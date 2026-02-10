@@ -16,6 +16,7 @@ FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         musl-tools \
         gcc-aarch64-linux-gnu \
+        libc6-dev-arm64-cross \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
