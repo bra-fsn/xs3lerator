@@ -14,8 +14,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::json;
 use sha2::{Digest, Sha224};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
 use tracing::warn;
 
 use crate::cache::CacheStore;
@@ -262,15 +260,32 @@ async fn serve_cached_file(
         start: 0,
         end_inclusive: meta.content_length.saturating_sub(1),
     });
-    let mut file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|e| ProxyError::Internal(format!("open cached: {e}")))?;
-    file.seek(std::io::SeekFrom::Start(effective.start))
-        .await
-        .map_err(|e| ProxyError::Internal(format!("seek: {e}")))?;
 
-    let limited = file.take(effective.len());
-    let stream = ReaderStream::with_capacity(limited, 256 * 1024);
+    let file = std::fs::File::open(&path)
+        .map_err(|e| ProxyError::Internal(format!("open cached: {e}")))?;
+
+    // mmap the file — safe because cached files are immutable after rename.
+    // The evictor may unlink the path, but Linux keeps the inode alive
+    // as long as this mapping exists.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| ProxyError::Internal(format!("mmap: {e}")))?;
+    mmap.advise(memmap2::Advice::Sequential)
+        .map_err(|e| ProxyError::Internal(format!("madvise: {e}")))?;
+
+    let full = Bytes::from_owner(mmap);
+    let start = effective.start as usize;
+    let end = (effective.end_inclusive + 1) as usize;
+    const MMAP_PIECE: usize = 2 * 1024 * 1024;
+
+    let stream = futures::stream::iter(
+        (start..end)
+            .step_by(MMAP_PIECE)
+            .map(move |off| {
+                let piece_end = std::cmp::min(off + MMAP_PIECE, end);
+                Ok::<Bytes, std::io::Error>(full.slice(off..piece_end))
+            }),
+    );
+
     Ok(build_get_response(meta, range, Body::from_stream(stream)))
 }
 
