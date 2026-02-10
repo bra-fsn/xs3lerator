@@ -212,16 +212,16 @@ If you see `502 upstream error: dispatch failure`:
 ## Architecture
 
 ```
-┌─────────────┐        ┌──────────────────┐        ┌─────────┐
-│  HTTP Client │───────▶│  xs3lerator│───────▶│  AWS S3  │
-│  (downstream)│◀───────│  (proxy + cache)  │◀───────│(upstream)│
-└─────────────┘        └──────────────────┘        └─────────┘
-                              │
-                              ▼
-                       ┌─────────────┐
-                       │ POSIX Cache  │
-                       │ (hierarchy)  │
-                       └─────────────┘
+┌─────────────────┐     ┌────────────────────┐     ┌─────────────┐
+│   HTTP Client   │────▶│     xs3lerator     │────▶│   AWS S3    │
+│   (downstream)  │◀────│  (proxy + cache)   │◀────│  (upstream) │
+└─────────────────┘     └────────────────────┘     └─────────────┘
+                                  │
+                                  ▼
+                         ┌───────────────┐
+                         │  POSIX Cache  │
+                         │  (hierarchy)  │
+                         └───────────────┘
 ```
 
 ## License
