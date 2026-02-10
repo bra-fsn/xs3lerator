@@ -183,11 +183,15 @@ pub async fn handle_get(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Prefix for SHA-224 fallback cache keys, to prevent collisions with
+/// content-addressed keys stored in the `sha224` metadata header.
+const HASH_FALLBACK_PREFIX: &str = "k_";
+
 fn resolve_cache_key(meta: &ObjectMeta, s3_key: &str) -> String {
     meta.metadata
         .get("sha224")
         .cloned()
-        .unwrap_or_else(|| sha224_hex(s3_key))
+        .unwrap_or_else(|| format!("{HASH_FALLBACK_PREFIX}{}", sha224_hex(s3_key)))
 }
 
 fn sha224_hex(input: &str) -> String {
@@ -534,7 +538,35 @@ mod tests {
         let key = resolve_cache_key(&meta, "test");
         assert_eq!(
             key,
-            "90a3ed9e32b2aaf4c61c410eb925426119e1a9dc53d4286ade99a809"
+            "k_90a3ed9e32b2aaf4c61c410eb925426119e1a9dc53d4286ade99a809"
         );
+    }
+
+    #[test]
+    fn fallback_key_does_not_collide_with_content_addressed_key() {
+        let hash = "90a3ed9e32b2aaf4c61c410eb925426119e1a9dc53d4286ade99a809";
+
+        let meta_with_header = ObjectMeta {
+            content_length: 100,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            cache_control: None,
+            content_encoding: None,
+            metadata: [("sha224".into(), hash.into())].into_iter().collect(),
+        };
+        let meta_without_header = ObjectMeta {
+            content_length: 200,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            cache_control: None,
+            content_encoding: None,
+            metadata: Default::default(),
+        };
+
+        let content_key = resolve_cache_key(&meta_with_header, "irrelevant");
+        let fallback_key = resolve_cache_key(&meta_without_header, "test");
+        assert_ne!(content_key, fallback_key);
     }
 }
