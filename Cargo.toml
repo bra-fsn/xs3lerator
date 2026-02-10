@@ -3,6 +3,7 @@ name = "xs3lerator"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance S3 HTTP proxy cache with parallel downloads and LRU eviction"
+license = "MIT"
 
 [[bin]]
 name = "xs3lerator"

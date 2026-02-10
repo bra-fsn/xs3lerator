@@ -223,3 +223,9 @@ If you see `502 upstream error: dispatch failure`:
                        │ (hierarchy)  │
                        └─────────────┘
 ```
+
+## License
+
+See `LICENSE` and `NOTICE` for copyright and attribution details.
+
+MIT License - see [LICENSE](LICENSE) for details.
