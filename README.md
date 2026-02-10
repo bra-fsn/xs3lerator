@@ -91,7 +91,8 @@ Run `xs3lerator --help` to see the generated help with defaults.
    range-GET requests, writes them with `pwrite`, and streams completed
    chunks to waiting clients as they arrive.
 5. On completion, the temp file is fsync'd and atomically renamed to the
-   final cache path.
+   final cache path, ensuring no corrupt data is served after a power
+   failure.
 
 If the cache directory is not writable, the proxy falls back to direct S3
 streaming without caching.

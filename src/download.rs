@@ -394,12 +394,18 @@ async fn run_parallel_download(
     Ok(())
 }
 
-/// Atomic rename from temp to final path.
+/// Fsync the temp file to disk, then atomically rename to the final path.
 ///
-/// No fsync: this is a cache — if the machine crashes we simply lose the
-/// entry and re-download.  Skipping fsync avoids a multi-second disk flush
-/// that would otherwise stall the NVMe after every large download.
+/// The fsync ensures that after a power failure the cache file is either
+/// absent (crash before rename) or fully persisted (crash after rename).
+/// Without it, the file could exist at the final path with the correct
+/// size but contain zeros/stale data — leading to silent corruption on
+/// serve.  The cost is a one-time I/O flush per download; it runs in the
+/// background finalize task and does not affect the reader streaming path.
 async fn finalize_download(dl: &InFlightDownload) -> io::Result<()> {
+    let f = tokio::fs::File::open(&dl.temp_path).await?;
+    f.sync_all().await?;
+    drop(f);
     tokio::fs::rename(&dl.temp_path, &dl.final_path).await
 }
 
