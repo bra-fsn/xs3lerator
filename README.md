@@ -114,6 +114,24 @@ and hierarchy level 4:
 
 All hierarchy directories (16^level leaf dirs) are pre-created on startup.
 
+## Why a Parallelized Proxy?
+
+As of early 2026, a single HTTP stream to S3 inside the same region and
+availability zone tops out at roughly **60 MiB/s** for the Standard storage
+class and around **150 MiB/s** for the Express One Zone storage class
+(directory buckets). These are hard per-connection limits imposed by S3's
+internal architecture — they cannot be raised by tuning client buffers,
+TCP windows, or instance types.
+
+Any workload that needs to pull multi-gigabyte objects faster than a single
+stream allows — ML model checkpoints, large datasets, container images,
+build artifacts — must open **multiple parallel byte-range requests** and
+reassemble the pieces. xs3lerator does this transparently: a single HTTP GET
+from a client fans out into many concurrent range-GETs to S3, and completed
+chunks are streamed back to the client as they arrive. With 32 streams the
+proxy routinely sustains **~3 GiB/s** from S3 Standard; see the benchmarks
+below.
+
 ## Download Strategy
 
 The chunk planner adapts concurrency and chunk size to the object:
