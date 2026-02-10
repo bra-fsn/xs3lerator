@@ -1,0 +1,42 @@
+[package]
+name = "xs3lerator"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance S3 HTTP proxy cache with parallel downloads and LRU eviction"
+
+[[bin]]
+name = "xs3lerator"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+async-trait = "0.1"
+aws-config = "1"
+aws-sdk-s3 = "1"
+axum = "0.7"
+byte-unit = "5"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+filetime = "0.2"
+futures = "0.3"
+http = "1"
+httpdate = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http2"] }
+hyper-util = { version = "0.1", features = ["http2"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+reqwest = "0.12"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

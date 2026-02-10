@@ -1,0 +1,4 @@
+boto3>=1.28
+moto[server]>=4.2
+pytest>=7.0
+requests>=2.28
