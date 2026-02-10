@@ -8,7 +8,7 @@ use futures::stream;
 use tempfile::tempdir;
 
 use xs3lerator::cache::CacheStore;
-use xs3lerator::config::AppConfig;
+use xs3lerator::config::{AppConfig, OperatingMode};
 use xs3lerator::download::DownloadManager;
 use xs3lerator::error::ProxyError;
 use xs3lerator::handler::ProxyState;
@@ -86,15 +86,17 @@ fn test_config(cache_dir: std::path::PathBuf) -> AppConfig {
         region: None,
         s3_endpoint_url: None,
         s3_force_path_style: false,
-        cache_dir,
-        max_cache_size: 1 << 30,
-        cache_hierarchy_level: 2,
-        max_concurrency: 4,
-        min_chunk_size: 64 * 1024,
-        max_chunk_size: 4 << 20,
-        gc_interval_seconds: 3600,
-        gc_watermark_percent: 95,
-        gc_target_percent: 90,
+        mode: OperatingMode::Cache {
+            cache_dir,
+            max_cache_size: 1 << 30,
+            cache_hierarchy_level: 2,
+            max_concurrency: 4,
+            min_chunk_size: 64 * 1024,
+            max_chunk_size: 4 << 20,
+            gc_interval_seconds: 3600,
+            gc_watermark_percent: 95,
+            gc_target_percent: 90,
+        },
     }
 }
 
@@ -136,8 +138,8 @@ async fn full_get_and_cache_hit() {
             sha224: sha.into(),
             content_type: "application/octet-stream".into(),
         }),
-        cache,
-        downloads: Arc::new(DownloadManager::default()),
+        cache: Some(cache),
+        downloads: Some(Arc::new(DownloadManager::default())),
         trace: None,
     };
 
@@ -171,8 +173,8 @@ async fn range_request() {
             sha224: "deadbeef00112233".into(),
             content_type: "application/octet-stream".into(),
         }),
-        cache,
-        downloads: Arc::new(DownloadManager::default()),
+        cache: Some(cache),
+        downloads: Some(Arc::new(DownloadManager::default())),
         trace: None,
     };
 
@@ -230,8 +232,8 @@ async fn head_request() {
             sha224: "aabb".into(),
             content_type: "text/plain".into(),
         }),
-        cache,
-        downloads: Arc::new(DownloadManager::default()),
+        cache: Some(cache),
+        downloads: Some(Arc::new(DownloadManager::default())),
         trace: None,
     };
 
@@ -294,8 +296,8 @@ async fn concurrent_requests_same_object() {
             sha224: "concurrent1234567890abcdef".into(),
             content_type: "application/octet-stream".into(),
         }),
-        cache,
-        downloads: Arc::new(DownloadManager::default()),
+        cache: Some(cache),
+        downloads: Some(Arc::new(DownloadManager::default())),
         trace: None,
     };
 
@@ -334,8 +336,8 @@ async fn sha224_fallback_when_header_missing() {
             sha224: String::new(), // empty → fallback
             content_type: "application/octet-stream".into(),
         }),
-        cache,
-        downloads: Arc::new(DownloadManager::default()),
+        cache: Some(cache),
+        downloads: Some(Arc::new(DownloadManager::default())),
         trace: None,
     };
 
@@ -396,8 +398,8 @@ async fn not_found_returns_404() {
     let state = ProxyState {
         config: Arc::new(test_config(tmp.path().to_path_buf())),
         upstream: Arc::new(NotFoundUpstream),
-        cache,
-        downloads: Arc::new(DownloadManager::default()),
+        cache: Some(cache),
+        downloads: Some(Arc::new(DownloadManager::default())),
         trace: None,
     };
 

@@ -159,7 +159,7 @@ fn map_head_err(err: SdkError<HeadObjectError>) -> ProxyError {
         SdkError::ServiceError(se) if se.err().is_not_found() => {
             ProxyError::NotFound("object not found".into())
         }
-        _ => ProxyError::Upstream(err.to_string()),
+        _ => ProxyError::Upstream(format_sdk_error(&err)),
     }
 }
 
@@ -168,6 +168,20 @@ fn map_get_err(err: SdkError<GetObjectError>) -> ProxyError {
         SdkError::ServiceError(se) if se.err().is_no_such_key() => {
             ProxyError::NotFound("object not found".into())
         }
-        _ => ProxyError::Upstream(err.to_string()),
+        _ => ProxyError::Upstream(format_sdk_error(&err)),
     }
+}
+
+/// Walk the full error source chain so the user sees *why* the request failed
+/// (e.g. "dispatch failure: connection refused: Connection refused (os error 111)")
+/// instead of just "dispatch failure".
+fn format_sdk_error(err: &dyn std::error::Error) -> String {
+    let mut msg = err.to_string();
+    let mut cur: &dyn std::error::Error = err;
+    while let Some(src) = cur.source() {
+        msg.push_str(": ");
+        msg.push_str(&src.to_string());
+        cur = src;
+    }
+    msg
 }

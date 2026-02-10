@@ -17,7 +17,7 @@ use sha2::{Digest, Sha224};
 use tracing::warn;
 
 use crate::cache::CacheStore;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, OperatingMode};
 use crate::download::{spawn_download, DownloadManager, InFlightDownload};
 use crate::error::{ProxyError, ProxyResult};
 use crate::planner::compute_chunk_plan;
@@ -32,8 +32,10 @@ const SERVER_NAME: &str = "xs3lerator/0.1.0";
 pub struct ProxyState {
     pub config: Arc<AppConfig>,
     pub upstream: Arc<dyn Upstream>,
-    pub cache: Arc<CacheStore>,
-    pub downloads: Arc<DownloadManager>,
+    /// Present in cache mode, None in mount mode.
+    pub cache: Option<Arc<CacheStore>>,
+    /// Present in cache mode, None in mount mode.
+    pub downloads: Option<Arc<DownloadManager>>,
     pub trace: Option<Arc<TraceWriter>>,
 }
 
@@ -73,23 +75,41 @@ pub async fn handle_get(
         meta.content_length,
     )?;
 
-    // Empty objects: respond inline, nothing to cache
     if meta.content_length == 0 {
         return Ok(build_get_response(&meta, range, Body::empty()));
     }
 
-    let cache_key = resolve_cache_key(&meta, &key);
-    let cache_path = state.cache.cache_path(&cache_key);
+    // Mount mode: serve directly from mount-s3 FUSE path
+    if let Some(mount_path) = state.config.mount_path() {
+        let file_path = mount_path.join(&key);
+        return serve_cached_file(file_path, &meta, range).await;
+    }
 
-    // Check local cache
-    match state.cache.verify_cached(&cache_path, meta.content_length).await {
+    // Cache mode below
+    let cache = state.cache.as_ref().expect("cache required in cache mode");
+    let downloads = state.downloads.as_ref().expect("downloads required in cache mode");
+
+    let OperatingMode::Cache {
+        max_concurrency,
+        min_chunk_size,
+        max_chunk_size,
+        ..
+    } = &state.config.mode
+    else {
+        unreachable!()
+    };
+
+    let cache_key = resolve_cache_key(&meta, &key);
+    let cache_path = cache.cache_path(&cache_key);
+
+    match cache.verify_cached(&cache_path, meta.content_length).await {
         Some(true) => {
             trace_log(&state.trace, || json!({
                 "event": "cache_hit",
                 "key": key,
                 "size": meta.content_length,
             }));
-            state.cache.touch_mtime(&cache_path).await;
+            cache.touch_mtime(&cache_path).await;
             return serve_cached_file(cache_path, &meta, range).await;
         }
         Some(false) => {
@@ -99,26 +119,25 @@ pub async fn handle_get(
         None => {}
     }
 
-    // Fallback to passthrough when cache is not writable
-    state.cache.refresh_writable().await;
-    if !state.cache.is_writable() {
+    cache.refresh_writable().await;
+    if !cache.is_writable() {
         return stream_passthrough(&state, &key, &meta, range).await;
     }
 
-    let temp_path = state.cache.temp_path(&cache_key);
-    if let Err(e) = state.cache.ensure_parent_dir(&temp_path).await {
+    let temp_path = cache.temp_path(&cache_key);
+    if let Err(e) = cache.ensure_parent_dir(&temp_path).await {
         warn!(key, "cannot create parent dir: {e} — passthrough");
         return stream_passthrough(&state, &key, &meta, range).await;
     }
 
     let plan = compute_chunk_plan(
         meta.content_length,
-        state.config.max_concurrency,
-        state.config.min_chunk_size,
-        state.config.max_chunk_size,
+        *max_concurrency,
+        *min_chunk_size,
+        *max_chunk_size,
     );
 
-    let (download, is_new) = state.downloads.get_or_create(&cache_key, || {
+    let (download, is_new) = downloads.get_or_create(&cache_key, || {
         Arc::new(InFlightDownload::new(
             temp_path.clone(),
             cache_path.clone(),
@@ -127,7 +146,6 @@ pub async fn handle_get(
         ))
     });
 
-    // Hint the downloader about what this client needs first
     let effective = range.unwrap_or(ByteRange {
         start: 0,
         end_inclusive: meta.content_length.saturating_sub(1),
@@ -151,8 +169,8 @@ pub async fn handle_get(
             key.clone(),
             cache_key.clone(),
             download.clone(),
-            state.downloads.clone(),
-            state.cache.clone(),
+            downloads.clone(),
+            cache.clone(),
             plan.concurrency,
             trace.clone(),
         );

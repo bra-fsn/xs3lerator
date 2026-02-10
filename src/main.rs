@@ -9,7 +9,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use xs3lerator::cache::CacheStore;
-use xs3lerator::config::{AppConfig, CliArgs};
+use xs3lerator::config::{AppConfig, CliArgs, OperatingMode};
 use xs3lerator::download::DownloadManager;
 use xs3lerator::evictor::{run_evictor, EvictorConfig};
 use xs3lerator::handler::ProxyState;
@@ -33,23 +33,40 @@ async fn main() -> anyhow::Result<()> {
         });
     let config = Arc::new(AppConfig::try_from(args)?);
 
-    // ---------- cache ----------
-    let cache = Arc::new(
-        CacheStore::new(config.cache_dir.clone(), config.cache_hierarchy_level).await?,
-    );
-    cache.create_hierarchy().await?;
-    info!(dir = ?config.cache_dir, levels = config.cache_hierarchy_level,
-          "cache hierarchy created");
+    // ---------- cache + evictor (cache mode only) ----------
+    let (cache, downloads) = match &config.mode {
+        OperatingMode::Cache {
+            cache_dir,
+            cache_hierarchy_level,
+            max_cache_size,
+            gc_watermark_percent,
+            gc_target_percent,
+            gc_interval_seconds,
+            ..
+        } => {
+            let cache = Arc::new(
+                CacheStore::new(cache_dir.clone(), *cache_hierarchy_level).await?,
+            );
+            cache.create_hierarchy().await?;
+            info!(dir = ?cache_dir, levels = cache_hierarchy_level,
+                  "cache hierarchy created");
 
-    // ---------- background evictor ----------
-    let evictor_cache = cache.clone();
-    let evictor_cfg = EvictorConfig {
-        max_bytes: config.max_cache_size,
-        watermark_percent: config.gc_watermark_percent,
-        target_percent: config.gc_target_percent,
-        interval_seconds: config.gc_interval_seconds,
+            let evictor_cache = cache.clone();
+            let evictor_cfg = EvictorConfig {
+                max_bytes: *max_cache_size,
+                watermark_percent: *gc_watermark_percent,
+                target_percent: *gc_target_percent,
+                interval_seconds: *gc_interval_seconds,
+            };
+            tokio::spawn(run_evictor(evictor_cache, evictor_cfg));
+
+            (Some(cache), Some(Arc::new(DownloadManager::default())))
+        }
+        OperatingMode::Mount { mount_path } => {
+            info!(path = ?mount_path, "mount mode — serving from mount-s3 path");
+            (None, None)
+        }
     };
-    tokio::spawn(run_evictor(evictor_cache, evictor_cfg));
 
     // ---------- AWS S3 client ----------
     let region_provider = match &config.region {
@@ -76,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         upstream: Arc::new(AwsUpstream::new(s3_client)),
         cache,
-        downloads: Arc::new(DownloadManager::default()),
+        downloads,
         trace,
     };
 
