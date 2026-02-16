@@ -547,46 +547,51 @@ async fn stream_response_into_chunks(
     let mut stream = response.bytes_stream();
     let mut global_offset = 0u64;
 
-    while let Some(piece) = stream.next().await {
+    'outer: while let Some(piece) = stream.next().await {
         let data = piece.map_err(|e| ProxyError::Upstream(format!("sequential stream: {e}")))?;
-        let chunk_idx = (global_offset / download.chunk_size) as usize;
+        let mut piece_offset = 0usize;
 
-        if chunk_idx > stop_after.load(Ordering::Acquire) {
-            trace_log(trace, || json!({
-                "event": "sequential_stopped",
-                "at_chunk": chunk_idx,
-            }));
-            break;
-        }
-        if chunk_idx >= download.chunk_count() {
-            break;
-        }
+        while piece_offset < data.len() {
+            let chunk_idx = (global_offset / download.chunk_size) as usize;
 
-        let chunk_offset = global_offset - chunk_idx as u64 * download.chunk_size;
-        let to_write =
-            std::cmp::min(data.len() as u64, download.expected_chunk_len(chunk_idx) - chunk_offset)
-                as usize;
-        if to_write == 0 {
-            continue;
-        }
+            if chunk_idx > stop_after.load(Ordering::Acquire) {
+                trace_log(trace, || json!({
+                    "event": "sequential_stopped",
+                    "at_chunk": chunk_idx,
+                }));
+                break 'outer;
+            }
+            if chunk_idx >= download.chunk_count() {
+                break 'outer;
+            }
 
-        let file = download
-            .chunk(chunk_idx)
-            .get_file()
-            .ok_or_else(|| ProxyError::Internal("chunk file released during sequential".into()))?;
+            let chunk_offset = global_offset - chunk_idx as u64 * download.chunk_size;
+            let to_write = std::cmp::min(
+                (data.len() - piece_offset) as u64,
+                download.expected_chunk_len(chunk_idx) - chunk_offset,
+            ) as usize;
+            if to_write == 0 {
+                break;
+            }
 
-        pwrite_all(&file, chunk_offset, &data[..to_write])
-            .map_err(|e| ProxyError::Internal(format!("pwrite chunk {chunk_idx}: {e}")))?;
+            let file = download.chunk(chunk_idx).get_file().ok_or_else(|| {
+                ProxyError::Internal("chunk file released during sequential".into())
+            })?;
 
-        global_offset += to_write as u64;
-        download.record_written(chunk_idx, to_write as u64);
+            pwrite_all(&file, chunk_offset, &data[piece_offset..piece_offset + to_write])
+                .map_err(|e| ProxyError::Internal(format!("pwrite chunk {chunk_idx}: {e}")))?;
 
-        if download.is_chunk_done(chunk_idx) {
-            download.mark_chunk_done(chunk_idx);
-            trace_log(trace, || json!({
-                "event": "sequential_chunk_done",
-                "chunk": chunk_idx,
-            }));
+            piece_offset += to_write;
+            global_offset += to_write as u64;
+            download.record_written(chunk_idx, to_write as u64);
+
+            if download.is_chunk_done(chunk_idx) {
+                download.mark_chunk_done(chunk_idx);
+                trace_log(trace, || json!({
+                    "event": "sequential_chunk_done",
+                    "chunk": chunk_idx,
+                }));
+            }
         }
     }
 
@@ -707,32 +712,43 @@ async fn start_sequential_download(
         let mut stream = response.bytes_stream();
         let mut global_offset = 0u64;
 
-        while let Some(piece) = stream.next().await {
+        'outer: while let Some(piece) = stream.next().await {
             match piece {
                 Ok(data) => {
-                    let chunk_idx = (global_offset / dl.chunk_size) as usize;
-                    if chunk_idx >= dl.chunk_count() {
-                        break;
-                    }
-                    let chunk_offset = global_offset - chunk_idx as u64 * dl.chunk_size;
+                    let mut piece_offset = 0usize;
+                    while piece_offset < data.len() {
+                        let chunk_idx = (global_offset / dl.chunk_size) as usize;
+                        if chunk_idx >= dl.chunk_count() {
+                            break 'outer;
+                        }
+                        let chunk_offset = global_offset - chunk_idx as u64 * dl.chunk_size;
 
-                    if let Some(file) = dl.chunk(chunk_idx).get_file() {
-                        let to_write = std::cmp::min(
-                            data.len() as u64,
-                            dl.expected_chunk_len(chunk_idx) - chunk_offset,
-                        ) as usize;
-                        if to_write > 0 {
-                            if let Err(e) = pwrite_all(&file, chunk_offset, &data[..to_write]) {
-                                warn!(key = ck, "sequential write error: {e}");
-                                dl.mark_failed();
+                        if let Some(file) = dl.chunk(chunk_idx).get_file() {
+                            let to_write = std::cmp::min(
+                                (data.len() - piece_offset) as u64,
+                                dl.expected_chunk_len(chunk_idx) - chunk_offset,
+                            ) as usize;
+                            if to_write == 0 {
                                 break;
                             }
+                            if let Err(e) = pwrite_all(
+                                &file,
+                                chunk_offset,
+                                &data[piece_offset..piece_offset + to_write],
+                            ) {
+                                warn!(key = ck, "sequential write error: {e}");
+                                dl.mark_failed();
+                                break 'outer;
+                            }
+                            piece_offset += to_write;
                             global_offset += to_write as u64;
                             dl.record_written(chunk_idx, to_write as u64);
 
                             if dl.is_chunk_done(chunk_idx) {
                                 dl.mark_chunk_done(chunk_idx);
                             }
+                        } else {
+                            break;
                         }
                     }
                 }

@@ -234,19 +234,28 @@ async fn run_s3_download(
 
             handles.push(tokio::spawn(async move {
                 let download = unsafe { &*(dl_ptr as *const InFlightDownload) };
-                let data = s3.get_range_bytes(&b, &k, s3_start, s3_end).await?;
+                let mut body = s3.get_range_stream(&b, &k, s3_start, s3_end).await?;
 
-                let to_write = min(data.len() as u64, expected) as usize;
-                pwrite_all(&chunk_file, 0, &data[..to_write])
-                    .map_err(|e| ProxyError::Internal(format!("pwrite s3 chunk: {e}")))?;
-
-                download.record_written(idx, to_write as u64);
+                let mut offset = 0u64;
+                while let Some(piece) = body.next().await {
+                    let data = piece.map_err(|e| {
+                        ProxyError::Upstream(format!("s3 stream chunk {idx}: {e}"))
+                    })?;
+                    let to_write = min(data.len() as u64, expected - offset) as usize;
+                    if to_write == 0 {
+                        break;
+                    }
+                    pwrite_all(&chunk_file, offset, &data[..to_write])
+                        .map_err(|e| ProxyError::Internal(format!("pwrite s3 chunk {idx}: {e}")))?;
+                    offset += to_write as u64;
+                    download.record_written(idx, to_write as u64);
+                }
                 download.mark_chunk_done(idx);
 
                 trace_log(&trace_c, || json!({
                     "event": "s3_chunk_done",
                     "chunk": idx,
-                    "bytes": to_write,
+                    "bytes": offset,
                 }));
                 Ok::<(), ProxyError>(())
             }));

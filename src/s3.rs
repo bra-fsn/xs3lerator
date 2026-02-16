@@ -24,13 +24,6 @@ pub trait Upstream: Send + Sync {
         key: &str,
     ) -> Result<ObjectMeta, ProxyError>;
 
-    async fn get_range_bytes(
-        &self,
-        bucket: &str,
-        key: &str,
-        start: u64,
-        end_inclusive: u64,
-    ) -> Result<Bytes, ProxyError>;
 }
 
 /// Production S3 client backed by the official AWS SDK.
@@ -42,6 +35,28 @@ pub struct AwsUpstream {
 impl AwsUpstream {
     pub fn new(client: Client) -> Self {
         Self { client }
+    }
+
+    /// Fetch an S3 range as a streaming ByteStream, yielding chunks
+    /// incrementally instead of buffering the entire range into memory.
+    pub async fn get_range_stream(
+        &self,
+        bucket: &str,
+        key: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<ByteStream, ProxyError> {
+        let range = format!("bytes={start}-{end_inclusive}");
+        let output = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range(range)
+            .send()
+            .await
+            .map_err(map_get_err)?;
+        Ok(output.body)
     }
 }
 
@@ -69,31 +84,6 @@ impl Upstream for AwsUpstream {
         })
     }
 
-    async fn get_range_bytes(
-        &self,
-        bucket: &str,
-        key: &str,
-        start: u64,
-        end_inclusive: u64,
-    ) -> Result<Bytes, ProxyError> {
-        let range = format!("bytes={start}-{end_inclusive}");
-        let output = self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .range(range)
-            .send()
-            .await
-            .map_err(map_get_err)?;
-
-        output
-            .body
-            .collect()
-            .await
-            .map(|agg| agg.into_bytes())
-            .map_err(|e| ProxyError::Upstream(e.to_string()))
-    }
 }
 
 // ---------------------------------------------------------------------------
