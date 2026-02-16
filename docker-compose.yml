@@ -1,0 +1,45 @@
+services:
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3
+      - DEBUG=0
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - ./docker/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  xs3lerator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${XS3_PORT:-8888}:8080"
+    environment:
+      - RUST_LOG=xs3lerator=debug
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - XS3_S3_ENDPOINT_URL=http://localstack:4566
+      - XS3_S3_FORCE_PATH_STYLE=true
+      - XS3_S3_CONCURRENCY=4
+      - XS3_HTTP_CONCURRENCY=4
+      - XS3_MIN_CHUNK_SIZE=5MiB
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      localstack:
+        condition: service_healthy
+    # distroless has no shell or curl — use wget from busybox or skip healthcheck.
+    # The test suite waits for /healthz instead.
+    # healthcheck:
+    #   test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/healthz"]
+
+volumes:
+  localstack-data:
