@@ -1,13 +1,31 @@
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Method, Request};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use tower_http::trace::TraceLayer;
 
-use crate::handler::{handle_get, handle_head, ProxyState};
+use crate::handler::{handle_get, healthz, method_not_allowed, AppState};
 
-/// Build the axum router with GET and HEAD handlers for all paths.
-pub fn build_router(state: ProxyState) -> Router {
+async fn catch_all(
+    State(state): State<AppState>,
+    req: Request<Body>,
+) -> Response {
+    if req.method() == Method::GET {
+        match handle_get(State(state), req).await {
+            Ok(resp) => resp,
+            Err(err) => err.into_response(),
+        }
+    } else {
+        method_not_allowed().await.into_response()
+    }
+}
+
+pub fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(|| async { StatusCode::OK }))
-        .route("/*key", get(handle_get).head(handle_head))
+        .route("/healthz", get(healthz))
+        .fallback(catch_all)
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

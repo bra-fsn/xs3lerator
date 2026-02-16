@@ -1,11 +1,12 @@
-pub mod cache;
 pub mod config;
 pub mod download;
 pub mod error;
-pub mod evictor;
 pub mod handler;
+pub mod headers;
 pub mod planner;
 pub mod range;
 pub mod s3;
+pub mod s3_upload;
 pub mod server;
 pub mod trace;
+pub mod upstream_fetcher;

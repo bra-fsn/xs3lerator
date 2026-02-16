@@ -1,572 +1,501 @@
+use std::cmp::min;
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_stream::try_stream;
 use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::header::{
-    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE, SERVER,
-};
-use axum::http::{HeaderMap, Response, StatusCode};
-use axum::response::IntoResponse;
+use axum::extract::State;
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::json;
-use sha2::{Digest, Sha224};
-use tracing::warn;
+use tracing::{error, info};
 
-use crate::cache::CacheStore;
-use crate::config::{AppConfig, OperatingMode};
-use crate::download::{spawn_download, DownloadManager, InFlightDownload};
+use crate::config::AppConfig;
+use crate::download::{create_temp_chunk_file, pwrite_all, DownloadManager, InFlightDownload};
 use crate::error::{ProxyError, ProxyResult};
+use crate::headers::{
+    self, parse_bucket_key, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
+};
 use crate::planner::compute_chunk_plan;
 use crate::range::{parse_range_header, ByteRange};
-use crate::s3::{ObjectMeta, Upstream};
+use crate::s3::{AwsUpstream, S3Uploader, Upstream};
 use crate::trace::{trace_log, TraceWriter};
+use crate::upstream_fetcher;
 
-const SERVER_NAME: &str = "xs3lerator/0.1.0";
-
-/// Shared application state injected into every request handler.
+/// Shared application state.
 #[derive(Clone)]
-pub struct ProxyState {
+pub struct AppState {
     pub config: Arc<AppConfig>,
-    pub upstream: Arc<dyn Upstream>,
-    /// Present in cache mode, None in mount mode.
-    pub cache: Option<Arc<CacheStore>>,
-    /// Present in cache mode, None in mount mode.
-    pub downloads: Option<Arc<DownloadManager>>,
+    pub s3_upstream: Arc<AwsUpstream>,
+    pub s3_uploader: Arc<S3Uploader>,
+    pub downloads: Arc<DownloadManager>,
     pub trace: Option<Arc<TraceWriter>>,
 }
 
-// ---------------------------------------------------------------------------
-// HEAD handler
-// ---------------------------------------------------------------------------
-
-pub async fn handle_head(
-    State(state): State<ProxyState>,
-    Path(key): Path<String>,
-) -> ProxyResult<impl IntoResponse> {
-    let key = normalize_key(&key);
-    let meta = state
-        .upstream
-        .head_object(&state.config.bucket, &key)
-        .await?;
-    Ok(build_head_response(&meta))
+/// Health check endpoint: `GET /healthz`
+pub async fn healthz() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
 }
 
-// ---------------------------------------------------------------------------
-// GET handler
-// ---------------------------------------------------------------------------
+/// Method-not-allowed handler for non-GET methods.
+pub async fn method_not_allowed() -> impl IntoResponse {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(axum::http::header::ALLOW, "GET")],
+        "only GET is supported",
+    )
+}
 
+/// Main GET handler: `GET /<bucket>/<s3_key...>`
 pub async fn handle_get(
-    State(state): State<ProxyState>,
-    Path(key): Path<String>,
-    headers: HeaderMap,
-) -> ProxyResult<Response<Body>> {
-    let key = normalize_key(&key);
-    let meta = state
-        .upstream
-        .head_object(&state.config.bucket, &key)
-        .await?;
+    State(state): State<AppState>,
+    req: Request<Body>,
+) -> Result<Response, ProxyError> {
+    let path = req.uri().path().to_string();
+    let headers = req.headers().clone();
 
-    let range = parse_range_header(
-        headers.get(RANGE).and_then(|v| v.to_str().ok()),
-        meta.content_length,
-    )?;
+    let (bucket, key) = parse_bucket_key(&path)
+        .ok_or_else(|| ProxyError::Internal("invalid path: expected /<bucket>/<key>".into()))?;
 
-    if meta.content_length == 0 {
-        return Ok(build_get_response(&meta, range, Body::empty()));
-    }
+    let contract = parse_contract_headers(&headers);
+    let cache_key = [bucket.as_str(), "/", key.as_str()].concat();
+    let client_range_header = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
 
-    // Mount mode: serve directly from mount-s3 FUSE path
-    if let Some(mount_path) = state.config.mount_path() {
-        let file_path = mount_path.join(&key);
-        return serve_cached_file(file_path, &meta, range).await;
-    }
+    trace_log(&state.trace, || json!({
+        "event": "request",
+        "bucket": bucket,
+        "key": key,
+        "cache_skip": contract.cache_skip,
+        "object_size": contract.object_size,
+    }));
 
-    // Cache mode below
-    let cache = state.cache.as_ref().expect("cache required in cache mode");
-    let downloads = state.downloads.as_ref().expect("downloads required in cache mode");
-
-    let OperatingMode::Cache {
-        max_concurrency,
-        min_chunk_size,
-        max_chunk_size,
-        ..
-    } = &state.config.mode
-    else {
-        unreachable!()
-    };
-
-    let cache_key = resolve_cache_key(&meta, &key);
-    let cache_path = cache.cache_path(&cache_key);
-
-    match cache.verify_cached(&cache_path, meta.content_length).await {
-        Some(true) => {
-            trace_log(&state.trace, || json!({
-                "event": "cache_hit",
-                "key": key,
-                "size": meta.content_length,
-            }));
-            cache.touch_mtime(&cache_path).await;
-            return serve_cached_file(cache_path, &meta, range).await;
-        }
-        Some(false) => {
-            warn!(key, "cache size mismatch — removing stale entry");
-            let _ = tokio::fs::remove_file(&cache_path).await;
-        }
-        None => {}
-    }
-
-    cache.refresh_writable().await;
-    if !cache.is_writable() {
-        return stream_passthrough(&state, &key, &meta, range).await;
-    }
-
-    let temp_path = cache.temp_path(&cache_key);
-    if let Err(e) = cache.ensure_parent_dir(&temp_path).await {
-        warn!(key, "cannot create parent dir: {e} — passthrough");
-        return stream_passthrough(&state, &key, &meta, range).await;
-    }
-
-    let plan = compute_chunk_plan(
-        meta.content_length,
-        *max_concurrency,
-        *min_chunk_size,
-        *max_chunk_size,
-    );
-
-    let (download, is_new) = downloads.get_or_create(&cache_key, || {
-        Arc::new(InFlightDownload::new(
-            temp_path.clone(),
-            cache_path.clone(),
-            meta.content_length,
-            plan.chunk_size,
-        ))
-    });
-
-    let effective = range.unwrap_or(ByteRange {
-        start: 0,
-        end_inclusive: meta.content_length.saturating_sub(1),
-    });
-    download.prioritize_range(effective.start, effective.end_inclusive);
-
-    let trace = state.trace.clone();
-    if is_new {
-        trace_log(&trace, || json!({
-            "event": "request",
-            "key": key,
-            "size": meta.content_length,
-            "chunk_size": plan.chunk_size,
-            "chunks": download.chunk_count(),
-            "concurrency": plan.concurrency,
-            "range": range.map(|r| format!("{}-{}", r.start, r.end_inclusive)),
-        }));
-        spawn_download(
-            state.upstream.clone(),
-            state.config.bucket.clone(),
-            key.clone(),
-            cache_key.clone(),
-            download.clone(),
-            downloads.clone(),
-            cache.clone(),
-            plan.concurrency,
-            trace.clone(),
-        );
-    }
-
-    stream_in_progress(download, &meta, range, trace).await
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Prefix for SHA-224 fallback cache keys, to prevent collisions with
-/// content-addressed keys stored in the `sha224` metadata header.
-const HASH_FALLBACK_PREFIX: &str = "k_";
-
-fn resolve_cache_key(meta: &ObjectMeta, s3_key: &str) -> String {
-    meta.metadata
-        .get("sha224")
-        .cloned()
-        .unwrap_or_else(|| format!("{HASH_FALLBACK_PREFIX}{}", sha224_hex(s3_key)))
-}
-
-fn sha224_hex(input: &str) -> String {
-    let mut h = Sha224::new();
-    h.update(input.as_bytes());
-    format!("{:x}", h.finalize())
-}
-
-fn normalize_key(key: &str) -> String {
-    key.trim_start_matches('/').to_string()
-}
-
-// ---------------------------------------------------------------------------
-// Response builders
-// ---------------------------------------------------------------------------
-
-fn build_head_response(meta: &ObjectMeta) -> Response<Body> {
-    apply_headers(Response::builder(), meta, None)
-        .body(Body::empty())
-        .unwrap_or_else(|_| Response::new(Body::empty()))
-}
-
-fn build_get_response(
-    meta: &ObjectMeta,
-    range: Option<ByteRange>,
-    body: Body,
-) -> Response<Body> {
-    apply_headers(Response::builder(), meta, range)
-        .body(body)
-        .unwrap_or_else(|_| Response::new(Body::empty()))
-}
-
-fn apply_headers(
-    mut b: http::response::Builder,
-    meta: &ObjectMeta,
-    range: Option<ByteRange>,
-) -> http::response::Builder {
-    let status = if range.is_some() {
-        StatusCode::PARTIAL_CONTENT
-    } else {
-        StatusCode::OK
-    };
-    let content_length = range.map(|r| r.len()).unwrap_or(meta.content_length);
-
-    b = b
-        .status(status)
-        .header(SERVER, SERVER_NAME)
-        .header(ACCEPT_RANGES, "bytes")
-        .header(CONTENT_LENGTH, content_length);
-
-    if let Some(r) = range {
-        b = b.header(
-            CONTENT_RANGE,
-            format!(
-                "bytes {}-{}/{}",
-                r.start, r.end_inclusive, meta.content_length
-            ),
-        );
-    }
-    if let Some(v) = &meta.content_type {
-        b = b.header(CONTENT_TYPE, v.as_str());
-    }
-    if let Some(v) = &meta.etag {
-        b = b.header(ETAG, v.as_str());
-    }
-    if let Some(v) = &meta.last_modified {
-        b = b.header(LAST_MODIFIED, v.as_str());
-    }
-    if let Some(v) = &meta.cache_control {
-        b = b.header(CACHE_CONTROL, v.as_str());
-    }
-    if let Some(v) = &meta.content_encoding {
-        b = b.header(CONTENT_ENCODING, v.as_str());
-    }
-    b
-}
-
-// ---------------------------------------------------------------------------
-// Serve from a fully cached file
-// ---------------------------------------------------------------------------
-
-async fn serve_cached_file(
-    path: std::path::PathBuf,
-    meta: &ObjectMeta,
-    range: Option<ByteRange>,
-) -> ProxyResult<Response<Body>> {
-    let effective = range.unwrap_or(ByteRange {
-        start: 0,
-        end_inclusive: meta.content_length.saturating_sub(1),
-    });
-
-    let file = std::fs::File::open(&path)
-        .map_err(|e| ProxyError::Internal(format!("open cached: {e}")))?;
-
-    // mmap the file — safe because cached files are immutable after rename.
-    // The evictor may unlink the path, but Linux keeps the inode alive
-    // as long as this mapping exists.
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| ProxyError::Internal(format!("mmap: {e}")))?;
-    mmap.advise(memmap2::Advice::Sequential)
-        .map_err(|e| ProxyError::Internal(format!("madvise: {e}")))?;
-
-    let full = Bytes::from_owner(mmap);
-    let start = effective.start as usize;
-    let end = (effective.end_inclusive + 1) as usize;
-    const MMAP_PIECE: usize = 2 * 1024 * 1024;
-
-    let stream = futures::stream::iter(
-        (start..end)
-            .step_by(MMAP_PIECE)
-            .map(move |off| {
-                let piece_end = std::cmp::min(off + MMAP_PIECE, end);
-                Ok::<Bytes, std::io::Error>(full.slice(off..piece_end))
-            }),
-    );
-
-    Ok(build_get_response(meta, range, Body::from_stream(stream)))
-}
-
-// ---------------------------------------------------------------------------
-// Direct S3 passthrough (when cache is not writable)
-// ---------------------------------------------------------------------------
-
-async fn stream_passthrough(
-    state: &ProxyState,
-    key: &str,
-    meta: &ObjectMeta,
-    range: Option<ByteRange>,
-) -> ProxyResult<Response<Body>> {
-    let effective = range.unwrap_or(ByteRange {
-        start: 0,
-        end_inclusive: meta.content_length.saturating_sub(1),
-    });
-    let byte_stream = state
-        .upstream
-        .get_range_stream(
-            &state.config.bucket,
-            key,
-            effective.start,
-            effective.end_inclusive,
+    if contract.cache_skip {
+        return handle_upstream_path(
+            &state,
+            &contract,
+            &headers,
+            &bucket,
+            &key,
+            &cache_key,
+            client_range_header.as_deref(),
         )
-        .await?;
-    let body = Body::from_stream(
-        byte_stream.map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
-    );
-    Ok(build_get_response(meta, range, body))
+        .await;
+    }
+
+    // S3-first path: try to serve from cache
+    match handle_s3_path(
+        &state,
+        &contract,
+        &bucket,
+        &key,
+        &cache_key,
+        client_range_header.as_deref(),
+    )
+    .await
+    {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            info!(
+                key = key.as_str(),
+                error = %e,
+                "S3 fetch failed, falling back to upstream"
+            );
+            handle_upstream_path(
+                &state,
+                &contract,
+                &headers,
+                &bucket,
+                &key,
+                &cache_key,
+                client_range_header.as_deref(),
+            )
+            .await
+        }
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Stream from an in-progress download (the hot path)
-// ---------------------------------------------------------------------------
+/// Serve from S3 cache using parallel range-GETs.
+async fn handle_s3_path(
+    state: &AppState,
+    contract: &headers::ContractHeaders,
+    bucket: &str,
+    key: &str,
+    cache_key: &str,
+    client_range: Option<&str>,
+) -> ProxyResult<Response> {
+    let object_size = if let Some(size) = contract.object_size {
+        size
+    } else {
+        let meta = state.s3_upstream.head_object(bucket, key).await?;
+        meta.content_length
+    };
 
-/// Maximum bytes per downstream write.  Small enough to keep per-reader
-/// memory low, large enough for efficient pread + TCP send.
-const READ_PIECE_SIZE: u64 = 256 * 1024;
+    let client_byte_range = parse_range_header(client_range, object_size)?;
 
-/// Stream data from the temp/final file to the client as it is written
-/// by the download workers.
-///
-/// Unlike the previous implementation that waited for whole chunks, this
-/// reads in 256 KiB pieces and starts streaming as soon as the first bytes
-/// of the first relevant chunk hit disk.  Uses pread (positional read)
-/// so multiple readers can share a single file descriptor safely.
-async fn stream_in_progress(
-    download: Arc<InFlightDownload>,
-    meta: &ObjectMeta,
-    range: Option<ByteRange>,
-    trace: Option<Arc<TraceWriter>>,
-) -> ProxyResult<Response<Body>> {
-    let effective = range.unwrap_or(ByteRange {
-        start: 0,
-        end_inclusive: meta.content_length.saturating_sub(1),
-    });
+    let (serve_start, serve_end) = match client_byte_range {
+        Some(ref r) => (r.start, r.end_inclusive),
+        None => (0, object_size.saturating_sub(1)),
+    };
 
-    let chunk_size = download.chunk_size;
-    let obj_size = download.object_size;
-    let start_chunk = (effective.start / chunk_size) as usize;
-    let end_chunk = (effective.end_inclusive / chunk_size) as usize;
-    let temp_path = download.temp_path.clone();
-    let final_path = download.final_path.clone();
+    // Only download the requested range from S3 (not the full file)
+    let plan = compute_chunk_plan(
+        serve_end - serve_start + 1,
+        state.config.s3_concurrency,
+        state.config.min_chunk_size,
+    );
 
-    let body_stream = try_stream! {
-        let mut file_handle: Option<Arc<std::fs::File>> = None;
-        let reader_t0 = Instant::now();
-        let mut total_sent = 0u64;
+    let download = Arc::new(InFlightDownload::new(
+        serve_end - serve_start + 1,
+        plan.chunk_size,
+    ));
 
-        for idx in start_chunk..=end_chunk {
-            let chunk_t0 = Instant::now();
+    let (download, is_new) = state.downloads.get_or_create(
+        &format!("{cache_key}:{serve_start}-{serve_end}"),
+        || download,
+    );
 
-            // What slice of this chunk does the client need?
-            let chunk_start = idx as u64 * chunk_size;
-            let chunk_end = std::cmp::min(chunk_start + chunk_size, obj_size);
-            let read_start = std::cmp::max(chunk_start, effective.start);
-            let read_end = std::cmp::min(chunk_end - 1, effective.end_inclusive);
-            let total_needed = read_end - read_start + 1;
-            let within_chunk_offset = read_start - chunk_start;
+    if is_new {
+        // Spawn S3 download workers
+        let dl = download.clone();
+        let s3 = state.s3_upstream.clone();
+        let b = bucket.to_string();
+        let k = key.to_string();
+        let temp_dir = state.config.temp_dir.clone();
+        let trace = state.trace.clone();
+        let ck = format!("{cache_key}:{serve_start}-{serve_end}");
+        let dm = state.downloads.clone();
 
-            trace_log(&trace, || json!({
-                "event": "rd_chunk_enter",
-                "chunk": idx,
-                "read_from": read_start,
-                "read_to": read_end,
-                "need_bytes": total_needed,
+        tokio::spawn(async move {
+            let result = run_s3_download(
+                &s3, &b, &k, serve_start, &dl, &temp_dir, &trace,
+            )
+            .await;
+
+            match result {
+                Ok(()) => {
+                    info!(key = k, "S3 download complete");
+                }
+                Err(e) => {
+                    error!(key = k, "S3 download failed: {e}");
+                    dl.mark_failed();
+                }
+            }
+            dm.remove(&ck);
+        });
+    }
+
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("true"));
+    resp_headers.insert(
+        RESP_FULL_SIZE,
+        HeaderValue::from_str(&object_size.to_string()).unwrap(),
+    );
+
+    build_streaming_response(
+        download,
+        object_size,
+        client_byte_range,
+        resp_headers,
+    )
+}
+
+async fn run_s3_download(
+    s3: &AwsUpstream,
+    bucket: &str,
+    key: &str,
+    global_offset: u64,
+    download: &InFlightDownload,
+    temp_dir: &std::path::Path,
+    trace: &Option<Arc<TraceWriter>>,
+) -> ProxyResult<()> {
+    let mut handles = Vec::with_capacity(download.chunk_count());
+
+    for _ in 0..download.chunk_count() {
+        if let Some(idx) = download.pop_chunk() {
+            let chunk_file = create_temp_chunk_file(temp_dir)
+                .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
+            let chunk_file = Arc::new(chunk_file);
+            download.chunk(idx).set_file(chunk_file.clone());
+
+            let (local_start, local_end) = download.chunk_byte_range(idx);
+            let s3_start = global_offset + local_start;
+            let s3_end = global_offset + local_end;
+
+            let s3 = s3.clone();
+            let b = bucket.to_string();
+            let k = key.to_string();
+            let dl_ptr = download as *const InFlightDownload as usize;
+            let trace_c = trace.clone();
+            let expected = download.expected_chunk_len(idx);
+
+            handles.push(tokio::spawn(async move {
+                let download = unsafe { &*(dl_ptr as *const InFlightDownload) };
+                let data = s3.get_range_bytes(&b, &k, s3_start, s3_end).await?;
+
+                let to_write = min(data.len() as u64, expected) as usize;
+                pwrite_all(&chunk_file, 0, &data[..to_write])
+                    .map_err(|e| ProxyError::Internal(format!("pwrite s3 chunk: {e}")))?;
+
+                download.record_written(idx, to_write as u64);
+                download.mark_chunk_done(idx);
+
+                trace_log(&trace_c, || json!({
+                    "event": "s3_chunk_done",
+                    "chunk": idx,
+                    "bytes": to_write,
+                }));
+                Ok::<(), ProxyError>(())
             }));
+        }
+    }
 
-            let mut sent = 0u64;
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(ProxyError::Internal(format!("s3 worker panicked: {e}"))),
+        }
+    }
 
-            while sent < total_needed {
-                // Wait until at least 1 byte past our current position is
-                // written to disk.
-                let need_in_chunk = within_chunk_offset + sent + 1;
+    Ok(())
+}
 
-                // Log if we're about to actually block (data not yet available)
-                let available_before = download.bytes_written(idx);
-                if available_before < need_in_chunk {
-                    trace_log(&trace, || json!({
-                        "event": "rd_wait",
-                        "chunk": idx,
-                        "need": need_in_chunk,
-                        "have": available_before,
-                        "total_sent": total_sent,
-                    }));
-                }
+/// Serve from upstream (cache miss or S3 fallback).
+async fn handle_upstream_path(
+    state: &AppState,
+    contract: &headers::ContractHeaders,
+    client_headers: &HeaderMap,
+    bucket: &str,
+    key: &str,
+    cache_key: &str,
+    client_range: Option<&str>,
+) -> ProxyResult<Response> {
+    let result = upstream_fetcher::fetch_upstream(
+        &state.config,
+        contract,
+        client_headers,
+        bucket,
+        key,
+        cache_key,
+        client_range,
+        &state.downloads,
+        Some(state.s3_uploader.clone()),
+        &state.trace,
+    )
+    .await?;
 
-                let available_in_chunk =
-                    download.wait_for_bytes(idx, need_in_chunk).await?;
+    // ENOSPC degradation: stream upstream response directly without buffering.
+    // No S3 upload occurred; passsage should not record this as cached.
+    if let Some(direct_response) = result.degraded_body {
+        return build_passthrough_response(
+            direct_response,
+            result.full_size,
+            result.content_type,
+            result.etag,
+            result.last_modified,
+            result.cache_control,
+        );
+    }
 
-                // Open file lazily (the download worker has created it by now).
-                if file_handle.is_none() {
-                    let f = std::fs::File::open(&temp_path)
-                        .or_else(|_| std::fs::File::open(&final_path))
-                        .map_err(|e| ProxyError::Internal(
-                            format!("open cache file: {e}")
-                        ))?;
-                    file_handle = Some(Arc::new(f));
-                }
+    let full_size = result.full_size.unwrap_or(result.download.object_size);
+    let client_byte_range = if full_size > 0 {
+        parse_range_header(client_range, full_size)?
+    } else {
+        None
+    };
 
-                // Read up to READ_PIECE_SIZE of whatever is available now.
-                let readable =
-                    available_in_chunk.saturating_sub(within_chunk_offset + sent);
-                let to_read = std::cmp::min(
-                    std::cmp::min(readable, total_needed - sent),
-                    READ_PIECE_SIZE,
-                ) as usize;
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+    if full_size > 0 {
+        resp_headers.insert(
+            RESP_FULL_SIZE,
+            HeaderValue::from_str(&full_size.to_string()).unwrap(),
+        );
+    }
+    if let Some(ct) = &result.content_type {
+        if let Ok(v) = HeaderValue::from_str(ct) {
+            resp_headers.insert("content-type", v);
+        }
+    }
+    if let Some(et) = &result.etag {
+        if let Ok(v) = HeaderValue::from_str(et) {
+            resp_headers.insert("etag", v);
+        }
+    }
+    if let Some(lm) = &result.last_modified {
+        if let Ok(v) = HeaderValue::from_str(lm) {
+            resp_headers.insert("last-modified", v);
+        }
+    }
+    if let Some(cc) = &result.cache_control {
+        if let Ok(v) = HeaderValue::from_str(cc) {
+            resp_headers.insert("cache-control", v);
+        }
+    }
 
-                if to_read == 0 {
-                    continue;
-                }
+    build_streaming_response(
+        result.download,
+        full_size,
+        client_byte_range,
+        resp_headers,
+    )
+}
 
-                let file = file_handle.as_ref().unwrap().clone();
-                let file_offset = read_start + sent;
-                let data = tokio::task::spawn_blocking(move || -> Result<Bytes, ProxyError> {
-                    use std::os::unix::fs::FileExt;
-                    let mut buf = vec![0u8; to_read];
-                    file.read_exact_at(&mut buf, file_offset)
-                        .map_err(|e| ProxyError::Internal(format!("pread: {e}")))?;
-                    Ok(Bytes::from(buf))
-                })
-                .await
-                .map_err(|e| ProxyError::Internal(format!("join: {e}")))?
-                ?;
+/// Build the HTTP response that streams data from in-flight chunk files.
+fn build_streaming_response(
+    download: Arc<InFlightDownload>,
+    full_size: u64,
+    client_range: Option<ByteRange>,
+    mut extra_headers: HeaderMap,
+) -> ProxyResult<Response> {
+    let (serve_start, serve_end, status) = match client_range {
+        Some(ref r) => (r.start, r.end_inclusive, StatusCode::PARTIAL_CONTENT),
+        None => (0, full_size.saturating_sub(1), StatusCode::OK),
+    };
+    let serve_len = if full_size == 0 {
+        0
+    } else {
+        serve_end - serve_start + 1
+    };
 
-                sent += data.len() as u64;
-                total_sent += data.len() as u64;
-                yield data;
+    if status == StatusCode::PARTIAL_CONTENT {
+        extra_headers.insert(
+            "content-range",
+            HeaderValue::from_str(&format!("bytes {serve_start}-{serve_end}/{full_size}"))
+                .unwrap(),
+        );
+    }
+    extra_headers.insert(
+        "content-length",
+        HeaderValue::from_str(&serve_len.to_string()).unwrap(),
+    );
+    extra_headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
+
+    let stream = make_download_stream(download, serve_start, serve_end, serve_len);
+    let body = Body::from_stream(stream);
+    let mut response = Response::builder()
+        .status(status)
+        .body(body)
+        .map_err(|e| ProxyError::Internal(format!("build response: {e}")))?;
+
+    *response.headers_mut() = extra_headers;
+
+    Ok(response)
+}
+
+/// Build a direct passthrough response for ENOSPC degradation.
+/// Streams the upstream response body directly to the client without temp-file
+/// buffering. Returns 200 OK with the full body (no range support in this mode).
+fn build_passthrough_response(
+    response: reqwest::Response,
+    full_size: Option<u64>,
+    content_type: Option<String>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    cache_control: Option<String>,
+) -> ProxyResult<Response> {
+    let mut headers = HeaderMap::new();
+    headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+    headers.insert(RESP_DEGRADED, HeaderValue::from_static("enospc"));
+    if let Some(size) = full_size {
+        headers.insert(
+            RESP_FULL_SIZE,
+            HeaderValue::from_str(&size.to_string()).unwrap(),
+        );
+        headers.insert(
+            "content-length",
+            HeaderValue::from_str(&size.to_string()).unwrap(),
+        );
+    }
+    if let Some(ref ct) = content_type {
+        if let Ok(v) = HeaderValue::from_str(ct) {
+            headers.insert("content-type", v);
+        }
+    }
+    if let Some(ref et) = etag {
+        if let Ok(v) = HeaderValue::from_str(et) {
+            headers.insert("etag", v);
+        }
+    }
+    if let Some(ref lm) = last_modified {
+        if let Ok(v) = HeaderValue::from_str(lm) {
+            headers.insert("last-modified", v);
+        }
+    }
+    if let Some(ref cc) = cache_control {
+        if let Ok(v) = HeaderValue::from_str(cc) {
+            headers.insert("cache-control", v);
+        }
+    }
+    headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
+
+    let stream = response
+        .bytes_stream()
+        .map(|r| r.map_err(|e| ProxyError::Upstream(format!("passthrough: {e}"))));
+    let body = Body::from_stream(stream);
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .body(body)
+        .map_err(|e| ProxyError::Internal(format!("build response: {e}")))?;
+    *resp.headers_mut() = headers;
+    Ok(resp)
+}
+
+fn make_download_stream(
+    download: Arc<InFlightDownload>,
+    serve_start: u64,
+    serve_end: u64,
+    serve_len: u64,
+) -> impl futures::Stream<Item = Result<Bytes, ProxyError>> {
+    try_stream! {
+        if serve_len == 0 {
+            return;
+        }
+
+        let chunk_size = download.chunk_size;
+        let mut pos = serve_start;
+
+        while pos <= serve_end {
+            let chunk_idx = (pos / chunk_size) as usize;
+            if chunk_idx >= download.chunk_count() {
+                break;
             }
 
-            let chunk_elapsed = chunk_t0.elapsed();
-            trace_log(&trace, || json!({
-                "event": "rd_chunk_done",
-                "chunk": idx,
-                "bytes": sent,
-                "elapsed_ms": chunk_elapsed.as_secs_f64() * 1000.0,
-                "total_sent": total_sent,
-            }));
+            let chunk_offset = pos % chunk_size;
+            let chunk_remaining = download.expected_chunk_len(chunk_idx) - chunk_offset;
+            let serve_remaining = serve_end - pos + 1;
+            let to_read = min(chunk_remaining, serve_remaining).min(256 * 1024);
+
+            download.wait_for_bytes(chunk_idx, chunk_offset + to_read).await?;
+
+            let file = download.chunk(chunk_idx).get_file()
+                .ok_or_else(|| ProxyError::Internal("chunk released before read".into()))?;
+
+            let read_len = to_read as usize;
+            let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0u8; read_len];
+                file.read_exact_at(&mut buf, chunk_offset)?;
+                Ok(Bytes::from(buf))
+            })
+            .await
+            .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?
+            .map_err(|e| ProxyError::Internal(format!("pread: {e}")))?;
+
+            pos += data.len() as u64;
+            yield data;
         }
 
-        let total_elapsed = reader_t0.elapsed();
-        trace_log(&trace, || json!({
-            "event": "rd_done",
-            "total_bytes": total_sent,
-            "elapsed_ms": total_elapsed.as_secs_f64() * 1000.0,
-            "mbps": if total_elapsed.as_nanos() > 0 {
-                (total_sent as f64) / total_elapsed.as_secs_f64() / 1_000_000.0
-            } else { 0.0 },
-        }));
-    };
-
-    let body = Body::from_stream(
-        body_stream.map(|r: Result<Bytes, ProxyError>| {
-            r.map_err(|e| std::io::Error::other(e.to_string()))
-        }),
-    );
-    Ok(build_get_response(meta, range, body))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sha224_fallback_is_stable() {
-        let hash = sha224_hex("test");
-        assert_eq!(
-            hash,
-            "90a3ed9e32b2aaf4c61c410eb925426119e1a9dc53d4286ade99a809"
-        );
-    }
-
-    #[test]
-    fn key_normalization() {
-        assert_eq!(normalize_key("/a/b/c"), "a/b/c");
-        assert_eq!(normalize_key("a/b"), "a/b");
-        assert_eq!(normalize_key("///x"), "x");
-    }
-
-    #[test]
-    fn cache_key_uses_sha224_header_when_present() {
-        let meta = ObjectMeta {
-            content_length: 100,
-            content_type: None,
-            etag: None,
-            last_modified: None,
-            cache_control: None,
-            content_encoding: None,
-            metadata: [("sha224".into(), "deadbeef".into())]
-                .into_iter()
-                .collect(),
-        };
-        assert_eq!(resolve_cache_key(&meta, "some/key"), "deadbeef");
-    }
-
-    #[test]
-    fn cache_key_falls_back_to_key_hash() {
-        let meta = ObjectMeta {
-            content_length: 100,
-            content_type: None,
-            etag: None,
-            last_modified: None,
-            cache_control: None,
-            content_encoding: None,
-            metadata: Default::default(),
-        };
-        let key = resolve_cache_key(&meta, "test");
-        assert_eq!(
-            key,
-            "k_90a3ed9e32b2aaf4c61c410eb925426119e1a9dc53d4286ade99a809"
-        );
-    }
-
-    #[test]
-    fn fallback_key_does_not_collide_with_content_addressed_key() {
-        let hash = "90a3ed9e32b2aaf4c61c410eb925426119e1a9dc53d4286ade99a809";
-
-        let meta_with_header = ObjectMeta {
-            content_length: 100,
-            content_type: None,
-            etag: None,
-            last_modified: None,
-            cache_control: None,
-            content_encoding: None,
-            metadata: [("sha224".into(), hash.into())].into_iter().collect(),
-        };
-        let meta_without_header = ObjectMeta {
-            content_length: 200,
-            content_type: None,
-            etag: None,
-            last_modified: None,
-            cache_control: None,
-            content_encoding: None,
-            metadata: Default::default(),
-        };
-
-        let content_key = resolve_cache_key(&meta_with_header, "irrelevant");
-        let fallback_key = resolve_cache_key(&meta_without_header, "test");
-        assert_ne!(content_key, fallback_key);
+        // Signal that all downstream readers are done for chunks we've consumed
+        let first_chunk = (serve_start / chunk_size) as usize;
+        let last_chunk = (serve_end / chunk_size) as usize;
+        for idx in first_chunk..=last_chunk.min(download.chunk_count() - 1) {
+            download.chunk(idx).readers_done.store(true, std::sync::atomic::Ordering::Release);
+            download.chunk(idx).try_release();
+        }
     }
 }

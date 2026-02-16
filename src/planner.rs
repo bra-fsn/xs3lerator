@@ -1,77 +1,64 @@
 use std::cmp::{max, min};
 
-/// Computed download strategy for a single S3 object.
+/// Computed download strategy for an object.
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkPlan {
+    #[allow(dead_code)] // validated by planner tests
     pub concurrency: usize,
     pub chunk_size: u64,
+    #[allow(dead_code)] // validated by planner tests
+    pub num_chunks: usize,
 }
 
-/// Optimal chunk baseline derived from S3 benchmarks (us-west-2, 2025):
-///
-/// | Concurrency | Best chunk | Throughput |
-/// |-------------|-----------|------------|
-/// | 8           | 8 MiB     | ~557 MiB/s |
-/// | 16          | 8 MiB     | ~1.4 GiB/s |
-/// | 32          | 16 MiB    | ~2.9 GiB/s |
-/// | 64          | 8 MiB     | ~5.5 GiB/s |
-/// | 128         | 4 MiB     | ~5.7 GiB/s |
-///
-/// S3 uses erasure coding internally. While the exact segment size is not
-/// public, benchmarks suggest an internal stripe boundary around 8-32 MiB.
-/// Chunks aligned to ~8 MiB give consistently high throughput across
-/// concurrency levels.
-const S3_OPTIMAL_CHUNK_BASELINE: u64 = 8 * 1024 * 1024;
+/// Maximum S3 multipart upload part size (5 GiB).
+const S3_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Compute the download plan for an S3 object.
+/// Compute the download plan for an object using dual-ramp sizing.
 ///
-/// The planner uses the optimal chunk baseline (8 MiB from S3 benchmarks),
-/// clamped to user-configured min/max, and scales concurrency to the number
-/// of chunks. Keeping chunks small (~8 MiB) is critical:
+/// Both concurrency and chunk size scale together:
+///   - For small files, fewer connections are used (one per `min_chunk`-sized piece).
+///   - For large files, exactly `max_concurrency` connections each download 1/Nth.
+///   - Chunk size is clamped to 5 GiB (S3 multipart part ceiling).
 ///
-///   - Workers stream S3 data to disk; memory per-worker is O(network_buffer),
-///     not O(chunk_size). Large chunks waste nothing but add retry cost.
-///   - Readers stream to clients progressively within each chunk, so smaller
-///     chunks give finer-grained progress and faster time-to-first-byte.
-///   - The 8 MiB baseline matches S3's internal erasure-coding stride,
-///     giving consistently high throughput across concurrency levels.
+/// The same function is used for both S3 and HTTP upstream downloads — only
+/// the `max_concurrency` differs (e.g. 32 for S3, 8 for HTTP).
 pub fn compute_chunk_plan(
-    object_size: u64,
+    file_size: u64,
     max_concurrency: usize,
     min_chunk: u64,
-    max_chunk: u64,
 ) -> ChunkPlan {
-    if object_size == 0 {
+    if file_size == 0 {
         return ChunkPlan {
             concurrency: 1,
             chunk_size: min_chunk.max(1),
+            num_chunks: 0,
         };
     }
 
-    let chunk_size = min(max_chunk, max(min_chunk, S3_OPTIMAL_CHUNK_BASELINE));
-    let chunk_count = object_size.div_ceil(chunk_size) as usize;
-    let concurrency = min(max_concurrency, chunk_count).max(1);
+    let chunk_size = max(min_chunk, file_size.div_ceil(max_concurrency as u64));
+    let chunk_size = min(chunk_size, S3_MAX_PART_SIZE);
+    let num_chunks = file_size.div_ceil(chunk_size) as usize;
+    let concurrency = min(max_concurrency, num_chunks).max(1);
 
     ChunkPlan {
         concurrency,
         chunk_size,
+        num_chunks,
     }
 }
 
-/// Produce byte-ranges `(start, end_inclusive)` covering the full object.
-pub fn compute_ranges(object_size: u64, chunk_size: u64) -> Vec<(u64, u64)> {
-    if object_size == 0 {
-        return Vec::new();
-    }
-    let count = object_size.div_ceil(chunk_size) as usize;
-    let mut ranges = Vec::with_capacity(count);
-    let mut offset = 0u64;
-    while offset < object_size {
-        let end = min(offset + chunk_size - 1, object_size - 1);
-        ranges.push((offset, end));
-        offset = end + 1;
-    }
-    ranges
+/// Byte range `(start, end_inclusive)` for a given chunk index.
+pub fn chunk_byte_range(idx: usize, chunk_size: u64, object_size: u64) -> (u64, u64) {
+    let start = idx as u64 * chunk_size;
+    let end = min(start + chunk_size - 1, object_size.saturating_sub(1));
+    (start, end)
+}
+
+/// Expected byte count for a given chunk.
+pub fn expected_chunk_len(idx: usize, chunk_size: u64, object_size: u64) -> u64 {
+    let start = idx as u64 * chunk_size;
+    let end = min(start + chunk_size, object_size);
+    end - start
 }
 
 #[cfg(test)]
@@ -80,50 +67,96 @@ mod tests {
 
     #[test]
     fn zero_size_object() {
-        let p = compute_chunk_plan(0, 32, 1 << 20, 256 << 20);
+        let p = compute_chunk_plan(0, 8, 8 << 20);
         assert_eq!(p.concurrency, 1);
+        assert_eq!(p.num_chunks, 0);
     }
 
     #[test]
-    fn small_file_single_stream() {
-        let p = compute_chunk_plan(500_000, 32, 1 << 20, 256 << 20);
+    fn small_file_single_connection() {
+        // 5 MB file, 8 MB min chunk → 1 chunk, 1 connection
+        let p = compute_chunk_plan(5 * 1024 * 1024, 8, 8 << 20);
+        assert_eq!(p.num_chunks, 1);
         assert_eq!(p.concurrency, 1);
-        assert!(p.chunk_size >= 500_000);
+        assert_eq!(p.chunk_size, 8 << 20);
     }
 
     #[test]
-    fn medium_file_moderate_concurrency() {
-        // 64 MiB file with 8 MiB chunks → 8 chunks
-        let p = compute_chunk_plan(64 << 20, 32, 1 << 20, 256 << 20);
+    fn medium_file_ramps_connections() {
+        // 16 MB → 2 chunks, 2 connections
+        let p = compute_chunk_plan(16 << 20, 8, 8 << 20);
+        assert_eq!(p.num_chunks, 2);
+        assert_eq!(p.concurrency, 2);
+        assert_eq!(p.chunk_size, 8 << 20);
+    }
+
+    #[test]
+    fn exact_max_concurrency() {
+        // 64 MB → 8 chunks of 8 MB, 8 connections
+        let p = compute_chunk_plan(64 << 20, 8, 8 << 20);
+        assert_eq!(p.num_chunks, 8);
         assert_eq!(p.concurrency, 8);
         assert_eq!(p.chunk_size, 8 << 20);
     }
 
     #[test]
-    fn large_file_max_concurrency() {
-        let p = compute_chunk_plan(10 * 1024 * 1024 * 1024, 32, 1 << 20, 256 << 20);
-        assert!(p.concurrency > 1);
-        assert!(p.concurrency <= 32);
-        assert!(p.chunk_size >= 1 << 20);
-        assert!(p.chunk_size <= 256 << 20);
+    fn large_file_scales_chunk_size() {
+        // 128 MB → 8 chunks of 16 MB, 8 connections
+        let p = compute_chunk_plan(128 << 20, 8, 8 << 20);
+        assert_eq!(p.num_chunks, 8);
+        assert_eq!(p.concurrency, 8);
+        assert_eq!(p.chunk_size, 16 << 20);
     }
 
     #[test]
-    fn ranges_are_contiguous_and_cover_full_object() {
-        let size = 10_000_000u64;
-        let chunk = 3_000_000u64;
-        let ranges = compute_ranges(size, chunk);
-        assert_eq!(ranges.first().unwrap().0, 0);
-        assert_eq!(ranges.last().unwrap().1, size - 1);
-        for pair in ranges.windows(2) {
-            assert_eq!(pair[0].1 + 1, pair[1].0);
+    fn one_gig_file() {
+        // 1 GB → 8 chunks of 128 MB, 8 connections
+        let p = compute_chunk_plan(1 << 30, 8, 8 << 20);
+        assert_eq!(p.concurrency, 8);
+        assert_eq!(p.chunk_size, 128 << 20);
+    }
+
+    #[test]
+    fn huge_file_hits_s3_part_ceiling() {
+        // 48.8 TiB → chunk_size clamped to 5 GiB
+        let size = 48_800_000_000_000u64;
+        let p = compute_chunk_plan(size, 8, 8 << 20);
+        assert_eq!(p.chunk_size, S3_MAX_PART_SIZE);
+        assert!(p.num_chunks <= 10_000);
+    }
+
+    #[test]
+    fn s3_concurrency_32() {
+        // 1 GB with S3 concurrency 32 → 32 chunks of ~32 MB
+        let p = compute_chunk_plan(1 << 30, 32, 8 << 20);
+        assert_eq!(p.concurrency, 32);
+        assert_eq!(p.num_chunks, 32);
+    }
+
+    #[test]
+    fn chunk_byte_ranges_contiguous() {
+        let size = 100_000_000u64;
+        let p = compute_chunk_plan(size, 8, 8 << 20);
+        let mut prev_end = None;
+        for idx in 0..p.num_chunks {
+            let (start, end) = chunk_byte_range(idx, p.chunk_size, size);
+            if let Some(pe) = prev_end {
+                assert_eq!(start, pe + 1);
+            } else {
+                assert_eq!(start, 0);
+            }
+            prev_end = Some(end);
         }
+        assert_eq!(prev_end.unwrap(), size - 1);
     }
 
     #[test]
-    fn single_byte_object() {
-        let ranges = compute_ranges(1, 1 << 20);
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0], (0, 0));
+    fn expected_chunk_len_last_chunk() {
+        // 65 MB with 8 MB chunks: 8 full + 1 MB remainder
+        let size: u64 = 65 << 20;
+        let chunk: u64 = 8 << 20;
+        let last_idx = (size.div_ceil(chunk) - 1) as usize;
+        assert_eq!(expected_chunk_len(0, chunk, size), chunk);
+        assert_eq!(expected_chunk_len(last_idx, chunk, size), 1 << 20);
     }
 }

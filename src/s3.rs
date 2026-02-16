@@ -1,14 +1,11 @@
-use std::collections::HashMap;
-use std::pin::Pin;
-
 use async_trait::async_trait;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
-use tokio_util::io::ReaderStream;
 
 use crate::error::ProxyError;
 
@@ -16,16 +13,7 @@ use crate::error::ProxyError;
 #[derive(Debug, Clone)]
 pub struct ObjectMeta {
     pub content_length: u64,
-    pub content_type: Option<String>,
-    pub etag: Option<String>,
-    pub last_modified: Option<String>,
-    pub cache_control: Option<String>,
-    pub content_encoding: Option<String>,
-    pub metadata: HashMap<String, String>,
 }
-
-pub type BoxByteStream =
-    Pin<Box<dyn Stream<Item = Result<Bytes, ProxyError>> + Send>>;
 
 /// Abstraction over S3 access, enabling mock implementations for testing.
 #[async_trait]
@@ -36,7 +24,6 @@ pub trait Upstream: Send + Sync {
         key: &str,
     ) -> Result<ObjectMeta, ProxyError>;
 
-    /// Fetch a byte range and return all data at once.
     async fn get_range_bytes(
         &self,
         bucket: &str,
@@ -44,15 +31,6 @@ pub trait Upstream: Send + Sync {
         start: u64,
         end_inclusive: u64,
     ) -> Result<Bytes, ProxyError>;
-
-    /// Fetch a byte range as an async stream (for passthrough mode).
-    async fn get_range_stream(
-        &self,
-        bucket: &str,
-        key: &str,
-        start: u64,
-        end_inclusive: u64,
-    ) -> Result<BoxByteStream, ProxyError>;
 }
 
 /// Production S3 client backed by the official AWS SDK.
@@ -88,18 +66,6 @@ impl Upstream for AwsUpstream {
                 .content_length()
                 .unwrap_or_default()
                 .max(0) as u64,
-            content_type: output.content_type().map(str::to_owned),
-            etag: output.e_tag().map(str::to_owned),
-            last_modified: output.last_modified().and_then(|t| {
-                // AWS SDK DateTime::to_string() produces ISO 8601, but HTTP
-                // requires RFC 7231 format: "Mon, 09 Feb 2026 09:18:32 GMT"
-                let epoch = std::time::UNIX_EPOCH
-                    + std::time::Duration::from_secs(t.secs().max(0) as u64);
-                httpdate::fmt_http_date(epoch).into()
-            }),
-            cache_control: output.cache_control().map(str::to_owned),
-            content_encoding: output.content_encoding().map(str::to_owned),
-            metadata: output.metadata().cloned().unwrap_or_default(),
         })
     }
 
@@ -128,31 +94,114 @@ impl Upstream for AwsUpstream {
             .map(|agg| agg.into_bytes())
             .map_err(|e| ProxyError::Upstream(e.to_string()))
     }
+}
 
-    async fn get_range_stream(
+// ---------------------------------------------------------------------------
+// S3 Multipart Upload
+// ---------------------------------------------------------------------------
+
+/// Handles S3 multipart upload operations.
+#[derive(Clone)]
+pub struct S3Uploader {
+    client: Client,
+}
+
+impl S3Uploader {
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+
+    pub async fn create_multipart(
         &self,
         bucket: &str,
         key: &str,
-        start: u64,
-        end_inclusive: u64,
-    ) -> Result<BoxByteStream, ProxyError> {
-        let range = format!("bytes={start}-{end_inclusive}");
+    ) -> Result<String, ProxyError> {
         let output = self
             .client
-            .get_object()
+            .create_multipart_upload()
             .bucket(bucket)
             .key(key)
-            .range(range)
             .send()
             .await
-            .map_err(map_get_err)?;
+            .map_err(|e| ProxyError::Internal(format!("create multipart: {}", format_sdk_error(&e))))?;
 
-        let reader = output.body.into_async_read();
-        let stream = ReaderStream::with_capacity(reader, 256 * 1024)
-            .map(|r| r.map_err(|e| ProxyError::Upstream(e.to_string())));
-        Ok(Box::pin(stream))
+        output
+            .upload_id()
+            .map(str::to_owned)
+            .ok_or_else(|| ProxyError::Internal("no upload_id in response".into()))
+    }
+
+    pub async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: Bytes,
+    ) -> Result<CompletedPart, ProxyError> {
+        let output = self
+            .client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal(format!("upload part {part_number}: {}", format_sdk_error(&e))))?;
+
+        Ok(CompletedPart::builder()
+            .part_number(part_number)
+            .set_e_tag(output.e_tag().map(str::to_owned))
+            .build())
+    }
+
+    pub async fn complete_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        mut parts: Vec<CompletedPart>,
+    ) -> Result<(), ProxyError> {
+        parts.sort_by_key(|p| p.part_number());
+        self.client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal(format!("complete multipart: {}", format_sdk_error(&e))))?;
+        Ok(())
+    }
+
+    pub async fn abort_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), ProxyError> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal(format!("abort multipart: {}", format_sdk_error(&e))))?;
+        Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Error helpers
+// ---------------------------------------------------------------------------
 
 fn map_head_err(err: SdkError<HeadObjectError>) -> ProxyError {
     match &err {
@@ -172,9 +221,6 @@ fn map_get_err(err: SdkError<GetObjectError>) -> ProxyError {
     }
 }
 
-/// Walk the full error source chain so the user sees *why* the request failed
-/// (e.g. "dispatch failure: connection refused: Connection refused (os error 111)")
-/// instead of just "dispatch failure".
 fn format_sdk_error(err: &dyn std::error::Error) -> String {
     let mut msg = err.to_string();
     let mut cur: &dyn std::error::Error = err;

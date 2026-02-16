@@ -6,11 +6,6 @@ pub struct ByteRange {
     pub end_inclusive: u64,
 }
 
-impl ByteRange {
-    pub fn len(&self) -> u64 {
-        self.end_inclusive - self.start + 1
-    }
-}
 
 /// Parse a single-range HTTP Range header value against a known object size.
 /// Multi-range requests are rejected (returns RangeNotSatisfiable).
@@ -90,7 +85,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.start, 0);
         assert_eq!(r.end_inclusive, 499);
-        assert_eq!(r.len(), 500);
+        assert_eq!(r.end_inclusive - r.start + 1, 500);
     }
 
     #[test]
@@ -100,7 +95,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.start, 500);
         assert_eq!(r.end_inclusive, 999);
-        assert_eq!(r.len(), 500);
+        assert_eq!(r.end_inclusive - r.start + 1, 500);
     }
 
     #[test]

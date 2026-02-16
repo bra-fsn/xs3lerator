@@ -5,20 +5,19 @@ use byte_unit::Byte;
 use clap::Parser;
 
 const DEFAULT_PORT: u16 = 8080;
-const DEFAULT_HIERARCHY_LEVEL: usize = 4;
-const DEFAULT_MAX_CONCURRENCY: usize = 32;
-const DEFAULT_MIN_CHUNK: &str = "1MiB";
-const DEFAULT_MAX_CHUNK: &str = "256MiB";
-const DEFAULT_GC_INTERVAL: u64 = 15;
-const DEFAULT_GC_WATERMARK: u8 = 95;
-const DEFAULT_GC_TARGET: u8 = 90;
+const DEFAULT_S3_CONCURRENCY: usize = 32;
+const DEFAULT_HTTP_CONCURRENCY: usize = 8;
+const DEFAULT_MIN_CHUNK: &str = "8MiB";
+const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
-/// High-performance S3 HTTP proxy cache with parallel chunked downloads,
-/// content-addressed caching, and background LRU eviction.
+/// High-performance HTTP caching proxy with parallel downloads and S3-backed storage.
 ///
-/// Two modes of operation:
-///   Cache mode (default): downloads objects from S3 into a local cache directory.
-///   Mount mode (--s3-mount-path): serves objects directly from a mount-s3 FUSE mount.
+/// Accepts GET requests where the URL path encodes `/<bucket>/<s3_key>`.
+/// The real upstream URL is passed in the `X-Xs3lerator-Upstream-Url` header
+/// (base64-encoded).  Depending on the `X-Xs3lerator-Cache-Skip` header,
+/// xs3lerator either serves the object from S3 (parallel range-GETs) or
+/// fetches it from the upstream, streams it to the client, and simultaneously
+/// uploads it to S3 via multipart upload.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "xs3lerator", version, about, long_about = None)]
 pub struct CliArgs {
@@ -29,10 +28,6 @@ pub struct CliArgs {
     /// TCP port to listen on.
     #[arg(long, env = "XS3_PORT", default_value_t = DEFAULT_PORT)]
     pub port: u16,
-
-    /// S3 bucket name (required).
-    #[arg(long, env = "XS3_BUCKET")]
-    pub bucket: String,
 
     /// AWS region. Falls back to SDK default resolution chain.
     #[arg(long, env = "XS3_REGION")]
@@ -46,35 +41,16 @@ pub struct CliArgs {
     #[arg(long, env = "XS3_S3_FORCE_PATH_STYLE", default_value_t = false)]
     pub s3_force_path_style: bool,
 
-    /// Mount mode: path where the S3 bucket is mounted via mount-s3.
-    /// When set, objects are served directly from this path instead of
-    /// downloading into a local cache. Disables --cache-dir, --max-cache-size,
-    /// and the background evictor.
-    #[arg(long, env = "XS3_S3_MOUNT_PATH")]
-    pub s3_mount_path: Option<PathBuf>,
+    /// Maximum parallel range-request streams per S3 object download.
+    #[arg(long, env = "XS3_S3_CONCURRENCY", default_value_t = DEFAULT_S3_CONCURRENCY)]
+    pub s3_concurrency: usize,
 
-    /// Local cache directory (required in cache mode, ignored in mount mode).
-    #[arg(long, env = "XS3_CACHE_DIR")]
-    pub cache_dir: Option<PathBuf>,
+    /// Maximum parallel connections per upstream HTTP download.
+    #[arg(long, env = "XS3_HTTP_CONCURRENCY", default_value_t = DEFAULT_HTTP_CONCURRENCY)]
+    pub http_concurrency: usize,
 
-    /// Maximum total cache size, e.g. 100GiB (required in cache mode, ignored in mount mode).
-    #[arg(long, env = "XS3_MAX_CACHE_SIZE", value_parser = parse_byte_size)]
-    pub max_cache_size: Option<u64>,
-
-    /// Cache directory hierarchy depth. Each level uses one hex nibble.
-    /// Level 4 → e/8/b/0/<hash>
-    #[arg(
-        long,
-        env = "XS3_CACHE_HIERARCHY_LEVEL",
-        default_value_t = DEFAULT_HIERARCHY_LEVEL
-    )]
-    pub cache_hierarchy_level: usize,
-
-    /// Maximum parallel range-request streams per object download.
-    #[arg(long, env = "XS3_MAX_CONCURRENCY", default_value_t = DEFAULT_MAX_CONCURRENCY)]
-    pub max_concurrency: usize,
-
-    /// Minimum upstream chunk size, e.g. 1MiB.
+    /// Minimum chunk size for parallel downloads.  Also the minimum S3
+    /// multipart upload part size (must be >= 5 MiB).
     #[arg(
         long,
         env = "XS3_MIN_CHUNK_SIZE",
@@ -83,38 +59,15 @@ pub struct CliArgs {
     )]
     pub min_chunk_size: u64,
 
-    /// Maximum upstream chunk size, e.g. 256MiB.
-    #[arg(
-        long,
-        env = "XS3_MAX_CHUNK_SIZE",
-        default_value = DEFAULT_MAX_CHUNK,
-        value_parser = parse_byte_size
-    )]
-    pub max_chunk_size: u64,
+    /// Directory for temporary chunk files.  Defaults to the system temp dir.
+    /// Set to /dev/shm for pure-RAM buffering on EBS-constrained environments.
+    #[arg(long, env = "XS3_TEMP_DIR")]
+    pub temp_dir: Option<PathBuf>,
 
-    /// Background cache GC scan interval in seconds.
-    #[arg(
-        long,
-        env = "XS3_GC_INTERVAL_SECONDS",
-        default_value_t = DEFAULT_GC_INTERVAL
-    )]
-    pub gc_interval_seconds: u64,
-
-    /// GC triggers when cache usage reaches this percentage of --max-cache-size.
-    #[arg(
-        long,
-        env = "XS3_GC_WATERMARK_PERCENT",
-        default_value_t = DEFAULT_GC_WATERMARK
-    )]
-    pub gc_watermark_percent: u8,
-
-    /// GC evicts files until cache usage drops to this percentage of --max-cache-size.
-    #[arg(
-        long,
-        env = "XS3_GC_TARGET_PERCENT",
-        default_value_t = DEFAULT_GC_TARGET
-    )]
-    pub gc_target_percent: u8,
+    /// Skip TLS certificate verification for upstream HTTP requests (global).
+    /// Can also be set per-request via the X-Xs3lerator-Tls-Skip-Verify header.
+    #[arg(long, env = "XS3_UPSTREAM_TLS_SKIP_VERIFY", default_value_t = false)]
+    pub upstream_tls_skip_verify: bool,
 
     /// Path to write JSONL debug trace (download/reader timing, S3 latency,
     /// chunk progress).  Disabled when omitted.
@@ -122,111 +75,49 @@ pub struct CliArgs {
     pub debug_trace: Option<String>,
 }
 
-/// Operational mode resolved from CLI arguments.
-#[derive(Debug, Clone)]
-pub enum OperatingMode {
-    /// Classic cache mode: download from S3, cache locally, serve from cache.
-    Cache {
-        cache_dir: PathBuf,
-        max_cache_size: u64,
-        cache_hierarchy_level: usize,
-        max_concurrency: usize,
-        min_chunk_size: u64,
-        max_chunk_size: u64,
-        gc_interval_seconds: u64,
-        gc_watermark_percent: u8,
-        gc_target_percent: u8,
-    },
-    /// Mount mode: serve objects directly from a mount-s3 FUSE mount.
-    Mount {
-        mount_path: PathBuf,
-    },
-}
-
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind_ip: IpAddr,
     pub port: u16,
-    pub bucket: String,
     pub region: Option<String>,
     pub s3_endpoint_url: Option<String>,
     pub s3_force_path_style: bool,
-    pub mode: OperatingMode,
-}
-
-impl AppConfig {
-    pub fn cache_mode(&self) -> Option<&OperatingMode> {
-        match &self.mode {
-            m @ OperatingMode::Cache { .. } => Some(m),
-            _ => None,
-        }
-    }
-
-    pub fn mount_path(&self) -> Option<&std::path::Path> {
-        match &self.mode {
-            OperatingMode::Mount { mount_path } => Some(mount_path),
-            _ => None,
-        }
-    }
+    pub s3_concurrency: usize,
+    pub http_concurrency: usize,
+    pub min_chunk_size: u64,
+    pub temp_dir: PathBuf,
+    pub upstream_tls_skip_verify: bool,
 }
 
 impl TryFrom<CliArgs> for AppConfig {
     type Error = anyhow::Error;
 
     fn try_from(args: CliArgs) -> Result<Self, Self::Error> {
-        let mode = if let Some(mount_path) = args.s3_mount_path {
-            anyhow::ensure!(
-                mount_path.is_dir(),
-                "--s3-mount-path {mount_path:?} is not an existing directory"
-            );
-            OperatingMode::Mount { mount_path }
-        } else {
-            let cache_dir = args.cache_dir.ok_or_else(|| {
-                anyhow::anyhow!("--cache-dir is required when not using --s3-mount-path")
-            })?;
-            let max_cache_size = args.max_cache_size.ok_or_else(|| {
-                anyhow::anyhow!("--max-cache-size is required when not using --s3-mount-path")
-            })?;
-            anyhow::ensure!(
-                args.cache_hierarchy_level >= 1 && args.cache_hierarchy_level <= 12,
-                "cache-hierarchy-level must be in 1..=12"
-            );
-            anyhow::ensure!(args.max_concurrency >= 1, "max-concurrency must be >= 1");
-            anyhow::ensure!(
-                args.min_chunk_size > 0 && args.max_chunk_size > 0,
-                "chunk sizes must be > 0"
-            );
-            anyhow::ensure!(
-                args.min_chunk_size <= args.max_chunk_size,
-                "min-chunk-size must be <= max-chunk-size"
-            );
-            anyhow::ensure!(
-                args.gc_target_percent > 0
-                    && args.gc_target_percent < args.gc_watermark_percent
-                    && args.gc_watermark_percent <= 100,
-                "require 0 < gc-target-percent < gc-watermark-percent <= 100"
-            );
-            OperatingMode::Cache {
-                cache_dir,
-                max_cache_size,
-                cache_hierarchy_level: args.cache_hierarchy_level,
-                max_concurrency: args.max_concurrency,
-                min_chunk_size: args.min_chunk_size,
-                max_chunk_size: args.max_chunk_size,
-                gc_interval_seconds: args.gc_interval_seconds,
-                gc_watermark_percent: args.gc_watermark_percent,
-                gc_target_percent: args.gc_target_percent,
-            }
-        };
+        anyhow::ensure!(args.s3_concurrency >= 1, "s3-concurrency must be >= 1");
+        anyhow::ensure!(args.http_concurrency >= 1, "http-concurrency must be >= 1");
+        anyhow::ensure!(
+            args.min_chunk_size >= S3_MIN_PART_SIZE,
+            "min-chunk-size must be >= 5 MiB (S3 multipart minimum part size)"
+        );
+
+        let temp_dir = args.temp_dir.unwrap_or_else(std::env::temp_dir);
+        anyhow::ensure!(
+            temp_dir.is_dir(),
+            "temp-dir {:?} is not an existing directory",
+            temp_dir
+        );
 
         Ok(Self {
             bind_ip: args.bind_ip.unwrap_or_else(|| IpAddr::from([0, 0, 0, 0])),
             port: args.port,
-            bucket: args.bucket,
             region: args.region,
             s3_endpoint_url: args.s3_endpoint_url,
             s3_force_path_style: args.s3_force_path_style,
-            mode,
+            s3_concurrency: args.s3_concurrency,
+            http_concurrency: args.http_concurrency,
+            min_chunk_size: args.min_chunk_size,
+            temp_dir,
+            upstream_tls_skip_verify: args.upstream_tls_skip_verify,
         })
     }
 }
@@ -243,46 +134,29 @@ mod tests {
 
     #[test]
     fn parse_common_sizes() {
-        assert_eq!(parse_byte_size("1MiB").unwrap(), 1_048_576);
+        assert_eq!(parse_byte_size("8MiB").unwrap(), 8_388_608);
         assert_eq!(parse_byte_size("256MiB").unwrap(), 268_435_456);
         assert_eq!(parse_byte_size("1GiB").unwrap(), 1_073_741_824);
-        assert_eq!(parse_byte_size("100GiB").unwrap(), 107_374_182_400);
-        assert_eq!(parse_byte_size("500GB").unwrap(), 500_000_000_000);
     }
 
     #[test]
-    fn validation_rejects_bad_gc_config() {
-        let mut args = CliArgs::parse_from([
-            "xs3lerator",
-            "--bucket",
-            "b",
-            "--cache-dir",
-            "/tmp",
-            "--max-cache-size",
-            "1GiB",
-        ]);
-        args.gc_target_percent = 95;
-        args.gc_watermark_percent = 90;
-        assert!(AppConfig::try_from(args).is_err());
-    }
-
-    #[test]
-    fn cache_mode_requires_cache_dir() {
-        let args = CliArgs::parse_from(["xs3lerator", "--bucket", "b"]);
-        let err = AppConfig::try_from(args).unwrap_err();
-        assert!(err.to_string().contains("--cache-dir"));
-    }
-
-    #[test]
-    fn mount_mode_skips_cache_validation() {
+    fn validation_rejects_small_chunk() {
         let args = CliArgs::parse_from([
             "xs3lerator",
-            "--bucket",
-            "b",
-            "--s3-mount-path",
-            "/tmp",
+            "--min-chunk-size",
+            "1MiB",
         ]);
+        let err = AppConfig::try_from(args).unwrap_err();
+        assert!(err.to_string().contains("5 MiB"));
+    }
+
+    #[test]
+    fn defaults_produce_valid_config() {
+        let args = CliArgs::parse_from(["xs3lerator"]);
         let config = AppConfig::try_from(args).unwrap();
-        assert!(config.mount_path().is_some());
+        assert_eq!(config.s3_concurrency, 32);
+        assert_eq!(config.http_concurrency, 8);
+        assert_eq!(config.min_chunk_size, 8_388_608);
+        assert!(!config.upstream_tls_skip_verify);
     }
 }
