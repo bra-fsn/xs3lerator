@@ -23,6 +23,16 @@ use crate::s3::{AwsUpstream, S3Uploader, Upstream};
 use crate::trace::{trace_log, TraceWriter};
 use crate::upstream_fetcher;
 
+/// RAII guard that cancels an in-flight download when dropped.
+/// Used for S3 cache-hit reads so that workers stop when the client disconnects.
+struct CancelGuard(Arc<InFlightDownload>);
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
@@ -200,6 +210,7 @@ async fn handle_s3_path(
         object_size,
         client_byte_range,
         resp_headers,
+        true, // cancel S3 workers when client disconnects
     )
 }
 
@@ -234,10 +245,16 @@ async fn run_s3_download(
 
             handles.push(tokio::spawn(async move {
                 let download = unsafe { &*(dl_ptr as *const InFlightDownload) };
+                if download.is_cancelled() {
+                    return Ok::<(), ProxyError>(());
+                }
                 let mut body = s3.get_range_stream(&b, &k, s3_start, s3_end).await?;
 
                 let mut offset = 0u64;
                 while let Some(piece) = body.next().await {
+                    if download.is_cancelled() {
+                        break;
+                    }
                     let data = piece.map_err(|e| {
                         ProxyError::Upstream(format!("s3 stream chunk {idx}: {e}"))
                     })?;
@@ -250,12 +267,15 @@ async fn run_s3_download(
                     offset += to_write as u64;
                     download.record_written(idx, to_write as u64);
                 }
-                download.mark_chunk_done(idx);
+                if !download.is_cancelled() {
+                    download.mark_chunk_done(idx);
+                }
 
                 trace_log(&trace_c, || json!({
                     "event": "s3_chunk_done",
                     "chunk": idx,
                     "bytes": offset,
+                    "cancelled": download.is_cancelled(),
                 }));
                 Ok::<(), ProxyError>(())
             }));
@@ -351,15 +371,22 @@ async fn handle_upstream_path(
         full_size,
         client_byte_range,
         resp_headers,
+        false, // keep downloading for S3 upload even if client disconnects
     )
 }
 
 /// Build the HTTP response that streams data from in-flight chunk files.
+///
+/// When `cancel_on_drop` is true, the download is cancelled when the response
+/// stream is dropped (e.g. client disconnects).  Use this for S3 cache-hit
+/// reads where continuing is wasteful.  For upstream cache-miss downloads,
+/// pass false so the S3 upload can complete.
 fn build_streaming_response(
     download: Arc<InFlightDownload>,
     full_size: u64,
     client_range: Option<ByteRange>,
     mut extra_headers: HeaderMap,
+    cancel_on_drop: bool,
 ) -> ProxyResult<Response> {
     let (serve_start, serve_end, status) = match client_range {
         Some(ref r) => (r.start, r.end_inclusive, StatusCode::PARTIAL_CONTENT),
@@ -384,7 +411,7 @@ fn build_streaming_response(
     );
     extra_headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
 
-    let stream = make_download_stream(download, serve_start, serve_end, serve_len);
+    let stream = make_download_stream(download, serve_start, serve_end, serve_len, cancel_on_drop);
     let body = Body::from_stream(stream);
     let mut response = Response::builder()
         .status(status)
@@ -459,8 +486,17 @@ fn make_download_stream(
     serve_start: u64,
     serve_end: u64,
     serve_len: u64,
+    cancel_on_drop: bool,
 ) -> impl futures::Stream<Item = Result<Bytes, ProxyError>> {
     try_stream! {
+        // When this guard is dropped (stream finished or client disconnected),
+        // the download is cancelled so workers stop fetching from S3.
+        let _cancel_guard = if cancel_on_drop {
+            Some(CancelGuard(download.clone()))
+        } else {
+            None
+        };
+
         if serve_len == 0 {
             return;
         }

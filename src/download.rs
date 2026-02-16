@@ -111,6 +111,7 @@ pub struct InFlightDownload {
     chunk_queue: Mutex<VecDeque<usize>>,
     notify: Notify,
     failed: AtomicU8,
+    cancelled: AtomicBool,
     /// Set when the S3 multipart upload is fully completed.
     pub s3_upload_complete: AtomicBool,
 }
@@ -131,6 +132,7 @@ impl InFlightDownload {
             chunk_queue: Mutex::new(queue),
             notify: Notify::new(),
             failed: AtomicU8::new(0),
+            cancelled: AtomicBool::new(false),
             s3_upload_complete: AtomicBool::new(false),
         }
     }
@@ -188,6 +190,9 @@ impl InFlightDownload {
             if self.has_failed() {
                 return Err(ProxyError::Upstream("upstream download failed".into()));
             }
+            if self.is_cancelled() {
+                return Err(ProxyError::Internal("download cancelled".into()));
+            }
             self.notify.notified().await;
         }
     }
@@ -199,6 +204,16 @@ impl InFlightDownload {
 
     pub fn has_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire) != 0
+    }
+
+    /// Signal that no readers remain and workers should stop.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 
     /// Move chunks overlapping `[byte_start, byte_end_inclusive]` to the
