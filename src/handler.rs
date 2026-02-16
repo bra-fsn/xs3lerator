@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_stream::try_stream;
@@ -178,10 +179,11 @@ async fn handle_s3_path(
         let trace = state.trace.clone();
         let ck = format!("{cache_key}:{serve_start}-{serve_end}");
         let dm = state.downloads.clone();
+        let s3_concurrency = state.config.s3_concurrency;
 
         tokio::spawn(async move {
             let result = run_s3_download(
-                &s3, &b, &k, serve_start, &dl, &temp_dir, &trace,
+                &s3, &b, &k, serve_start, &dl, &temp_dir, &trace, s3_concurrency,
             )
             .await;
 
@@ -214,6 +216,10 @@ async fn handle_s3_path(
     )
 }
 
+/// Persistent S3 download workers: each loops pulling the *next* chunk
+/// in priority order from a shared atomic cursor, streaming each range-GET
+/// incrementally to its temp file.  This guarantees near-sequential chunk
+/// completion and allows the client to stream smoothly without stalls.
 async fn run_s3_download(
     s3: &AwsUpstream,
     bucket: &str,
@@ -222,48 +228,62 @@ async fn run_s3_download(
     download: &InFlightDownload,
     temp_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
+    max_concurrency: usize,
 ) -> ProxyResult<()> {
-    let mut handles = Vec::with_capacity(download.chunk_count());
+    let chunk_indices: Vec<usize> = std::iter::from_fn(|| download.pop_chunk()).collect();
 
-    for _ in 0..download.chunk_count() {
-        if let Some(idx) = download.pop_chunk() {
-            let chunk_file = create_temp_chunk_file(temp_dir)
-                .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
-            let chunk_file = Arc::new(chunk_file);
-            download.chunk(idx).set_file(chunk_file.clone());
+    // Create temp files for all chunks up front.
+    for &idx in &chunk_indices {
+        let chunk_file = create_temp_chunk_file(temp_dir)
+            .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
+        download.chunk(idx).set_file(Arc::new(chunk_file));
+    }
 
-            let (local_start, local_end) = download.chunk_byte_range(idx);
-            let s3_start = global_offset + local_start;
-            let s3_end = global_offset + local_end;
+    let num_workers = max_concurrency.min(chunk_indices.len());
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let chunks = Arc::new(chunk_indices);
+    let mut handles = Vec::with_capacity(num_workers);
 
-            let s3 = s3.clone();
-            let b = bucket.to_string();
-            let k = key.to_string();
-            let dl_ptr = download as *const InFlightDownload as usize;
-            let trace_c = trace.clone();
-            let expected = download.expected_chunk_len(idx);
+    for _ in 0..num_workers {
+        let cursor = cursor.clone();
+        let chunks = chunks.clone();
+        let s3 = s3.clone();
+        let b = bucket.to_string();
+        let k = key.to_string();
+        let dl_ptr = download as *const InFlightDownload as usize;
+        let trace_c = trace.clone();
 
-            handles.push(tokio::spawn(async move {
-                let download = unsafe { &*(dl_ptr as *const InFlightDownload) };
-                if download.is_cancelled() {
-                    return Ok::<(), ProxyError>(());
-                }
+        handles.push(tokio::spawn(async move {
+            let download = unsafe { &*(dl_ptr as *const InFlightDownload) };
+            loop {
+                if download.is_cancelled() { break; }
+
+                let pos = cursor.fetch_add(1, Ordering::Relaxed);
+                if pos >= chunks.len() { break; }
+                let idx = chunks[pos];
+
+                let chunk_file = download.chunk(idx).get_file()
+                    .ok_or_else(|| ProxyError::Internal(
+                        format!("s3 chunk {idx} file gone")
+                    ))?;
+                let (local_start, local_end) = download.chunk_byte_range(idx);
+                let s3_start = global_offset + local_start;
+                let s3_end = global_offset + local_end;
+                let expected = download.expected_chunk_len(idx);
+
                 let mut body = s3.get_range_stream(&b, &k, s3_start, s3_end).await?;
-
                 let mut offset = 0u64;
                 while let Some(piece) = body.next().await {
-                    if download.is_cancelled() {
-                        break;
-                    }
+                    if download.is_cancelled() { break; }
                     let data = piece.map_err(|e| {
                         ProxyError::Upstream(format!("s3 stream chunk {idx}: {e}"))
                     })?;
                     let to_write = min(data.len() as u64, expected - offset) as usize;
-                    if to_write == 0 {
-                        break;
-                    }
+                    if to_write == 0 { break; }
                     pwrite_all(&chunk_file, offset, &data[..to_write])
-                        .map_err(|e| ProxyError::Internal(format!("pwrite s3 chunk {idx}: {e}")))?;
+                        .map_err(|e| ProxyError::Internal(
+                            format!("pwrite s3 chunk {idx}: {e}")
+                        ))?;
                     offset += to_write as u64;
                     download.record_written(idx, to_write as u64);
                 }
@@ -277,9 +297,9 @@ async fn run_s3_download(
                     "bytes": offset,
                     "cancelled": download.is_cancelled(),
                 }));
-                Ok::<(), ProxyError>(())
-            }));
-        }
+            }
+            Ok::<(), ProxyError>(())
+        }));
     }
 
     for handle in handles {
@@ -539,7 +559,7 @@ fn make_download_stream(
         let first_chunk = (serve_start / chunk_size) as usize;
         let last_chunk = (serve_end / chunk_size) as usize;
         for idx in first_chunk..=last_chunk.min(download.chunk_count() - 1) {
-            download.chunk(idx).readers_done.store(true, std::sync::atomic::Ordering::Release);
+            download.chunk(idx).readers_done.store(true, Ordering::Release);
             download.chunk(idx).try_release();
         }
     }

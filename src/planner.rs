@@ -13,15 +13,22 @@ pub struct ChunkPlan {
 /// Maximum S3 multipart upload part size (5 GiB).
 const S3_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Compute the download plan for an object using dual-ramp sizing.
+/// Maximum number of parts in an S3 multipart upload.
+const MAX_S3_PARTS: u64 = 10_000;
+
+/// Compute the download plan for an object.
 ///
-/// Both concurrency and chunk size scale together:
-///   - For small files, fewer connections are used (one per `min_chunk`-sized piece).
-///   - For large files, exactly `max_concurrency` connections each download 1/Nth.
-///   - Chunk size is clamped to 5 GiB (S3 multipart part ceiling).
+/// Chunk size is kept at the configured minimum (`min_chunk`, typically 8 MiB)
+/// so that the client can start receiving data quickly — even when many workers
+/// share a slow link, each small chunk completes fast and the client can burst
+/// through a batch of pre-fetched chunks.
 ///
-/// The same function is used for both S3 and HTTP upstream downloads — only
-/// the `max_concurrency` differs (e.g. 32 for S3, 8 for HTTP).
+/// Chunk size is only bumped when the file would exceed S3's 10,000-part limit
+/// or the 5 GiB per-part ceiling.
+///
+/// Actual download concurrency is managed separately by a worker pool with
+/// progressive ramp-up (see `run_s3_download` / `run_adaptive_upstream`).
+/// The `concurrency` field here is the *maximum* number of workers.
 pub fn compute_chunk_plan(
     file_size: u64,
     max_concurrency: usize,
@@ -35,7 +42,7 @@ pub fn compute_chunk_plan(
         };
     }
 
-    let chunk_size = max(min_chunk, file_size.div_ceil(max_concurrency as u64));
+    let chunk_size = max(min_chunk, file_size.div_ceil(MAX_S3_PARTS));
     let chunk_size = min(chunk_size, S3_MAX_PART_SIZE);
     let num_chunks = file_size.div_ceil(chunk_size) as usize;
     let concurrency = min(max_concurrency, num_chunks).max(1);
@@ -100,37 +107,58 @@ mod tests {
     }
 
     #[test]
-    fn large_file_scales_chunk_size() {
-        // 128 MB → 8 chunks of 16 MB, 8 connections
+    fn large_file_keeps_small_chunks() {
+        // 128 MB → 16 chunks of 8 MB, capped at 8 concurrent workers
         let p = compute_chunk_plan(128 << 20, 8, 8 << 20);
-        assert_eq!(p.num_chunks, 8);
+        assert_eq!(p.num_chunks, 16);
         assert_eq!(p.concurrency, 8);
-        assert_eq!(p.chunk_size, 16 << 20);
+        assert_eq!(p.chunk_size, 8 << 20);
     }
 
     #[test]
     fn one_gig_file() {
-        // 1 GB → 8 chunks of 128 MB, 8 connections
+        // 1 GB → 128 chunks of 8 MB, 8 max concurrent
         let p = compute_chunk_plan(1 << 30, 8, 8 << 20);
         assert_eq!(p.concurrency, 8);
-        assert_eq!(p.chunk_size, 128 << 20);
+        assert_eq!(p.num_chunks, 128);
+        assert_eq!(p.chunk_size, 8 << 20);
     }
 
     #[test]
-    fn huge_file_hits_s3_part_ceiling() {
-        // 48.8 TiB → chunk_size clamped to 5 GiB
+    fn huge_file_respects_part_limit() {
+        // 48.8 TiB → ceil(48.8T / 10,000) = ~4.88 GB per chunk (under 5 GiB ceiling)
         let size = 48_800_000_000_000u64;
         let p = compute_chunk_plan(size, 8, 8 << 20);
-        assert_eq!(p.chunk_size, S3_MAX_PART_SIZE);
+        assert_eq!(p.chunk_size, size.div_ceil(MAX_S3_PARTS));
+        assert!(p.chunk_size < S3_MAX_PART_SIZE);
         assert!(p.num_chunks <= 10_000);
     }
 
     #[test]
+    fn extreme_file_hits_s3_part_ceiling() {
+        // 60 TiB → ceil(60T / 10,000) = 6 GB > 5 GiB → clamped to 5 GiB
+        let size = 60_000_000_000_000u64;
+        let p = compute_chunk_plan(size, 8, 8 << 20);
+        assert_eq!(p.chunk_size, S3_MAX_PART_SIZE);
+    }
+
+    #[test]
     fn s3_concurrency_32() {
-        // 1 GB with S3 concurrency 32 → 32 chunks of ~32 MB
+        // 1 GB with S3 concurrency 32 → 128 chunks of 8 MB, 32 max concurrent
         let p = compute_chunk_plan(1 << 30, 32, 8 << 20);
         assert_eq!(p.concurrency, 32);
-        assert_eq!(p.num_chunks, 32);
+        assert_eq!(p.num_chunks, 128);
+        assert_eq!(p.chunk_size, 8 << 20);
+    }
+
+    #[test]
+    fn huge_file_bumps_chunk_for_part_limit() {
+        // 100 GiB: 8 MiB chunks would be 12,800 parts (> 10,000)
+        // Planner bumps chunk_size to ceil(100 GiB / 10,000) ≈ 10.7 MiB
+        let size = 100u64 * 1024 * 1024 * 1024;
+        let p = compute_chunk_plan(size, 32, 8 << 20);
+        assert!(p.num_chunks <= 10_000);
+        assert!(p.chunk_size > 8 << 20);
     }
 
     #[test]

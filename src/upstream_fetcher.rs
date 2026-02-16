@@ -299,13 +299,14 @@ async fn start_parallel_upstream_download(
     let hdrs = upstream_headers.clone();
     let ck = cache_key.to_string();
     let dm_ptr = downloads as *const DownloadManager as usize;
+    let http_concurrency = config.http_concurrency;
 
     // Spawn the adaptive download workers
     tokio::spawn(async move {
         let downloads = unsafe { &*(dm_ptr as *const DownloadManager) };
         let result = run_adaptive_upstream(
             &temp_dir, &url, &client, &hdrs, initial_response,
-            &dl, &trace_clone,
+            &dl, &trace_clone, http_concurrency,
         )
         .await;
 
@@ -337,11 +338,15 @@ async fn start_parallel_upstream_download(
 /// 1. Pre-create temp files for all chunks.
 /// 2. Start streaming the initial full-GET response into chunks sequentially
 ///    (chunk 0, then 1, 2, …).
-/// 3. Simultaneously probe one range-GET for the first priority chunk.
-/// 4. If the probe succeeds (2xx), convert to parallel: tell the sequential
-///    stream to stop after its current chunk and spawn range-GET workers for
-///    the rest.
-/// 5. If the probe fails (403, connection error, etc.), let the sequential
+/// 3. Compute a sequential *runway*: the sequential stream handles the next
+///    `max_concurrency` chunks at full single-connection speed, giving the
+///    client smooth, uninterrupted data delivery.
+/// 4. Send a range-GET probe for the first chunk *beyond* the runway.
+/// 5. If the probe succeeds (2xx), set `stop_after` to the runway end and
+///    spawn persistent worker tasks that pull chunks **in order** from a
+///    shared cursor (aria2-style).  Workers reuse HTTP connections via
+///    reqwest's pool.
+/// 6. If the probe fails (403, connection error, etc.), let the sequential
 ///    stream continue through all chunks — the server lied about Accept-Ranges.
 async fn run_adaptive_upstream(
     temp_dir: &std::path::Path,
@@ -351,6 +356,7 @@ async fn run_adaptive_upstream(
     initial_response: reqwest::Response,
     download: &InFlightDownload,
     trace: &Option<Arc<TraceWriter>>,
+    max_concurrency: usize,
 ) -> Result<(), ProxyError> {
     // Pre-create temp files for all chunks so the sequential stream can use them.
     for idx in 0..download.chunk_count() {
@@ -381,107 +387,156 @@ async fn run_adaptive_upstream(
     let mut parallel_handles: Vec<tokio::task::JoinHandle<Result<(), ProxyError>>> = Vec::new();
 
     if !remaining.is_empty() {
-        // Probe: send one range-GET for the first priority chunk.
-        let probe_idx = remaining[0];
-        let (probe_start, probe_end) = download.chunk_byte_range(probe_idx);
+        // Compute the sequential runway: let sequential handle the next
+        // max_concurrency chunks at full single-connection speed so the
+        // client gets smooth, uninterrupted data delivery while parallel
+        // workers establish connections for chunks further ahead.
+        let seq_chunk_now = active_sequential_chunk(download);
+        let runway = max_concurrency;
+        let estimated_stop = (seq_chunk_now + runway)
+            .min(download.chunk_count().saturating_sub(1));
 
-        let probe_resp = {
-            let mut req = http_client.get(upstream_url);
-            for (name, value) in upstream_headers.iter() {
-                if let Ok(v) = value.to_str() {
-                    req = req.header(name.as_str(), v);
-                }
-            }
-            req = req.header("Range", format!("bytes={probe_start}-{probe_end}"));
-            req.send().await
-        };
+        // Find a probe target *beyond* the runway — no point probing a
+        // chunk the sequential stream will fill anyway.
+        let probe_target = remaining.iter()
+            .find(|&&i| i > estimated_stop && !download.is_chunk_done(i))
+            .copied();
 
-        match probe_resp {
-            Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => {
-                trace_log(trace, || json!({
-                    "event": "range_probe_ok",
-                    "probe_chunk": probe_idx,
-                    "status": resp.status().as_u16(),
-                }));
+        if let Some(probe_idx) = probe_target {
+            let (probe_start, probe_end) = download.chunk_byte_range(probe_idx);
 
-                // Tell sequential to stop after its current chunk.
-                let seq_chunk = active_sequential_chunk(download);
-                stop_after.store(seq_chunk, Ordering::Release);
-                info!(
-                    seq_chunk,
-                    probe_chunk = probe_idx,
-                    "range probe succeeded, converting to parallel"
-                );
-
-                // Download probe chunk from the already-open response.
-                let probe_file = download.chunk(probe_idx).get_file()
-                    .ok_or_else(|| ProxyError::Internal("probe chunk file gone".into()))?;
-                let dl_ptr2 = download as *const InFlightDownload as usize;
-                let expected = download.expected_chunk_len(probe_idx);
-                let trace_c = trace.clone();
-                parallel_handles.push(tokio::spawn(async move {
-                    let download = unsafe { &*(dl_ptr2 as *const InFlightDownload) };
-                    download_chunk_from_stream(
-                        resp, &probe_file, download, probe_idx, expected, &trace_c,
-                    )
-                    .await
-                }));
-
-                // Start range-GETs for remaining chunks not covered by sequential.
-                for &idx in &remaining[1..] {
-                    if idx <= seq_chunk || download.is_chunk_done(idx) {
-                        continue;
+            let probe_resp = {
+                let mut req = http_client.get(upstream_url);
+                for (name, value) in upstream_headers.iter() {
+                    if let Ok(v) = value.to_str() {
+                        req = req.header(name.as_str(), v);
                     }
-                    let (start, end) = download.chunk_byte_range(idx);
-                    let chunk_file = download.chunk(idx).get_file()
-                        .ok_or_else(|| ProxyError::Internal(format!("chunk {idx} file gone")))?;
-                    let client = http_client.clone();
-                    let url = upstream_url.to_string();
-                    let hdrs = upstream_headers.clone();
-                    let dl_ptr3 = download as *const InFlightDownload as usize;
-                    let expected = download.expected_chunk_len(idx);
-                    let trace_c = trace.clone();
-
-                    parallel_handles.push(tokio::spawn(async move {
-                        let download = unsafe { &*(dl_ptr3 as *const InFlightDownload) };
-                        let mut req = client.get(&url);
-                        for (name, value) in hdrs.iter() {
-                            if let Ok(v) = value.to_str() {
-                                req = req.header(name.as_str(), v);
-                            }
-                        }
-                        req = req.header("Range", format!("bytes={start}-{end}"));
-                        let response = req.send().await.map_err(|e| {
-                            ProxyError::Upstream(format!("range request chunk {idx}: {e}"))
-                        })?;
-                        if !response.status().is_success() && response.status().as_u16() != 206 {
-                            return Err(ProxyError::Upstream(format!(
-                                "range request chunk {idx} returned {}",
-                                response.status()
-                            )));
-                        }
-                        download_chunk_from_stream(
-                            response, &chunk_file, download, idx, expected, &trace_c,
-                        )
-                        .await
-                    }));
                 }
-            }
-            Ok(resp) => {
-                trace_log(trace, || json!({
-                    "event": "range_probe_rejected",
-                    "probe_chunk": probe_idx,
-                    "status": resp.status().as_u16(),
-                }));
-                info!(
-                    status = resp.status().as_u16(),
-                    "range probe rejected, continuing sequential"
-                );
-            }
-            Err(e) => {
-                warn!("range probe connection failed: {e}, continuing sequential");
+                req = req.header("Range", format!("bytes={probe_start}-{probe_end}"));
+                req.send().await
+            };
+
+            match probe_resp {
+                Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => {
+                    // Re-compute runway now that the probe round-trip is done
+                    // (sequential has progressed further).
+                    let seq_chunk = active_sequential_chunk(download);
+                    let effective_stop = (seq_chunk + runway)
+                        .min(download.chunk_count().saturating_sub(1));
+                    stop_after.store(effective_stop, Ordering::Release);
+
+                    trace_log(trace, || json!({
+                        "event": "range_probe_ok",
+                        "probe_chunk": probe_idx,
+                        "status": resp.status().as_u16(),
+                        "seq_chunk": seq_chunk,
+                        "effective_stop": effective_stop,
+                    }));
+                    info!(
+                        seq_chunk,
+                        effective_stop,
+                        probe_chunk = probe_idx,
+                        "range probe succeeded, sequential runway {seq_chunk}..{effective_stop}"
+                    );
+
+                    // Ordered list of chunks for parallel workers
+                    // (probe_idx handled separately by the probe worker).
+                    let parallel_chunks: Vec<usize> = remaining.iter()
+                        .filter(|&&i| i > effective_stop && i != probe_idx && !download.is_chunk_done(i))
+                        .copied()
+                        .collect();
+
+                    // Probe worker: download the probed chunk from the already-open response.
+                    {
+                        let probe_file = download.chunk(probe_idx).get_file()
+                            .ok_or_else(|| ProxyError::Internal("probe chunk file gone".into()))?;
+                        let dl_ptr2 = download as *const InFlightDownload as usize;
+                        let expected = download.expected_chunk_len(probe_idx);
+                        let trace_c = trace.clone();
+                        parallel_handles.push(tokio::spawn(async move {
+                            let download = unsafe { &*(dl_ptr2 as *const InFlightDownload) };
+                            download_chunk_from_stream(
+                                resp, &probe_file, download, probe_idx, expected, &trace_c,
+                            ).await
+                        }));
+                    }
+
+                    // Persistent workers: each loops pulling the *next* chunk in order
+                    // from a shared atomic cursor.  This guarantees near-sequential
+                    // completion and enables reqwest connection reuse between chunks.
+                    if !parallel_chunks.is_empty() {
+                        let num_workers = max_concurrency.min(parallel_chunks.len());
+                        let cursor = Arc::new(AtomicUsize::new(0));
+                        let chunks = Arc::new(parallel_chunks);
+
+                        for _ in 0..num_workers {
+                            let cursor = cursor.clone();
+                            let chunks = chunks.clone();
+                            let client = http_client.clone();
+                            let url = upstream_url.to_string();
+                            let hdrs = upstream_headers.clone();
+                            let dl_ptr3 = download as *const InFlightDownload as usize;
+                            let trace_c = trace.clone();
+
+                            parallel_handles.push(tokio::spawn(async move {
+                                let download = unsafe { &*(dl_ptr3 as *const InFlightDownload) };
+                                loop {
+                                    let pos = cursor.fetch_add(1, Ordering::Relaxed);
+                                    if pos >= chunks.len() { break; }
+                                    let idx = chunks[pos];
+                                    if download.is_chunk_done(idx) { continue; }
+
+                                    let chunk_file = download.chunk(idx).get_file()
+                                        .ok_or_else(|| ProxyError::Internal(
+                                            format!("chunk {idx} file gone")
+                                        ))?;
+                                    let (start, end) = download.chunk_byte_range(idx);
+                                    let expected = download.expected_chunk_len(idx);
+
+                                    let mut req = client.get(&url);
+                                    for (name, value) in hdrs.iter() {
+                                        if let Ok(v) = value.to_str() {
+                                            req = req.header(name.as_str(), v);
+                                        }
+                                    }
+                                    req = req.header("Range", format!("bytes={start}-{end}"));
+                                    let response = req.send().await.map_err(|e| {
+                                        ProxyError::Upstream(format!("range chunk {idx}: {e}"))
+                                    })?;
+                                    if !response.status().is_success()
+                                        && response.status().as_u16() != 206
+                                    {
+                                        return Err(ProxyError::Upstream(format!(
+                                            "range chunk {idx} returned {}",
+                                            response.status()
+                                        )));
+                                    }
+                                    download_chunk_from_stream(
+                                        response, &chunk_file, download, idx, expected, &trace_c,
+                                    ).await?;
+                                }
+                                Ok(())
+                            }));
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    trace_log(trace, || json!({
+                        "event": "range_probe_rejected",
+                        "probe_chunk": probe_target,
+                        "status": resp.status().as_u16(),
+                    }));
+                    info!(
+                        status = resp.status().as_u16(),
+                        "range probe rejected, continuing sequential"
+                    );
+                }
+                Err(e) => {
+                    warn!("range probe connection failed: {e}, continuing sequential");
+                }
             }
         }
+        // else: no chunks beyond the runway — sequential handles the entire file.
     }
 
     // Wait for the sequential stream to finish.
