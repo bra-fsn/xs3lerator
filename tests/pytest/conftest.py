@@ -1,9 +1,26 @@
 """Fixtures for xs3lerator integration tests.
 
-Starts a moto S3 backend and the proxy binary for end-to-end testing.
+Supports two modes:
+
+  Docker Compose mode (CI or `docker compose up`):
+    Set PROXY_URL, LOCALSTACK_ENDPOINT, and TEST_SERVER_HOST env vars.
+    The test server binds to 0.0.0.0 so the container can reach it via
+    host.docker.internal.
+
+  Local mode (no Docker, default):
+    Builds the Rust binary, starts LocalStack (must already be running),
+    and launches xs3lerator directly.  Everything runs on localhost.
+
+Environment variables:
+    PROXY_URL              xs3lerator base URL (skip build/launch if set)
+    LOCALSTACK_ENDPOINT    S3 endpoint        (default: http://localhost:4566)
+    TEST_SERVER_BIND_HOST  Bind address        (default: 127.0.0.1)
+    TEST_SERVER_HOST       Host xs3lerator uses to reach the test server
+                           (default: 127.0.0.1, use host.docker.internal
+                            when xs3lerator runs in Docker)
 """
 
-import hashlib
+import base64
 import os
 import socket
 import subprocess
@@ -14,6 +31,19 @@ import boto3
 import pytest
 import requests
 
+from test_server import TestServer, generate_payload  # noqa: F401 (re-export)
+
+# ---------------------------------------------------------------------------
+# Configuration from environment
+# ---------------------------------------------------------------------------
+
+PROXY_URL = os.environ.get("PROXY_URL")  # None → local mode
+LOCALSTACK_ENDPOINT = os.environ.get("LOCALSTACK_ENDPOINT", "http://localhost:4566")
+TEST_SERVER_BIND_HOST = os.environ.get("TEST_SERVER_BIND_HOST", "127.0.0.1")
+TEST_SERVER_HOST = os.environ.get("TEST_SERVER_HOST", "127.0.0.1")
+TEST_BUCKET = "xs3lerator-test"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -21,160 +51,202 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-# ── 1 MiB deterministic payload ────────────────────────────────────────────
-
-PAYLOAD_1MB = bytes(range(256)) * 4096  # exactly 1 MiB
-
-
-# ── Session-scoped fixtures ────────────────────────────────────────────────
-
-@pytest.fixture(scope="session")
-def moto_endpoint():
-    """Start a moto_server process and return its base URL."""
-    port = _free_port()
-    proc = subprocess.Popen(
-        ["moto_server", "-H", "127.0.0.1", "-p", str(port)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    endpoint = f"http://127.0.0.1:{port}"
-    for _ in range(40):
+def _wait_for_url(url: str, timeout: float = 20.0, interval: float = 0.3):
+    deadline = time.monotonic() + timeout
+    last_err = None
+    while time.monotonic() < deadline:
         try:
-            requests.get(endpoint, timeout=0.3)
-            break
-        except Exception:
-            time.sleep(0.25)
-    else:
-        proc.terminate()
-        pytest.fail("moto_server failed to start")
-    yield endpoint
-    proc.terminate()
-    proc.wait(timeout=10)
+            requests.get(url, timeout=1)
+            return
+        except Exception as e:
+            last_err = e
+            time.sleep(interval)
+    raise RuntimeError(f"URL {url} not reachable after {timeout}s: {last_err}")
+
+
+def encode_upstream_url(url: str) -> str:
+    return base64.b64encode(url.encode()).decode()
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped fixtures
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="session")
-def s3(moto_endpoint):
-    """Boto3 S3 client connected to the moto endpoint."""
+def localstack_endpoint():
+    """Return the LocalStack endpoint, skipping if not reachable."""
+    try:
+        resp = requests.get(f"{LOCALSTACK_ENDPOINT}/_localstack/health", timeout=3)
+        resp.raise_for_status()
+    except Exception:
+        pytest.skip(f"LocalStack not reachable at {LOCALSTACK_ENDPOINT}")
+    return LOCALSTACK_ENDPOINT
+
+
+@pytest.fixture(scope="session")
+def s3_client(localstack_endpoint):
+    """Boto3 S3 client connected to LocalStack."""
     return boto3.client(
         "s3",
         region_name="us-east-1",
-        endpoint_url=moto_endpoint,
-        aws_access_key_id="testing",
-        aws_secret_access_key="testing",
+        endpoint_url=localstack_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
     )
 
 
 @pytest.fixture(scope="session")
-def bucket(s3):
-    """Create and return a test bucket name."""
-    name = "xs3lerator-test"
-    s3.create_bucket(Bucket=name)
-    return name
+def test_bucket(s3_client):
+    """Create the test bucket in LocalStack."""
+    try:
+        s3_client.create_bucket(Bucket=TEST_BUCKET)
+    except s3_client.exceptions.BucketAlreadyOwnedByYou:
+        pass
+    except Exception:
+        pass  # bucket may already exist
+    return TEST_BUCKET
 
 
 @pytest.fixture(scope="session")
-def fixture_object(s3, bucket):
-    """Upload a 1 MiB object with x-amz-meta-sha224 and return (key, payload, sha224)."""
-    key = "fixture.bin"
-    sha = hashlib.sha224(PAYLOAD_1MB).hexdigest()
-    s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=PAYLOAD_1MB,
-        Metadata={"sha224": sha},
-        ContentType="application/octet-stream",
-    )
-    return key, PAYLOAD_1MB, sha
+def test_server():
+    """Start the test HTTP server.
+
+    Binds to TEST_SERVER_BIND_HOST so Docker containers can reach it
+    via host.docker.internal when running in compose mode.
+    """
+    server = TestServer(host=TEST_SERVER_BIND_HOST)
+    server.start()
+    yield server
+    server.stop()
 
 
 @pytest.fixture(scope="session")
-def fixture_no_sha(s3, bucket):
-    """Upload an object WITHOUT x-amz-meta-sha224 to test fallback."""
-    key = "no-sha.bin"
-    payload = b"hello xs3lerator\n" * 600
-    s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=payload,
-        ContentType="text/plain",
-    )
-    return key, payload
+def test_server_external_url(test_server):
+    """Base URL that xs3lerator should use to reach the test server.
 
-
-@pytest.fixture(scope="session")
-def fixture_large(s3, bucket):
-    """Upload a 4 MiB object to exercise multi-chunk downloads."""
-    key = "large.bin"
-    payload = bytes(range(256)) * (4 * 4096)  # 4 MiB
-    sha = hashlib.sha224(payload).hexdigest()
-    s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=payload,
-        Metadata={"sha224": sha},
-        ContentType="application/octet-stream",
-    )
-    return key, payload, sha
+    In Docker mode this uses host.docker.internal; locally it's 127.0.0.1.
+    """
+    return f"http://{TEST_SERVER_HOST}:{test_server.port}"
 
 
 @pytest.fixture(scope="session")
 def proxy_binary():
-    """Build the proxy in debug mode and return the binary path."""
-    root = Path(__file__).resolve().parents[2]
-    subprocess.run(["cargo", "build", "--quiet"], cwd=root, check=True)
-    return root / "target" / "debug" / "xs3lerator"
+    """Build the proxy in debug mode and return the binary path.
+
+    Skipped in Docker Compose mode where PROXY_URL is set.
+    """
+    if PROXY_URL:
+        pytest.skip("PROXY_URL set — using external proxy")
+    subprocess.run(
+        ["cargo", "build", "--quiet"],
+        cwd=PROJECT_ROOT,
+        check=True,
+        timeout=300,
+    )
+    return PROJECT_ROOT / "target" / "debug" / "xs3lerator"
 
 
 @pytest.fixture(scope="session")
 def proxy(
     proxy_binary,
-    moto_endpoint,
-    bucket,
-    fixture_object,
-    fixture_no_sha,
-    fixture_large,
+    localstack_endpoint,
+    test_bucket,
+    test_server,
     tmp_path_factory,
 ):
-    """Start the proxy binary and return its base URL."""
-    cache_dir = tmp_path_factory.mktemp("cache")
+    """Start xs3lerator and return its base URL.
+
+    In Docker Compose mode (PROXY_URL set), returns the external URL directly.
+    """
+    if PROXY_URL:
+        _wait_for_url(f"{PROXY_URL}/healthz", timeout=30)
+        return PROXY_URL
+
+    temp_dir = tmp_path_factory.mktemp("xs3-temp")
     port = _free_port()
     env = os.environ.copy()
-    env.update(
-        {
-            "RUST_LOG": "xs3lerator=debug,tower_http=debug",
-            "AWS_ACCESS_KEY_ID": "testing",
-            "AWS_SECRET_ACCESS_KEY": "testing",
-            "XS3_PORT": str(port),
-            "XS3_BUCKET": bucket,
-            "XS3_CACHE_DIR": str(cache_dir),
-            "XS3_MAX_CACHE_SIZE": "1GiB",
-            "XS3_S3_ENDPOINT_URL": moto_endpoint,
-            "XS3_S3_FORCE_PATH_STYLE": "true",
-            "XS3_GC_INTERVAL_SECONDS": "2",
-            "XS3_MAX_CONCURRENCY": "4",
-            "XS3_MIN_CHUNK_SIZE": "64KiB",
-        }
-    )
+    env.update({
+        "RUST_LOG": "xs3lerator=debug",
+        "AWS_ACCESS_KEY_ID": "test",
+        "AWS_SECRET_ACCESS_KEY": "test",
+        "AWS_DEFAULT_REGION": "us-east-1",
+        "XS3_PORT": str(port),
+        "XS3_S3_ENDPOINT_URL": localstack_endpoint,
+        "XS3_S3_FORCE_PATH_STYLE": "true",
+        "XS3_S3_CONCURRENCY": "4",
+        "XS3_HTTP_CONCURRENCY": "4",
+        "XS3_MIN_CHUNK_SIZE": "5MiB",
+        "XS3_TEMP_DIR": str(temp_dir),
+    })
     proc = subprocess.Popen(
         [str(proxy_binary)],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    base = f"http://127.0.0.1:{port}"
-    key = fixture_object[0]
-    for _ in range(80):
-        try:
-            requests.head(f"{base}/{key}", timeout=0.3)
-            break
-        except Exception:
-            time.sleep(0.25)
-    else:
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        _wait_for_url(f"{base_url}/healthz", timeout=20)
+    except RuntimeError:
         proc.terminate()
         stderr = ""
         if proc.stderr:
-            stderr = proc.stderr.read().decode(errors="replace")[:2000]
-        pytest.fail(f"proxy failed to start: {stderr}")
-    yield base
+            stderr = proc.stderr.read().decode(errors="replace")[:4000]
+        pytest.fail(f"xs3lerator failed to start:\n{stderr}")
+
+    yield base_url
     proc.terminate()
-    proc.wait(timeout=10)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+# ---------------------------------------------------------------------------
+# Per-test helpers available as fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def proxy_get(proxy, test_bucket, test_server_external_url):
+    """Helper to make a GET to xs3lerator with proper contract headers.
+
+    Usage:
+        resp = proxy_get("my-key", "/data/1024", cache_skip=True)
+    """
+    def _get(
+        s3_key: str,
+        upstream_path: str,
+        *,
+        cache_skip: bool = False,
+        object_size: int | None = None,
+        extra_headers: dict | None = None,
+        range_header: str | None = None,
+        timeout: int = 30,
+    ):
+        upstream_url = f"{test_server_external_url}{upstream_path}"
+        headers = {
+            "X-Xs3lerator-Upstream-Url": encode_upstream_url(upstream_url),
+        }
+        if cache_skip:
+            headers["X-Xs3lerator-Cache-Skip"] = "true"
+        if object_size is not None:
+            headers["X-Xs3lerator-Object-Size"] = str(object_size)
+        if range_header:
+            headers["Range"] = range_header
+        if extra_headers:
+            headers.update(extra_headers)
+        return requests.get(
+            f"{proxy}/{test_bucket}/{s3_key}",
+            headers=headers,
+            timeout=timeout,
+        )
+    return _get
+
+
+@pytest.fixture
+def unique_key():
+    """Generate a unique S3 key per test to avoid cross-test interference."""
+    import uuid
+    return f"test/{uuid.uuid4().hex}"
