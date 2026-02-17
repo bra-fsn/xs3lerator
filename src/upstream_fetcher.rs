@@ -35,6 +35,11 @@ pub struct UpstreamResult {
     /// response body directly to the client without buffering, and set the
     /// `X-Xs3lerator-Degraded: enospc` header. No S3 upload occurs.
     pub degraded_body: Option<reqwest::Response>,
+    /// When set, the upstream returned a 3xx redirect and follow_redirects was
+    /// false.  The handler should return this status + headers verbatim to the
+    /// caller (no S3 caching, no body).
+    pub redirect_status: Option<u16>,
+    pub redirect_headers: Option<reqwest::header::HeaderMap>,
 }
 
 /// Start an upstream download, creating an `InFlightDownload` that the handler
@@ -73,6 +78,8 @@ pub async fn fetch_upstream(
                 cache_control: None,
                 full_size: Some(full_size),
                 degraded_body: None,
+                redirect_status: None,
+                redirect_headers: None,
             });
         }
         // We created a placeholder — remove it so we can insert the real one.
@@ -81,8 +88,14 @@ pub async fn fetch_upstream(
 
     // Build the reqwest client
     let skip_tls = config.upstream_tls_skip_verify || contract.tls_skip_verify;
+    let redirect_policy = if contract.follow_redirects {
+        reqwest::redirect::Policy::default()
+    } else {
+        reqwest::redirect::Policy::none()
+    };
     let http_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(skip_tls)
+        .redirect(redirect_policy)
         .build()
         .map_err(|e| ProxyError::Internal(format!("build http client: {e}")))?;
 
@@ -107,6 +120,25 @@ pub async fn fetch_upstream(
     })?;
 
     let status = response.status();
+    if status.is_redirection() && !contract.follow_redirects {
+        let redirect_headers = response.headers().clone();
+        info!(
+            status = status.as_u16(),
+            location = redirect_headers.get("location").and_then(|v| v.to_str().ok()).unwrap_or(""),
+            "upstream returned redirect, passing through to client"
+        );
+        return Ok(UpstreamResult {
+            download: Arc::new(InFlightDownload::new(0, config.min_chunk_size)),
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            cache_control: None,
+            full_size: None,
+            degraded_body: None,
+            redirect_status: Some(status.as_u16()),
+            redirect_headers: Some(redirect_headers),
+        });
+    }
     if !status.is_success() {
         return Err(ProxyError::Upstream(format!(
             "upstream returned {status}"
@@ -253,6 +285,8 @@ async fn start_parallel_upstream_download(
             cache_control,
             full_size: Some(file_size),
             degraded_body: None,
+            redirect_status: None,
+            redirect_headers: None,
         });
     }
 
@@ -269,6 +303,8 @@ async fn start_parallel_upstream_download(
                 cache_control,
                 full_size: Some(file_size),
                 degraded_body: Some(initial_response),
+                redirect_status: None,
+                redirect_headers: None,
             });
         }
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
@@ -330,6 +366,8 @@ async fn start_parallel_upstream_download(
         cache_control,
         full_size: Some(file_size),
         degraded_body: None,
+        redirect_status: None,
+        redirect_headers: None,
     })
 }
 
@@ -719,6 +757,8 @@ async fn start_sequential_download(
             cache_control,
             full_size: file_size,
             degraded_body: None,
+            redirect_status: None,
+            redirect_headers: None,
         });
     }
 
@@ -735,6 +775,8 @@ async fn start_sequential_download(
                 cache_control,
                 full_size: file_size,
                 degraded_body: Some(response),
+                redirect_status: None,
+                redirect_headers: None,
             });
         }
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
@@ -833,5 +875,7 @@ async fn start_sequential_download(
         cache_control,
         full_size: file_size,
         degraded_body: None,
+        redirect_status: None,
+        redirect_headers: None,
     })
 }

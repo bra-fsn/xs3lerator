@@ -352,6 +352,33 @@ async fn handle_upstream_path(
     )
     .await?;
 
+    // Redirect passthrough: upstream returned a 3xx and follow_redirects was
+    // false.  Return the redirect response verbatim — no S3 caching, no body.
+    if let Some(redirect_code) = result.redirect_status {
+        let status = StatusCode::from_u16(redirect_code)
+            .unwrap_or(StatusCode::FOUND);
+        let mut resp_headers = HeaderMap::new();
+        if let Some(ref rh) = result.redirect_headers {
+            for (name, value) in rh.iter() {
+                let key = name.as_str().to_lowercase();
+                if key.starts_with("x-xs3lerator-") {
+                    continue;
+                }
+                if let Ok(hname) = axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
+                    resp_headers.append(hname, value.clone());
+                }
+            }
+        }
+        resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+        let resp = Response::builder()
+            .status(status)
+            .body(Body::empty())
+            .map_err(|e| ProxyError::Internal(format!("build redirect response: {e}")))?;
+        let mut resp = resp;
+        *resp.headers_mut() = resp_headers;
+        return Ok(resp);
+    }
+
     // ENOSPC degradation: stream upstream response directly without buffering.
     // No S3 upload occurred; passsage should not record this as cached.
     if let Some(direct_response) = result.degraded_body {

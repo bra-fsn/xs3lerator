@@ -13,12 +13,17 @@ pub struct ContractHeaders {
     pub object_size: Option<u64>,
     /// Skip TLS certificate verification for this upstream request.
     pub tls_skip_verify: bool,
+    /// When true, follow upstream HTTP redirects instead of returning the 3xx
+    /// response to the caller.  Default false — redirects are returned as-is
+    /// so the caller (passsage) can cache them independently per RFC 9111.
+    pub follow_redirects: bool,
 }
 
 const HEADER_UPSTREAM_URL: &str = "x-xs3lerator-upstream-url";
 const HEADER_CACHE_SKIP: &str = "x-xs3lerator-cache-skip";
 const HEADER_OBJECT_SIZE: &str = "x-xs3lerator-object-size";
 const HEADER_TLS_SKIP_VERIFY: &str = "x-xs3lerator-tls-skip-verify";
+const HEADER_FOLLOW_REDIRECTS: &str = "x-xs3lerator-follow-redirects";
 
 /// Contract header prefix — all headers with this prefix are stripped before
 /// forwarding to the upstream server.
@@ -56,11 +61,18 @@ pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    let follow_redirects = headers
+        .get(HEADER_FOLLOW_REDIRECTS)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     ContractHeaders {
         upstream_url,
         cache_skip,
         object_size,
         tls_skip_verify,
+        follow_redirects,
     }
 }
 
@@ -155,11 +167,13 @@ mod tests {
         h.insert(HEADER_CACHE_SKIP, HeaderValue::from_static("true"));
         h.insert(HEADER_OBJECT_SIZE, HeaderValue::from_static("12345"));
         h.insert(HEADER_TLS_SKIP_VERIFY, HeaderValue::from_static("true"));
+        h.insert(HEADER_FOLLOW_REDIRECTS, HeaderValue::from_static("true"));
         let c = parse_contract_headers(&h);
         assert_eq!(c.upstream_url.as_deref(), Some("https://example.com/file.iso"));
         assert!(c.cache_skip);
         assert_eq!(c.object_size, Some(12345));
         assert!(c.tls_skip_verify);
+        assert!(c.follow_redirects);
     }
 
     #[test]
@@ -170,5 +184,6 @@ mod tests {
         assert!(!c.cache_skip);
         assert!(c.object_size.is_none());
         assert!(!c.tls_skip_verify);
+        assert!(!c.follow_redirects);
     }
 }
