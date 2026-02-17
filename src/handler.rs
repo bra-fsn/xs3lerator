@@ -218,6 +218,7 @@ async fn handle_s3_path(
         client_byte_range,
         resp_headers,
         true, // cancel S3 workers when client disconnects
+        0,    // download contains only the requested range
     )
 }
 
@@ -485,12 +486,14 @@ async fn handle_upstream_path(
         );
     }
 
+    let download_start = client_byte_range.as_ref().map_or(0, |r| r.start);
     build_streaming_response(
         result.download,
         full_size,
         client_byte_range,
         resp_headers,
         false, // keep downloading for S3 upload even if client disconnects
+        download_start, // download contains the full file
     )
 }
 
@@ -500,12 +503,18 @@ async fn handle_upstream_path(
 /// stream is dropped (e.g. client disconnects).  Use this for S3 cache-hit
 /// reads where continuing is wasteful.  For upstream cache-miss downloads,
 /// pass false so the S3 upload can complete.
+///
+/// `download_start` is the byte offset within the download's byte space where
+/// reading begins. For upstream downloads (which contain the full file), this
+/// equals `serve_start`. For S3 cache-hit range requests (which only contain
+/// the requested range), this is 0.
 fn build_streaming_response(
     download: Arc<InFlightDownload>,
     full_size: u64,
     client_range: Option<ByteRange>,
     mut extra_headers: HeaderMap,
     cancel_on_drop: bool,
+    download_start: u64,
 ) -> ProxyResult<Response> {
     let (serve_start, serve_end, status) = match client_range {
         Some(ref r) => (r.start, r.end_inclusive, StatusCode::PARTIAL_CONTENT),
@@ -530,7 +539,7 @@ fn build_streaming_response(
     );
     extra_headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
 
-    let stream = make_download_stream(download, serve_start, serve_end, serve_len, cancel_on_drop);
+    let stream = make_download_stream(download, download_start, serve_len, cancel_on_drop);
     let body = Body::from_stream(stream);
     let mut response = Response::builder()
         .status(status)
@@ -602,36 +611,32 @@ fn build_passthrough_response(
 
 fn make_download_stream(
     download: Arc<InFlightDownload>,
-    serve_start: u64,
-    serve_end: u64,
-    serve_len: u64,
+    download_start: u64,
+    read_len: u64,
     cancel_on_drop: bool,
 ) -> impl futures::Stream<Item = Result<Bytes, ProxyError>> {
     try_stream! {
-        // When this guard is dropped (stream finished or client disconnected),
-        // the download is cancelled so workers stop fetching from S3.
         let _cancel_guard = if cancel_on_drop {
             Some(CancelGuard(download.clone()))
         } else {
             None
         };
 
-        if serve_len == 0 {
+        if read_len == 0 {
             return;
         }
 
         let chunk_size = download.chunk_size;
-        let mut pos = serve_start;
+        let read_end = download_start + read_len - 1;
+        let mut pos = download_start;
         let mut prev_chunk: Option<usize> = None;
 
-        while pos <= serve_end {
+        while pos <= read_end {
             let chunk_idx = (pos / chunk_size) as usize;
             if chunk_idx >= download.chunk_count() {
                 break;
             }
 
-            // When crossing a chunk boundary, release the previous chunk.
-            // For unlinked temp files this discards pages with no writeback.
             if let Some(prev) = prev_chunk {
                 if chunk_idx != prev {
                     download.notify_consumed(prev);
@@ -643,18 +648,18 @@ fn make_download_stream(
 
             let chunk_offset = pos % chunk_size;
             let chunk_remaining = download.expected_chunk_len(chunk_idx) - chunk_offset;
-            let serve_remaining = serve_end - pos + 1;
-            let to_read = min(chunk_remaining, serve_remaining).min(256 * 1024);
+            let remaining = read_end - pos + 1;
+            let to_read = min(chunk_remaining, remaining).min(256 * 1024);
 
             download.wait_for_bytes(chunk_idx, chunk_offset + to_read).await?;
 
             let file = download.chunk(chunk_idx).get_file()
                 .ok_or_else(|| ProxyError::Internal("chunk released before read".into()))?;
 
-            let read_len = to_read as usize;
+            let buf_len = to_read as usize;
             let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
                 use std::os::unix::fs::FileExt;
-                let mut buf = vec![0u8; read_len];
+                let mut buf = vec![0u8; buf_len];
                 file.read_exact_at(&mut buf, chunk_offset)?;
                 Ok(Bytes::from(buf))
             })
@@ -666,7 +671,6 @@ fn make_download_stream(
             yield data;
         }
 
-        // Release the final chunk
         if let Some(last) = prev_chunk {
             download.notify_consumed(last);
         }

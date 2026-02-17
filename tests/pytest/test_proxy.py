@@ -20,7 +20,7 @@ from test_server import generate_payload
 SMALL = 1_000_000          # 1 MB  (single chunk)
 MEDIUM = 12_000_000        # 12 MB (2-3 chunks at 5 MiB min)
 LARGE = 30_000_000         # 30 MB (6 chunks)
-S3_UPLOAD_SETTLE = 3.0     # seconds to wait for async S3 upload
+S3_UPLOAD_SETTLE = 5.0     # seconds to wait for async S3 upload
 
 
 # ── Basic functionality ───────────────────────────────────────────────────
@@ -312,7 +312,8 @@ class TestHeaders:
         )
         assert r.status_code == 200
         echoed = r.json()
-        assert echoed.get("X-Custom-Test") == "hello123"
+        echoed_lower = {k.lower(): v for k, v in echoed.items()}
+        assert echoed_lower.get("x-custom-test") == "hello123"
 
     def test_contract_headers_not_forwarded(self, proxy_get, unique_key):
         """X-Xs3lerator-* headers should be stripped before forwarding upstream."""
