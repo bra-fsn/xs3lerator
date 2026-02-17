@@ -328,6 +328,43 @@ async fn run_s3_download(
     Ok(())
 }
 
+/// Headers that should not be forwarded from upstream to the client.
+const UPSTREAM_STRIP_HEADERS: &[&str] = &[
+    "connection",
+    "transfer-encoding",
+    "content-length",
+    "content-range",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "upgrade",
+];
+
+/// Merge upstream response headers into an axum HeaderMap, stripping
+/// hop-by-hop headers, xs3lerator contract headers, and headers that
+/// xs3lerator manages itself (Content-Length, Content-Range, etc).
+fn merge_upstream_headers(
+    upstream: &reqwest::header::HeaderMap,
+    out: &mut HeaderMap,
+) {
+    for (name, value) in upstream.iter() {
+        let key = name.as_str().to_lowercase();
+        if key.starts_with(headers::CONTRACT_PREFIX) {
+            continue;
+        }
+        if UPSTREAM_STRIP_HEADERS.contains(&key.as_str()) {
+            continue;
+        }
+        if let Ok(hname) = axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
+            if let Ok(hval) = axum::http::HeaderValue::from_bytes(value.as_bytes()) {
+                out.append(hname, hval);
+            }
+        }
+    }
+}
+
 /// Serve from upstream (cache miss or S3 fallback).
 async fn handle_upstream_path(
     state: &AppState,
@@ -359,15 +396,7 @@ async fn handle_upstream_path(
             .unwrap_or(StatusCode::FOUND);
         let mut resp_headers = HeaderMap::new();
         if let Some(ref rh) = result.redirect_headers {
-            for (name, value) in rh.iter() {
-                let key = name.as_str().to_lowercase();
-                if key.starts_with("x-xs3lerator-") {
-                    continue;
-                }
-                if let Ok(hname) = axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
-                    resp_headers.append(hname, value.clone());
-                }
-            }
+            merge_upstream_headers(rh, &mut resp_headers);
         }
         resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
         let resp = Response::builder()
@@ -375,6 +404,51 @@ async fn handle_upstream_path(
             .body(Body::empty())
             .map_err(|e| ProxyError::Internal(format!("build redirect response: {e}")))?;
         let mut resp = resp;
+        *resp.headers_mut() = resp_headers;
+        return Ok(resp);
+    }
+
+    // Error passthrough: upstream returned a non-2xx status. Stream the error
+    // response body to the client with the original status code intact.
+    if let Some((status_code, error_response)) = result.error_passthrough {
+        let status = StatusCode::from_u16(status_code)
+            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let mut resp_headers = HeaderMap::new();
+        if let Some(ref uh) = result.upstream_headers {
+            merge_upstream_headers(uh, &mut resp_headers);
+        }
+        resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+
+        let stream = error_response
+            .bytes_stream()
+            .map(|r| r.map_err(|e| ProxyError::Upstream(format!("error passthrough: {e}"))));
+        let body = Body::from_stream(stream);
+        let mut resp = Response::builder()
+            .status(status)
+            .body(body)
+            .map_err(|e| ProxyError::Internal(format!("build error response: {e}")))?;
+        *resp.headers_mut() = resp_headers;
+        return Ok(resp);
+    }
+
+    // Unknown-size passthrough: upstream used chunked encoding (no Content-Length).
+    // Stream directly without temp files or S3 upload. Do NOT set Content-Length
+    // so the downstream transport uses chunked encoding.
+    if let Some(chunked_response) = result.unknown_size_body {
+        let mut resp_headers = HeaderMap::new();
+        if let Some(ref uh) = result.upstream_headers {
+            merge_upstream_headers(uh, &mut resp_headers);
+        }
+        resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+
+        let stream = chunked_response
+            .bytes_stream()
+            .map(|r| r.map_err(|e| ProxyError::Upstream(format!("chunked passthrough: {e}"))));
+        let body = Body::from_stream(stream);
+        let mut resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(body)
+            .map_err(|e| ProxyError::Internal(format!("build chunked response: {e}")))?;
         *resp.headers_mut() = resp_headers;
         return Ok(resp);
     }
@@ -400,32 +474,15 @@ async fn handle_upstream_path(
     };
 
     let mut resp_headers = HeaderMap::new();
+    if let Some(ref uh) = result.upstream_headers {
+        merge_upstream_headers(uh, &mut resp_headers);
+    }
     resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
     if full_size > 0 {
         resp_headers.insert(
             RESP_FULL_SIZE,
             HeaderValue::from_str(&full_size.to_string()).unwrap(),
         );
-    }
-    if let Some(ct) = &result.content_type {
-        if let Ok(v) = HeaderValue::from_str(ct) {
-            resp_headers.insert("content-type", v);
-        }
-    }
-    if let Some(et) = &result.etag {
-        if let Ok(v) = HeaderValue::from_str(et) {
-            resp_headers.insert("etag", v);
-        }
-    }
-    if let Some(lm) = &result.last_modified {
-        if let Ok(v) = HeaderValue::from_str(lm) {
-            resp_headers.insert("last-modified", v);
-        }
-    }
-    if let Some(cc) = &result.cache_control {
-        if let Ok(v) = HeaderValue::from_str(cc) {
-            resp_headers.insert("cache-control", v);
-        }
     }
 
     build_streaming_response(

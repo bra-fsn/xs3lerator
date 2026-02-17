@@ -17,26 +17,26 @@ pub fn parse_range_header(
         return Ok(None);
     };
     if total_size == 0 {
-        return Err(ProxyError::RangeNotSatisfiable);
+        return Err(ProxyError::RangeNotSatisfiable(None));
     }
     let value = value.trim();
     if !value.starts_with("bytes=") {
-        return Err(ProxyError::RangeNotSatisfiable);
+        return Err(ProxyError::RangeNotSatisfiable(Some(total_size)));
     }
     let spec = &value["bytes=".len()..];
     if spec.contains(',') {
-        return Err(ProxyError::RangeNotSatisfiable);
+        return Err(ProxyError::RangeNotSatisfiable(Some(total_size)));
     }
-    let (left, right) = spec.split_once('-').ok_or(ProxyError::RangeNotSatisfiable)?;
+    let (left, right) = spec.split_once('-').ok_or(ProxyError::RangeNotSatisfiable(Some(total_size)))?;
     let left = left.trim();
     let right = right.trim();
 
     let range = if left.is_empty() {
         let suffix_len: u64 = right
             .parse()
-            .map_err(|_| ProxyError::RangeNotSatisfiable)?;
+            .map_err(|_| ProxyError::RangeNotSatisfiable(Some(total_size)))?;
         if suffix_len == 0 {
-            return Err(ProxyError::RangeNotSatisfiable);
+            return Err(ProxyError::RangeNotSatisfiable(Some(total_size)));
         }
         let len = suffix_len.min(total_size);
         ByteRange {
@@ -46,19 +46,19 @@ pub fn parse_range_header(
     } else {
         let start: u64 = left
             .parse()
-            .map_err(|_| ProxyError::RangeNotSatisfiable)?;
+            .map_err(|_| ProxyError::RangeNotSatisfiable(Some(total_size)))?;
         if start >= total_size {
-            return Err(ProxyError::RangeNotSatisfiable);
+            return Err(ProxyError::RangeNotSatisfiable(Some(total_size)));
         }
         let end_inclusive = if right.is_empty() {
             total_size - 1
         } else {
             right
                 .parse::<u64>()
-                .map_err(|_| ProxyError::RangeNotSatisfiable)?
+                .map_err(|_| ProxyError::RangeNotSatisfiable(Some(total_size)))?
         };
         if end_inclusive < start {
-            return Err(ProxyError::RangeNotSatisfiable);
+            return Err(ProxyError::RangeNotSatisfiable(Some(total_size)));
         }
         ByteRange {
             start,

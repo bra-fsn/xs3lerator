@@ -40,6 +40,15 @@ pub struct UpstreamResult {
     /// caller (no S3 caching, no body).
     pub redirect_status: Option<u16>,
     pub redirect_headers: Option<reqwest::header::HeaderMap>,
+    /// Full upstream response headers for forwarding to the client.
+    pub upstream_headers: Option<reqwest::header::HeaderMap>,
+    /// When set, upstream returned a non-2xx/non-3xx error. The handler should
+    /// stream this response body with the original status code (no S3 caching).
+    pub error_passthrough: Option<(u16, reqwest::Response)>,
+    /// When set, upstream used chunked encoding (unknown Content-Length). The
+    /// handler should stream directly without temp files or S3 upload, and must
+    /// NOT set Content-Length (use chunked transfer encoding instead).
+    pub unknown_size_body: Option<reqwest::Response>,
 }
 
 /// Start an upstream download, creating an `InFlightDownload` that the handler
@@ -80,6 +89,9 @@ pub async fn fetch_upstream(
                 degraded_body: None,
                 redirect_status: None,
                 redirect_headers: None,
+                upstream_headers: None,
+                error_passthrough: None,
+                unknown_size_body: None,
             });
         }
         // We created a placeholder — remove it so we can insert the real one.
@@ -137,16 +149,34 @@ pub async fn fetch_upstream(
             degraded_body: None,
             redirect_status: Some(status.as_u16()),
             redirect_headers: Some(redirect_headers),
+            upstream_headers: None,
+            error_passthrough: None,
+            unknown_size_body: None,
         });
     }
     if !status.is_success() {
-        return Err(ProxyError::Upstream(format!(
-            "upstream returned {status}"
-        )));
+        let resp_headers = response.headers().clone();
+        let status_code = status.as_u16();
+        warn!(status = status_code, "upstream returned error, passing through");
+        return Ok(UpstreamResult {
+            download: Arc::new(InFlightDownload::new(0, config.min_chunk_size)),
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            cache_control: None,
+            full_size: None,
+            degraded_body: None,
+            redirect_status: None,
+            redirect_headers: None,
+            upstream_headers: Some(resp_headers),
+            error_passthrough: Some((status_code, response)),
+            unknown_size_body: None,
+        });
     }
 
     // Extract response metadata
     let resp_headers = response.headers().clone();
+    let all_upstream_headers = resp_headers.clone();
     let content_type = resp_headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -211,6 +241,7 @@ pub async fn fetch_upstream(
                 etag,
                 last_modified,
                 cache_control,
+                Some(all_upstream_headers),
             )
             .await;
         }
@@ -229,27 +260,27 @@ pub async fn fetch_upstream(
             etag,
             last_modified,
             cache_control,
+            Some(all_upstream_headers),
         )
         .await;
     }
 
-    // Chunked / unknown size — sequential
-    start_sequential_download(
-        config,
-        response,
-        None,
-        cache_key,
-        s3_bucket,
-        s3_key,
-        downloads,
-        s3_uploader,
-        trace,
+    // Chunked / unknown size — stream directly without temp files or S3 upload
+    info!("upstream response is chunked/unknown size, streaming directly");
+    Ok(UpstreamResult {
+        download: Arc::new(InFlightDownload::new(0, config.min_chunk_size)),
         content_type,
         etag,
         last_modified,
         cache_control,
-    )
-    .await
+        full_size: None,
+        degraded_body: None,
+        redirect_status: None,
+        redirect_headers: None,
+        upstream_headers: Some(all_upstream_headers),
+        error_passthrough: None,
+        unknown_size_body: Some(response),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -271,6 +302,7 @@ async fn start_parallel_upstream_download(
     etag: Option<String>,
     last_modified: Option<String>,
     cache_control: Option<String>,
+    all_upstream_headers: Option<reqwest::header::HeaderMap>,
 ) -> Result<UpstreamResult, ProxyError> {
     let plan = compute_chunk_plan(file_size, config.http_concurrency, config.min_chunk_size);
 
@@ -287,6 +319,9 @@ async fn start_parallel_upstream_download(
             degraded_body: None,
             redirect_status: None,
             redirect_headers: None,
+            upstream_headers: all_upstream_headers,
+            error_passthrough: None,
+            unknown_size_body: None,
         });
     }
 
@@ -305,6 +340,9 @@ async fn start_parallel_upstream_download(
                 degraded_body: Some(initial_response),
                 redirect_status: None,
                 redirect_headers: None,
+                upstream_headers: all_upstream_headers,
+                error_passthrough: None,
+                unknown_size_body: None,
             });
         }
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
@@ -368,6 +406,9 @@ async fn start_parallel_upstream_download(
         degraded_body: None,
         redirect_status: None,
         redirect_headers: None,
+        upstream_headers: all_upstream_headers,
+        error_passthrough: None,
+        unknown_size_body: None,
     })
 }
 
@@ -742,6 +783,7 @@ async fn start_sequential_download(
     etag: Option<String>,
     last_modified: Option<String>,
     cache_control: Option<String>,
+    all_upstream_headers: Option<reqwest::header::HeaderMap>,
 ) -> Result<UpstreamResult, ProxyError> {
     let effective_size = file_size.unwrap_or(config.min_chunk_size);
     let chunk_size = config.min_chunk_size;
@@ -759,6 +801,9 @@ async fn start_sequential_download(
             degraded_body: None,
             redirect_status: None,
             redirect_headers: None,
+            upstream_headers: all_upstream_headers,
+            error_passthrough: None,
+            unknown_size_body: None,
         });
     }
 
@@ -777,6 +822,9 @@ async fn start_sequential_download(
                 degraded_body: Some(response),
                 redirect_status: None,
                 redirect_headers: None,
+                upstream_headers: all_upstream_headers,
+                error_passthrough: None,
+                unknown_size_body: None,
             });
         }
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
@@ -877,5 +925,8 @@ async fn start_sequential_download(
         degraded_body: None,
         redirect_status: None,
         redirect_headers: None,
+        upstream_headers: all_upstream_headers,
+        error_passthrough: None,
+        unknown_size_body: None,
     })
 }
