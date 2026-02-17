@@ -432,28 +432,6 @@ async fn handle_upstream_path(
         return Ok(resp);
     }
 
-    // Unknown-size passthrough: upstream used chunked encoding (no Content-Length).
-    // Stream directly without temp files or S3 upload. Do NOT set Content-Length
-    // so the downstream transport uses chunked encoding.
-    if let Some(chunked_response) = result.unknown_size_body {
-        let mut resp_headers = HeaderMap::new();
-        if let Some(ref uh) = result.upstream_headers {
-            merge_upstream_headers(uh, &mut resp_headers);
-        }
-        resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
-
-        let stream = chunked_response
-            .bytes_stream()
-            .map(|r| r.map_err(|e| ProxyError::Upstream(format!("chunked passthrough: {e}"))));
-        let body = Body::from_stream(stream);
-        let mut resp = Response::builder()
-            .status(StatusCode::OK)
-            .body(body)
-            .map_err(|e| ProxyError::Internal(format!("build chunked response: {e}")))?;
-        *resp.headers_mut() = resp_headers;
-        return Ok(resp);
-    }
-
     // ENOSPC degradation: stream upstream response directly without buffering.
     // No S3 upload occurred; passsage should not record this as cached.
     if let Some(direct_response) = result.degraded_body {
@@ -465,6 +443,26 @@ async fn handle_upstream_path(
             result.last_modified,
             result.cache_control,
         );
+    }
+
+    // Unknown-size (chunked upstream): stream from the download without
+    // Content-Length.  The downstream transport uses chunked encoding.
+    // No range support in this mode.
+    if result.full_size.is_none() {
+        let mut resp_headers = HeaderMap::new();
+        if let Some(ref uh) = result.upstream_headers {
+            merge_upstream_headers(uh, &mut resp_headers);
+        }
+        resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+
+        let stream = make_unknown_size_stream(result.download);
+        let body = Body::from_stream(stream);
+        let mut resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(body)
+            .map_err(|e| ProxyError::Internal(format!("build chunked response: {e}")))?;
+        *resp.headers_mut() = resp_headers;
+        return Ok(resp);
     }
 
     let full_size = result.full_size.unwrap_or(result.download.object_size);
@@ -661,6 +659,73 @@ fn make_download_stream(
                 use std::os::unix::fs::FileExt;
                 let mut buf = vec![0u8; buf_len];
                 file.read_exact_at(&mut buf, chunk_offset)?;
+                Ok(Bytes::from(buf))
+            })
+            .await
+            .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?
+            .map_err(|e| ProxyError::Internal(format!("pread: {e}")))?;
+
+            pos += data.len() as u64;
+            yield data;
+        }
+
+        if let Some(last) = prev_chunk {
+            download.notify_consumed(last);
+        }
+    }
+}
+
+/// Stream data from an unknown-size download (chunked upstream).
+/// Reads until `stream_complete` is set and all written bytes are consumed.
+/// Does NOT use a fixed read length — adapts to whatever `wait_for_bytes`
+/// reports as available.
+fn make_unknown_size_stream(
+    download: Arc<InFlightDownload>,
+) -> impl futures::Stream<Item = Result<Bytes, ProxyError>> {
+    try_stream! {
+        let chunk_size = download.chunk_size;
+        let mut pos = 0u64;
+        let mut prev_chunk: Option<usize> = None;
+
+        loop {
+            let chunk_idx = (pos / chunk_size) as usize;
+            if chunk_idx >= download.chunk_count() {
+                break;
+            }
+
+            if let Some(prev) = prev_chunk {
+                if chunk_idx != prev {
+                    download.notify_consumed(prev);
+                    prev_chunk = Some(chunk_idx);
+                }
+            } else {
+                prev_chunk = Some(chunk_idx);
+            }
+
+            let chunk_offset = pos % chunk_size;
+            let want = (256 * 1024) as u64;
+
+            let available = download
+                .wait_for_bytes(chunk_idx, chunk_offset + want)
+                .await?;
+            let readable = available.saturating_sub(chunk_offset);
+            if readable == 0 {
+                if download.is_stream_complete() {
+                    break;
+                }
+                pos = (chunk_idx as u64 + 1) * chunk_size;
+                continue;
+            }
+            let to_read = min(readable, want) as usize;
+
+            let file = download.chunk(chunk_idx).get_file()
+                .ok_or_else(|| ProxyError::Internal("chunk released before read".into()))?;
+
+            let offset = chunk_offset;
+            let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0u8; to_read];
+                file.read_exact_at(&mut buf, offset)?;
                 Ok(Bytes::from(buf))
             })
             .await

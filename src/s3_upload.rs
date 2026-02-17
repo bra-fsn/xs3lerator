@@ -34,7 +34,17 @@ async fn run_s3_upload(
     key: &str,
     download: &InFlightDownload,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let num_chunks = download.chunk_count();
+    // For unknown-size (stream_complete) downloads, only upload chunks that
+    // have data.  For known-size downloads, upload all chunks as before.
+    let num_chunks = if download.is_stream_complete() {
+        let total = download.actual_total_bytes();
+        if total == 0 {
+            return Ok(());
+        }
+        ((total + download.chunk_size - 1) / download.chunk_size) as usize
+    } else {
+        download.chunk_count()
+    };
     if num_chunks == 0 {
         return Ok(());
     }
@@ -111,19 +121,24 @@ async fn upload_chunk_to_s3(
     let expected = download.expected_chunk_len(idx);
 
     // Wait for the full chunk to be downloaded before uploading.
-    // (S3 UploadPart needs the complete body; streaming partial
-    // data requires a more complex streaming body implementation
-    // which we can add later as an optimization.)
+    // For unknown-size (stream_complete) downloads, this may return
+    // early with fewer bytes than expected.
     download.wait_for_bytes(idx, expected).await?;
 
-    let file = download.chunk(idx).get_file().ok_or_else(|| {
-        Box::<dyn std::error::Error + Send + Sync>::from("chunk file released before S3 upload")
-    })?;
+    let actual_written = download.chunk(idx).bytes_written();
+    let upload_size = std::cmp::min(expected, actual_written);
+    if upload_size == 0 {
+        return Ok(());
+    }
 
-    // Read the full chunk from the file (should hit page cache)
+    let file = match download.chunk(idx).get_file() {
+        Some(f) => f,
+        None => return Ok(()),
+    };
+
     let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
         use std::os::unix::fs::FileExt;
-        let mut buf = vec![0u8; expected as usize];
+        let mut buf = vec![0u8; upload_size as usize];
         file.read_exact_at(&mut buf, 0)?;
         Ok(Bytes::from(buf))
     })

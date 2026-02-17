@@ -45,10 +45,6 @@ pub struct UpstreamResult {
     /// When set, upstream returned a non-2xx/non-3xx error. The handler should
     /// stream this response body with the original status code (no S3 caching).
     pub error_passthrough: Option<(u16, reqwest::Response)>,
-    /// When set, upstream used chunked encoding (unknown Content-Length). The
-    /// handler should stream directly without temp files or S3 upload, and must
-    /// NOT set Content-Length (use chunked transfer encoding instead).
-    pub unknown_size_body: Option<reqwest::Response>,
 }
 
 /// Start an upstream download, creating an `InFlightDownload` that the handler
@@ -91,7 +87,6 @@ pub async fn fetch_upstream(
                 redirect_headers: None,
                 upstream_headers: None,
                 error_passthrough: None,
-                unknown_size_body: None,
             });
         }
         // We created a placeholder — remove it so we can insert the real one.
@@ -151,7 +146,6 @@ pub async fn fetch_upstream(
             redirect_headers: Some(redirect_headers),
             upstream_headers: None,
             error_passthrough: None,
-            unknown_size_body: None,
         });
     }
     if !status.is_success() {
@@ -170,7 +164,6 @@ pub async fn fetch_upstream(
             redirect_headers: None,
             upstream_headers: Some(resp_headers),
             error_passthrough: Some((status_code, response)),
-            unknown_size_body: None,
         });
     }
 
@@ -265,22 +258,25 @@ pub async fn fetch_upstream(
         .await;
     }
 
-    // Chunked / unknown size — stream directly without temp files or S3 upload
-    info!("upstream response is chunked/unknown size, streaming directly");
-    Ok(UpstreamResult {
-        download: Arc::new(InFlightDownload::new(0, config.min_chunk_size)),
+    // Chunked / unknown size — buffer through sequential download with S3 cache
+    info!("upstream response is chunked/unknown size, using sequential download with S3 cache");
+    start_sequential_download(
+        config,
+        response,
+        None,
+        cache_key,
+        s3_bucket,
+        s3_key,
+        downloads,
+        s3_uploader,
+        trace,
         content_type,
         etag,
         last_modified,
         cache_control,
-        full_size: None,
-        degraded_body: None,
-        redirect_status: None,
-        redirect_headers: None,
-        upstream_headers: Some(all_upstream_headers),
-        error_passthrough: None,
-        unknown_size_body: Some(response),
-    })
+        Some(all_upstream_headers),
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -321,7 +317,6 @@ async fn start_parallel_upstream_download(
             redirect_headers: None,
             upstream_headers: all_upstream_headers,
             error_passthrough: None,
-            unknown_size_body: None,
         });
     }
 
@@ -342,7 +337,6 @@ async fn start_parallel_upstream_download(
                 redirect_headers: None,
                 upstream_headers: all_upstream_headers,
                 error_passthrough: None,
-                unknown_size_body: None,
             });
         }
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
@@ -408,7 +402,6 @@ async fn start_parallel_upstream_download(
         redirect_headers: None,
         upstream_headers: all_upstream_headers,
         error_passthrough: None,
-        unknown_size_body: None,
     })
 }
 
@@ -768,6 +761,10 @@ async fn download_chunk_from_stream(
     Ok(())
 }
 
+/// Upper bound on the number of chunks allocated for unknown-size (chunked)
+/// responses.  With 8 MiB chunks this supports responses up to 16 GiB.
+const MAX_UNKNOWN_SIZE_CHUNKS: u64 = 2048;
+
 #[allow(clippy::too_many_arguments)]
 async fn start_sequential_download(
     config: &AppConfig,
@@ -785,7 +782,9 @@ async fn start_sequential_download(
     cache_control: Option<String>,
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
 ) -> Result<UpstreamResult, ProxyError> {
-    let effective_size = file_size.unwrap_or(config.min_chunk_size);
+    let is_unknown_size = file_size.is_none();
+    let effective_size = file_size
+        .unwrap_or(config.min_chunk_size * MAX_UNKNOWN_SIZE_CHUNKS);
     let chunk_size = config.min_chunk_size;
 
     let download = Arc::new(InFlightDownload::new(effective_size, chunk_size));
@@ -803,7 +802,6 @@ async fn start_sequential_download(
             redirect_headers: None,
             upstream_headers: all_upstream_headers,
             error_passthrough: None,
-            unknown_size_body: None,
         });
     }
 
@@ -824,14 +822,19 @@ async fn start_sequential_download(
                 redirect_headers: None,
                 upstream_headers: all_upstream_headers,
                 error_passthrough: None,
-                unknown_size_body: None,
             });
         }
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
     }
 
-    if let Some(uploader) = s3_uploader {
-        if file_size.is_some() {
+    // For known-size: spawn S3 upload immediately and pre-create temp files.
+    // For unknown-size: defer S3 upload until stream completes (actual size
+    // known); create temp files lazily inside the task.
+    let s3_uploader_for_task: Option<Arc<S3Uploader>>;
+    if is_unknown_size {
+        s3_uploader_for_task = s3_uploader;
+    } else {
+        if let Some(uploader) = s3_uploader {
             spawn_s3_upload(
                 uploader,
                 s3_bucket.to_string(),
@@ -839,18 +842,21 @@ async fn start_sequential_download(
                 download.clone(),
             );
         }
-    }
+        s3_uploader_for_task = None;
 
-    // Create temp files for all chunks
-    for idx in 0..download.chunk_count() {
-        let chunk_file = create_temp_chunk_file(&config.temp_dir)
-            .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
-        download.chunk(idx).set_file(Arc::new(chunk_file));
+        for idx in 0..download.chunk_count() {
+            let chunk_file = create_temp_chunk_file(&config.temp_dir)
+                .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
+            download.chunk(idx).set_file(Arc::new(chunk_file));
+        }
     }
 
     let dl = download.clone();
     let ck = cache_key.to_string();
     let dm_ptr = downloads as *const DownloadManager as usize;
+    let temp_dir = config.temp_dir.clone();
+    let s3b = s3_bucket.to_string();
+    let s3k = s3_key.to_string();
 
     tokio::spawn(async move {
         let downloads = unsafe { &*(dm_ptr as *const DownloadManager) };
@@ -866,6 +872,19 @@ async fn start_sequential_download(
                         if chunk_idx >= dl.chunk_count() {
                             break 'outer;
                         }
+
+                        // Lazy temp file creation for unknown-size responses
+                        if is_unknown_size && dl.chunk(chunk_idx).get_file().is_none() {
+                            match create_temp_chunk_file(&temp_dir) {
+                                Ok(f) => dl.chunk(chunk_idx).set_file(Arc::new(f)),
+                                Err(e) => {
+                                    warn!(key = ck, "temp file creation failed: {e}");
+                                    dl.mark_failed();
+                                    break 'outer;
+                                }
+                            }
+                        }
+
                         let chunk_offset = global_offset - chunk_idx as u64 * dl.chunk_size;
 
                         if let Some(file) = dl.chunk(chunk_idx).get_file() {
@@ -905,10 +924,18 @@ async fn start_sequential_download(
             }
         }
 
-        // Mark any incomplete chunks as done (for short responses)
-        for idx in 0..dl.chunk_count() {
-            if !dl.is_chunk_done(idx) && !dl.has_failed() {
-                dl.mark_chunk_done(idx);
+        if is_unknown_size {
+            dl.mark_stream_complete(global_offset);
+            if let Some(uploader) = s3_uploader_for_task {
+                if global_offset > 0 {
+                    spawn_s3_upload(uploader, s3b, s3k, dl.clone());
+                }
+            }
+        } else {
+            for idx in 0..dl.chunk_count() {
+                if !dl.is_chunk_done(idx) && !dl.has_failed() {
+                    dl.mark_chunk_done(idx);
+                }
             }
         }
 
@@ -927,6 +954,5 @@ async fn start_sequential_download(
         redirect_headers: None,
         upstream_headers: all_upstream_headers,
         error_passthrough: None,
-        unknown_size_body: None,
     })
 }

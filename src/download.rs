@@ -125,6 +125,12 @@ pub struct InFlightDownload {
     /// no concurrent S3 upload or upstream writer that still needs
     /// the file.
     eager_release: AtomicBool,
+    /// Set when the upstream stream has finished (all data received).
+    /// Used for unknown-size responses where the actual size is smaller
+    /// than `object_size`.  Signals `wait_for_bytes` to return early.
+    stream_complete: AtomicBool,
+    /// Actual total bytes received when `stream_complete` is true.
+    actual_total_bytes: AtomicU64,
 }
 
 impl InFlightDownload {
@@ -148,6 +154,8 @@ impl InFlightDownload {
             consumed_count: AtomicUsize::new(0),
             consumer_notify: Notify::new(),
             eager_release: AtomicBool::new(false),
+            stream_complete: AtomicBool::new(false),
+            actual_total_bytes: AtomicU64::new(0),
         }
     }
 
@@ -191,6 +199,9 @@ impl InFlightDownload {
     }
 
     /// Wait until at least `min_bytes` of chunk `idx` are written.
+    /// Returns early with the actual bytes written if the upstream stream
+    /// has completed (unknown-size responses may have fewer bytes than
+    /// `min_bytes`).
     pub async fn wait_for_bytes(
         &self,
         idx: usize,
@@ -201,6 +212,9 @@ impl InFlightDownload {
             if written >= min_bytes {
                 return Ok(written);
             }
+            if self.stream_complete.load(Ordering::Acquire) {
+                return Ok(written);
+            }
             if self.has_failed() {
                 return Err(ProxyError::Upstream("upstream download failed".into()));
             }
@@ -209,6 +223,24 @@ impl InFlightDownload {
             }
             self.notify.notified().await;
         }
+    }
+
+    /// Mark the upstream stream as fully received.  Used for unknown-size
+    /// (chunked) responses where `object_size` is an upper bound and the
+    /// actual data may be smaller.  Wakes all `wait_for_bytes` waiters so
+    /// they can return with the actual bytes available.
+    pub fn mark_stream_complete(&self, actual_bytes: u64) {
+        self.actual_total_bytes.store(actual_bytes, Ordering::Release);
+        self.stream_complete.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_stream_complete(&self) -> bool {
+        self.stream_complete.load(Ordering::Acquire)
+    }
+
+    pub fn actual_total_bytes(&self) -> u64 {
+        self.actual_total_bytes.load(Ordering::Acquire)
     }
 
     /// Mark all chunks as not needing S3 upload (cache-hit path).
