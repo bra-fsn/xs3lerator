@@ -169,6 +169,11 @@ async fn handle_s3_path(
         || download,
     );
 
+    // Cache-hit: no S3 upload needed.  This lets try_release() free
+    // chunk files as soon as the consumer reads them, keeping page-cache
+    // pressure bounded to the prefetch window (~128 MiB).
+    download.mark_no_upload_needed();
+
     if is_new {
         // Spawn S3 download workers
         let dl = download.clone();
@@ -216,10 +221,17 @@ async fn handle_s3_path(
     )
 }
 
+/// Prefetch window: workers stay at most this many chunks ahead of the
+/// consumer.  Keeps page-cache pressure bounded so the kernel doesn't
+/// throttle on dirty-page writeback (critical on EBS-backed instances).
+const S3_PREFETCH_WINDOW: usize = 16;
+
 /// Persistent S3 download workers: each loops pulling the *next* chunk
 /// in priority order from a shared atomic cursor, streaming each range-GET
-/// incrementally to its temp file.  This guarantees near-sequential chunk
-/// completion and allows the client to stream smoothly without stalls.
+/// incrementally to its temp file.  Workers wait for the consumer's
+/// prefetch window before starting each chunk, so the aggregate in-memory
+/// footprint stays at roughly `S3_PREFETCH_WINDOW × chunk_size` (128 MiB
+/// with 8 MiB chunks).
 async fn run_s3_download(
     s3: &AwsUpstream,
     bucket: &str,
@@ -232,13 +244,6 @@ async fn run_s3_download(
 ) -> ProxyResult<()> {
     let chunk_indices: Vec<usize> = std::iter::from_fn(|| download.pop_chunk()).collect();
 
-    // Create temp files for all chunks up front.
-    for &idx in &chunk_indices {
-        let chunk_file = create_temp_chunk_file(temp_dir)
-            .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
-        download.chunk(idx).set_file(Arc::new(chunk_file));
-    }
-
     let num_workers = max_concurrency.min(chunk_indices.len());
     let cursor = Arc::new(AtomicUsize::new(0));
     let chunks = Arc::new(chunk_indices);
@@ -250,6 +255,7 @@ async fn run_s3_download(
         let s3 = s3.clone();
         let b = bucket.to_string();
         let k = key.to_string();
+        let temp_dir = temp_dir.to_path_buf();
         let dl_ptr = download as *const InFlightDownload as usize;
         let trace_c = trace.clone();
 
@@ -262,10 +268,19 @@ async fn run_s3_download(
                 if pos >= chunks.len() { break; }
                 let idx = chunks[pos];
 
-                let chunk_file = download.chunk(idx).get_file()
-                    .ok_or_else(|| ProxyError::Internal(
-                        format!("s3 chunk {idx} file gone")
-                    ))?;
+                // Wait until this chunk is within the consumer's prefetch
+                // window.  This prevents aggressive pre-fetching from
+                // blowing out the page cache on bandwidth-limited disks.
+                download.wait_for_consumer_window(idx, S3_PREFETCH_WINDOW).await;
+                if download.is_cancelled() { break; }
+
+                // Create the temp file just-in-time (within the window),
+                // so we don't hold hundreds of open fds for a huge file.
+                let chunk_file = create_temp_chunk_file(&temp_dir)
+                    .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
+                let chunk_file = Arc::new(chunk_file);
+                download.chunk(idx).set_file(chunk_file.clone());
+
                 let (local_start, local_end) = download.chunk_byte_range(idx);
                 let s3_start = global_offset + local_start;
                 let s3_end = global_offset + local_end;
@@ -523,11 +538,23 @@ fn make_download_stream(
 
         let chunk_size = download.chunk_size;
         let mut pos = serve_start;
+        let mut prev_chunk: Option<usize> = None;
 
         while pos <= serve_end {
             let chunk_idx = (pos / chunk_size) as usize;
             if chunk_idx >= download.chunk_count() {
                 break;
+            }
+
+            // When crossing a chunk boundary, release the previous chunk.
+            // For unlinked temp files this discards pages with no writeback.
+            if let Some(prev) = prev_chunk {
+                if chunk_idx != prev {
+                    download.notify_consumed(prev);
+                    prev_chunk = Some(chunk_idx);
+                }
+            } else {
+                prev_chunk = Some(chunk_idx);
             }
 
             let chunk_offset = pos % chunk_size;
@@ -555,12 +582,9 @@ fn make_download_stream(
             yield data;
         }
 
-        // Signal that all downstream readers are done for chunks we've consumed
-        let first_chunk = (serve_start / chunk_size) as usize;
-        let last_chunk = (serve_end / chunk_size) as usize;
-        for idx in first_chunk..=last_chunk.min(download.chunk_count() - 1) {
-            download.chunk(idx).readers_done.store(true, Ordering::Release);
-            download.chunk(idx).try_release();
+        // Release the final chunk
+        if let Some(last) = prev_chunk {
+            download.notify_consumed(last);
         }
     }
 }

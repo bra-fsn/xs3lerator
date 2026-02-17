@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -114,6 +114,17 @@ pub struct InFlightDownload {
     cancelled: AtomicBool,
     /// Set when the S3 multipart upload is fully completed.
     pub s3_upload_complete: AtomicBool,
+    /// Number of chunks the client has fully consumed (0 initially).
+    /// Used by download workers to stay within a bounded prefetch window.
+    consumed_count: AtomicUsize,
+    /// Signaled when the consumer advances, unblocking workers waiting
+    /// for the prefetch window.
+    consumer_notify: Notify,
+    /// When true, `notify_consumed` eagerly releases chunk files via
+    /// `try_release`.  Only set for cache-hit downloads where there is
+    /// no concurrent S3 upload or upstream writer that still needs
+    /// the file.
+    eager_release: AtomicBool,
 }
 
 impl InFlightDownload {
@@ -134,6 +145,9 @@ impl InFlightDownload {
             failed: AtomicU8::new(0),
             cancelled: AtomicBool::new(false),
             s3_upload_complete: AtomicBool::new(false),
+            consumed_count: AtomicUsize::new(0),
+            consumer_notify: Notify::new(),
+            eager_release: AtomicBool::new(false),
         }
     }
 
@@ -197,6 +211,17 @@ impl InFlightDownload {
         }
     }
 
+    /// Mark all chunks as not needing S3 upload (cache-hit path).
+    /// This allows `try_release` to free chunk files as soon as the
+    /// consumer finishes reading them, and enables eager release in
+    /// `notify_consumed`.
+    pub fn mark_no_upload_needed(&self) {
+        self.eager_release.store(true, Ordering::Release);
+        for chunk in &self.chunks {
+            chunk.uploaded_to_s3.store(true, Ordering::Release);
+        }
+    }
+
     pub fn mark_failed(&self) {
         self.failed.store(1, Ordering::Release);
         self.notify.notify_waiters();
@@ -210,10 +235,41 @@ impl InFlightDownload {
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.notify.notify_waiters();
+        self.consumer_notify.notify_waiters();
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Called by the client stream when it finishes reading a chunk.
+    /// Updates the consumer position and, when eager_release is enabled
+    /// (cache-hit path), releases the chunk's file descriptor immediately.
+    /// For cache-miss paths the file is kept alive for the S3 upload; it
+    /// will be released by the upload completion loop instead.
+    pub fn notify_consumed(&self, chunk_idx: usize) {
+        self.consumed_count.store(chunk_idx + 1, Ordering::Release);
+        self.chunks[chunk_idx].readers_done.store(true, Ordering::Release);
+        if self.eager_release.load(Ordering::Acquire) {
+            self.chunks[chunk_idx].try_release();
+        }
+        self.consumer_notify.notify_waiters();
+    }
+
+    /// Block until `chunk_idx` is within the prefetch window.
+    /// Workers call this before starting each chunk download to avoid
+    /// racing too far ahead of the client and blowing out the page cache.
+    pub async fn wait_for_consumer_window(&self, chunk_idx: usize, window: usize) {
+        loop {
+            if self.is_cancelled() || self.has_failed() {
+                return;
+            }
+            let consumed = self.consumed_count.load(Ordering::Acquire);
+            if chunk_idx < consumed + window {
+                return;
+            }
+            self.consumer_notify.notified().await;
+        }
     }
 
     /// Move chunks overlapping `[byte_start, byte_end_inclusive]` to the
