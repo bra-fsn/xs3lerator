@@ -81,7 +81,7 @@ class TestCacheMiss:
         assert r.status_code == 200
         time.sleep(S3_UPLOAD_SETTLE)
 
-        manifest_key = f"{MAP_PREFIX}{unique_key}"
+        manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
         obj = s3_client.get_object(Bucket=test_bucket, Key=manifest_key)
         manifest_data = obj["Body"].read()
         assert manifest_data[:4] == b"XS3M", "Manifest should start with XS3M magic"
@@ -238,7 +238,7 @@ class TestLargeFile:
         assert r.status_code == 200
         time.sleep(S3_UPLOAD_SETTLE * 2)
 
-        manifest_key = f"{MAP_PREFIX}{unique_key}"
+        manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
         obj = s3_client.get_object(Bucket=test_bucket, Key=manifest_key)
         manifest_data = obj["Body"].read()
         assert manifest_data[:4] == b"XS3M"
@@ -374,9 +374,9 @@ class TestManifestAlias:
             headers={"X-Xs3lerator-Link-Manifest": unique_key},
             timeout=30,
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 204
 
-        alias_manifest_key = f"{MAP_PREFIX}{alias_key}"
+        alias_manifest_key = f"{MAP_PREFIX}{test_bucket}/{alias_key}"
         obj = s3_client.get_object(Bucket=test_bucket, Key=alias_manifest_key)
         assert obj["Body"].read()[:4] == b"XS3M"
 
@@ -395,7 +395,7 @@ class TestManifestAlias:
             headers={"X-Xs3lerator-Link-Manifest": unique_key},
             timeout=30,
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 204
 
         r2 = proxy_get(alias_key, "/data/1", object_size=SMALL)
         assert r2.status_code == 200

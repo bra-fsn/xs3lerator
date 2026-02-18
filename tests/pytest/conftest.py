@@ -302,14 +302,18 @@ def build_manifest(payload: bytes, chunk_size: int = CHUNK_SIZE) -> tuple[bytes,
 
 
 def seed_cached_object(s3_client, bucket: str, key: str, payload: bytes, chunk_size: int = CHUNK_SIZE):
-    """Upload a properly formatted manifest + chunks to S3 for cache hit tests."""
+    """Upload a properly formatted manifest + chunks to S3 for cache hit tests.
+
+    xs3lerator builds cache_key as "{bucket}/{key}", so the manifest S3 key
+    is "_map/{bucket}/{key}" stored inside the same bucket.
+    """
     manifest_bytes, chunks = build_manifest(payload, chunk_size)
 
     for chunk_hash, chunk_data in chunks:
         s3_key = _chunk_s3_key(chunk_hash)
         s3_client.put_object(Bucket=bucket, Key=s3_key, Body=chunk_data)
 
-    manifest_key = f"{MAP_PREFIX}{key}"
+    manifest_key = f"{MAP_PREFIX}{bucket}/{key}"
     s3_client.put_object(Bucket=bucket, Key=manifest_key, Body=manifest_bytes)
 
 
