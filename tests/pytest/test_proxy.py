@@ -4,20 +4,23 @@ Requires LocalStack (S3) and the xs3lerator binary.
 Fixtures are defined in conftest.py.
 """
 
-import base64
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import pytest
 import requests
 
 from test_server import generate_payload
+from conftest import (
+    DATA_PREFIX,
+    MAP_PREFIX,
+    seed_cached_object,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-SMALL = 1_000_000          # 1 MB  (single chunk)
+SMALL = 1_000_000          # 1 MB  (single chunk at 5 MiB min)
 MEDIUM = 12_000_000        # 12 MB (2-3 chunks at 5 MiB min)
 LARGE = 30_000_000         # 30 MB (6 chunks)
 S3_UPLOAD_SETTLE = 5.0     # seconds to wait for async S3 upload
@@ -31,9 +34,10 @@ class TestBasic:
         r = requests.get(f"{proxy}/healthz", timeout=5)
         assert r.status_code == 200
 
-    def test_method_not_allowed_post(self, proxy, test_bucket):
+    def test_method_not_allowed_post_without_header(self, proxy, test_bucket):
+        """POST without X-Xs3lerator-Link-Manifest header returns 500."""
         r = requests.post(f"{proxy}/{test_bucket}/any-key", timeout=5)
-        assert r.status_code == 405
+        assert r.status_code == 500
 
     def test_method_not_allowed_put(self, proxy, test_bucket):
         r = requests.put(f"{proxy}/{test_bucket}/any-key", timeout=5)
@@ -75,10 +79,18 @@ class TestCacheMiss:
         r = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r.status_code == 200
         time.sleep(S3_UPLOAD_SETTLE)
-        obj = s3_client.get_object(Bucket=test_bucket, Key=unique_key)
-        s3_data = obj["Body"].read()
-        assert len(s3_data) == SMALL
-        assert s3_data == generate_payload(SMALL)
+
+        manifest_key = f"{MAP_PREFIX}{unique_key}"
+        obj = s3_client.get_object(Bucket=test_bucket, Key=manifest_key)
+        manifest_data = obj["Body"].read()
+        assert manifest_data[:4] == b"XS3M", "Manifest should start with XS3M magic"
+
+        paginator = s3_client.get_paginator("list_objects_v2")
+        data_keys = []
+        for page in paginator.paginate(Bucket=test_bucket, Prefix=DATA_PREFIX):
+            for o in page.get("Contents", []):
+                data_keys.append(o["Key"])
+        assert len(data_keys) > 0, "At least one data chunk should exist"
 
 
 # ── Cache hit → S3 serve ─────────────────────────────────────────────────
@@ -86,15 +98,15 @@ class TestCacheMiss:
 
 class TestCacheHit:
     @pytest.fixture
-    def cached_key(self, proxy_get, unique_key, s3_client, test_bucket):
-        """Pre-populate S3 with a known object."""
+    def cached_key(self, unique_key, s3_client, test_bucket):
+        """Pre-populate S3 with a properly formatted manifest + chunks."""
         payload = generate_payload(SMALL)
-        s3_client.put_object(Bucket=test_bucket, Key=unique_key, Body=payload)
+        seed_cached_object(s3_client, test_bucket, unique_key, payload)
         return unique_key, payload
 
     def test_cache_hit_serves_from_s3(self, proxy_get, cached_key):
         key, payload = cached_key
-        r = proxy_get(key, "/data/1")  # upstream URL doesn't matter for hit
+        r = proxy_get(key, "/data/1", object_size=len(payload))
         assert r.status_code == 200
         assert r.content == payload
 
@@ -128,10 +140,10 @@ class TestS3Fallback:
 
 class TestRangeRequests:
     @pytest.fixture(scope="class")
-    def cached_object(self, proxy_get, s3_client, test_bucket):
+    def cached_object(self, s3_client, test_bucket):
         key = f"test/range-{SMALL}"
         payload = generate_payload(SMALL)
-        s3_client.put_object(Bucket=test_bucket, Key=key, Body=payload)
+        seed_cached_object(s3_client, test_bucket, key, payload)
         return key, payload
 
     def test_range_explicit(self, proxy_get, cached_object):
@@ -224,20 +236,20 @@ class TestLargeFile:
         r = proxy_get(unique_key, f"/data/{LARGE}", cache_skip=True, timeout=60)
         assert r.status_code == 200
         time.sleep(S3_UPLOAD_SETTLE * 2)
-        obj = s3_client.get_object(Bucket=test_bucket, Key=unique_key)
-        s3_data = obj["Body"].read()
-        assert len(s3_data) == LARGE
+
+        manifest_key = f"{MAP_PREFIX}{unique_key}"
+        obj = s3_client.get_object(Bucket=test_bucket, Key=manifest_key)
+        manifest_data = obj["Body"].read()
+        assert manifest_data[:4] == b"XS3M"
 
     def test_large_file_cache_hit_after_upload(
         self, proxy_get, s3_client, test_bucket
     ):
         key = "test/large-cache-hit"
         payload = generate_payload(LARGE)
-        # First request: cache miss → upload
         r1 = proxy_get(key, f"/data/{LARGE}", cache_skip=True, timeout=60)
         assert r1.status_code == 200
         time.sleep(S3_UPLOAD_SETTLE * 2)
-        # Second request: cache hit from S3
         r2 = proxy_get(key, "/data/1", object_size=LARGE, timeout=60)
         assert r2.status_code == 200
         assert r2.headers["x-xs3lerator-cache-hit"] == "true"
@@ -252,7 +264,7 @@ class TestConcurrency:
     def test_concurrent_gets_same_key(self, proxy_get, s3_client, test_bucket):
         key = "test/concurrent-same"
         payload = generate_payload(SMALL)
-        s3_client.put_object(Bucket=test_bucket, Key=key, Body=payload)
+        seed_cached_object(s3_client, test_bucket, key, payload)
 
         def fetch():
             return proxy_get(key, "/data/1", object_size=len(payload))
@@ -267,7 +279,7 @@ class TestConcurrency:
     def test_concurrent_range_gets(self, proxy_get, s3_client, test_bucket):
         key = "test/concurrent-ranges"
         payload = generate_payload(SMALL)
-        s3_client.put_object(Bucket=test_bucket, Key=key, Body=payload)
+        seed_cached_object(s3_client, test_bucket, key, payload)
 
         def fetch_range(start, end):
             return proxy_get(
@@ -340,6 +352,53 @@ class TestHeaders:
         echoed = r.json()
         host = echoed.get("Host", echoed.get("host", ""))
         assert "xs3lerator" not in host.lower()
+
+
+# ── Manifest alias (POST) ────────────────────────────────────────────────
+
+
+class TestManifestAlias:
+    def test_manifest_alias_creates_copy(
+        self, proxy, proxy_get, unique_key, s3_client, test_bucket
+    ):
+        """POST with X-Xs3lerator-Link-Manifest creates an alias manifest."""
+        payload = generate_payload(SMALL)
+        r = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
+        assert r.status_code == 200
+        time.sleep(S3_UPLOAD_SETTLE)
+
+        alias_key = f"{unique_key}-alias"
+        resp = requests.post(
+            f"{proxy}/{test_bucket}/{alias_key}",
+            headers={"X-Xs3lerator-Link-Manifest": unique_key},
+            timeout=30,
+        )
+        assert resp.status_code == 200
+
+        alias_manifest_key = f"{MAP_PREFIX}{alias_key}"
+        obj = s3_client.get_object(Bucket=test_bucket, Key=alias_manifest_key)
+        assert obj["Body"].read()[:4] == b"XS3M"
+
+    def test_manifest_alias_serves_same_content(
+        self, proxy, proxy_get, unique_key, s3_client, test_bucket
+    ):
+        """Content served via an alias key should match the original."""
+        payload = generate_payload(SMALL)
+        r1 = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
+        assert r1.status_code == 200
+        time.sleep(S3_UPLOAD_SETTLE)
+
+        alias_key = f"{unique_key}-alias2"
+        resp = requests.post(
+            f"{proxy}/{test_bucket}/{alias_key}",
+            headers={"X-Xs3lerator-Link-Manifest": unique_key},
+            timeout=30,
+        )
+        assert resp.status_code == 200
+
+        r2 = proxy_get(alias_key, "/data/1", object_size=SMALL)
+        assert r2.status_code == 200
+        assert r2.content == payload
 
 
 # ── Upstream error handling ──────────────────────────────────────────────

@@ -21,8 +21,10 @@ Environment variables:
 """
 
 import base64
+import hashlib
 import os
 import socket
+import struct
 import subprocess
 import time
 from pathlib import Path
@@ -250,3 +252,70 @@ def unique_key():
     """Generate a unique S3 key per test to avoid cross-test interference."""
     import uuid
     return f"test/{uuid.uuid4().hex}"
+
+
+# ---------------------------------------------------------------------------
+# Content-addressed storage helpers
+# ---------------------------------------------------------------------------
+
+DATA_PREFIX = "data/"
+MAP_PREFIX = "_map/"
+CHUNK_SIZE = 5 * 1024 * 1024  # 5 MiB -- matches XS3_MIN_CHUNK_SIZE in proxy fixture
+
+
+def _sha256(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
+
+
+def _chunk_s3_key(chunk_hash: bytes) -> str:
+    """Compute the S3 key for a chunk under data/ with 4-level prefix hashing."""
+    h = chunk_hash.hex()
+    return f"{DATA_PREFIX}{h[0]}/{h[1]}/{h[2]}/{h[3]}/{h}"
+
+
+def build_manifest(payload: bytes, chunk_size: int = CHUNK_SIZE) -> tuple[bytes, list[tuple[bytes, bytes]]]:
+    """Build a binary manifest and chunk list for a payload.
+
+    Returns (manifest_bytes, [(chunk_hash, chunk_data), ...]).
+    """
+    total_size = len(payload)
+    chunks = []
+    offset = 0
+    while offset < total_size:
+        chunk_data = payload[offset:offset + chunk_size]
+        chunk_hash = _sha256(chunk_data)
+        chunks.append((chunk_hash, chunk_data))
+        offset += chunk_size
+
+    num_chunks = len(chunks)
+    buf = bytearray()
+    buf.extend(b"XS3M")       # magic
+    buf.append(1)              # version
+    buf.append(1)              # hash_algo (SHA-256)
+    buf.extend(struct.pack("<Q", chunk_size))
+    buf.extend(struct.pack("<Q", total_size))
+    buf.extend(struct.pack("<I", num_chunks))
+    for chunk_hash, _ in chunks:
+        buf.extend(chunk_hash)
+
+    return bytes(buf), chunks
+
+
+def seed_cached_object(s3_client, bucket: str, key: str, payload: bytes, chunk_size: int = CHUNK_SIZE):
+    """Upload a properly formatted manifest + chunks to S3 for cache hit tests."""
+    manifest_bytes, chunks = build_manifest(payload, chunk_size)
+
+    for chunk_hash, chunk_data in chunks:
+        s3_key = _chunk_s3_key(chunk_hash)
+        s3_client.put_object(Bucket=bucket, Key=s3_key, Body=chunk_data)
+
+    manifest_key = f"{MAP_PREFIX}{key}"
+    s3_client.put_object(Bucket=bucket, Key=manifest_key, Body=manifest_bytes)
+
+
+@pytest.fixture(scope="session")
+def seed_object(s3_client, test_bucket):
+    """Factory fixture for seeding content-addressed objects."""
+    def _seed(key: str, payload: bytes, chunk_size: int = CHUNK_SIZE):
+        seed_cached_object(s3_client, test_bucket, key, payload, chunk_size)
+    return _seed
