@@ -1,6 +1,7 @@
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use thiserror::Error;
+use tracing::{error, warn};
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -23,7 +24,10 @@ pub enum ProxyError {
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let (code, extra_headers) = match &self {
-            ProxyError::NotFound(_) => (StatusCode::NOT_FOUND, None),
+            ProxyError::NotFound(msg) => {
+                warn!(status = 404, error = %msg, "not found");
+                (StatusCode::NOT_FOUND, None)
+            }
             ProxyError::RangeNotSatisfiable(total) => {
                 let mut h = HeaderMap::new();
                 if let Some(t) = total {
@@ -31,14 +35,24 @@ impl IntoResponse for ProxyError {
                         h.insert("content-range", v);
                     }
                 }
+                warn!(status = 416, "range not satisfiable");
                 (StatusCode::RANGE_NOT_SATISFIABLE, Some(h))
             }
-            ProxyError::Upstream(_) => (StatusCode::BAD_GATEWAY, None),
-            ProxyError::UpstreamStatus { status, .. } => (
-                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
-                None,
-            ),
-            ProxyError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, None),
+            ProxyError::Upstream(msg) => {
+                error!(status = 502, error = %msg, "upstream error");
+                (StatusCode::BAD_GATEWAY, None)
+            }
+            ProxyError::UpstreamStatus { status, message } => {
+                warn!(status, error = %message, "upstream status error");
+                (
+                    StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    None,
+                )
+            }
+            ProxyError::Internal(msg) => {
+                error!(status = 500, error = %msg, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, None)
+            }
         };
         let mut resp = (code, self.to_string()).into_response();
         if let Some(headers) = extra_headers {
