@@ -7,6 +7,7 @@ Fixtures are defined in conftest.py.
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
 import requests
 
 from test_server import generate_payload
