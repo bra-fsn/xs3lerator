@@ -73,6 +73,40 @@ pub struct CliArgs {
     /// chunk progress).  Disabled when omitted.
     #[arg(long, env = "XS3_DEBUG_TRACE")]
     pub debug_trace: Option<String>,
+
+    /// S3 prefix for content-addressed data chunks.
+    #[arg(long, env = "XS3_DATA_PREFIX", default_value = "data/")]
+    pub data_prefix: String,
+
+    /// S3 prefix for chunk manifests.
+    #[arg(long, env = "XS3_MAP_PREFIX", default_value = "_map/")]
+    pub map_prefix: String,
+
+    /// In-memory LRU cache capacity for manifests.
+    #[arg(long, env = "XS3_MANIFEST_CACHE_SIZE", default_value_t = 10_000)]
+    pub manifest_cache_size: usize,
+
+    /// Enable local filesystem chunk cache at this directory.
+    #[arg(long, env = "XS3_CHUNK_CACHE_DIR")]
+    pub chunk_cache_dir: Option<PathBuf>,
+
+    /// Maximum total size of the local chunk cache.
+    #[arg(
+        long,
+        env = "XS3_CHUNK_CACHE_MAX_SIZE",
+        default_value = "100GiB",
+        value_parser = parse_byte_size
+    )]
+    pub chunk_cache_max_size: u64,
+
+    /// Objects larger than this skip local chunk caching.
+    #[arg(
+        long,
+        env = "XS3_CHUNK_CACHE_MAX_OBJECT_SIZE",
+        default_value = "64MiB",
+        value_parser = parse_byte_size
+    )]
+    pub chunk_cache_max_object_size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +121,12 @@ pub struct AppConfig {
     pub min_chunk_size: u64,
     pub temp_dir: PathBuf,
     pub upstream_tls_skip_verify: bool,
+    pub data_prefix: String,
+    pub map_prefix: String,
+    pub manifest_cache_size: usize,
+    pub chunk_cache_dir: Option<PathBuf>,
+    pub chunk_cache_max_size: u64,
+    pub chunk_cache_max_object_size: u64,
 }
 
 impl TryFrom<CliArgs> for AppConfig {
@@ -107,6 +147,14 @@ impl TryFrom<CliArgs> for AppConfig {
             temp_dir
         );
 
+        if let Some(ref dir) = args.chunk_cache_dir {
+            anyhow::ensure!(
+                dir.is_dir() || !dir.exists(),
+                "chunk-cache-dir {:?} exists but is not a directory",
+                dir
+            );
+        }
+
         Ok(Self {
             bind_ip: args.bind_ip.unwrap_or_else(|| IpAddr::from([0, 0, 0, 0])),
             port: args.port,
@@ -118,6 +166,12 @@ impl TryFrom<CliArgs> for AppConfig {
             min_chunk_size: args.min_chunk_size,
             temp_dir,
             upstream_tls_skip_verify: args.upstream_tls_skip_verify,
+            data_prefix: args.data_prefix,
+            map_prefix: args.map_prefix,
+            manifest_cache_size: args.manifest_cache_size,
+            chunk_cache_dir: args.chunk_cache_dir,
+            chunk_cache_max_size: args.chunk_cache_max_size,
+            chunk_cache_max_object_size: args.chunk_cache_max_object_size,
         })
     }
 }

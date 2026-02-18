@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -41,6 +41,11 @@ impl DownloadManager {
     pub fn remove(&self, cache_key: &str) {
         self.active.lock().remove(cache_key);
     }
+
+    /// Check if there's an in-flight download for the given cache key.
+    pub fn get_inflight(&self, cache_key: &str) -> Option<Arc<InFlightDownload>> {
+        self.active.lock().get(cache_key).cloned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -53,10 +58,14 @@ pub struct ChunkSlot {
     file: Mutex<Option<Arc<File>>>,
     /// Bytes written to this chunk's file so far (monotonically increasing).
     bytes_written: AtomicU64,
-    /// Set once the S3 UploadPart for this chunk completes.
+    /// Set once the S3 upload for this chunk completes.
     pub uploaded_to_s3: AtomicBool,
     /// Set once all downstream readers have finished with this chunk.
     pub readers_done: AtomicBool,
+    /// SHA-256 hash of the chunk content (set after chunk is fully downloaded).
+    hash: Mutex<Option<[u8; 32]>>,
+    /// Path to the chunk in the local cache (set when chunk cache is enabled).
+    cache_path: Mutex<Option<PathBuf>>,
 }
 
 impl ChunkSlot {
@@ -66,6 +75,8 @@ impl ChunkSlot {
             bytes_written: AtomicU64::new(0),
             uploaded_to_s3: AtomicBool::new(false),
             readers_done: AtomicBool::new(false),
+            hash: Mutex::new(None),
+            cache_path: Mutex::new(None),
         }
     }
 
@@ -97,6 +108,22 @@ impl ChunkSlot {
 
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written.load(Ordering::Acquire)
+    }
+
+    pub fn set_hash(&self, hash: [u8; 32]) {
+        *self.hash.lock() = Some(hash);
+    }
+
+    pub fn get_hash(&self) -> Option<[u8; 32]> {
+        *self.hash.lock()
+    }
+
+    pub fn set_cache_path(&self, path: PathBuf) {
+        *self.cache_path.lock() = Some(path);
+    }
+
+    pub fn get_cache_path(&self) -> Option<PathBuf> {
+        self.cache_path.lock().clone()
     }
 }
 
@@ -334,6 +361,48 @@ impl InFlightDownload {
 
     pub fn pop_chunk(&self) -> Option<usize> {
         self.chunk_queue.lock().pop_front()
+    }
+
+    /// Wait until the S3 upload is fully completed (manifest written).
+    pub async fn wait_for_s3_complete(&self) {
+        loop {
+            if self.s3_upload_complete.load(Ordering::Acquire) {
+                return;
+            }
+            if self.has_failed() || self.is_cancelled() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    /// Collect all chunk hashes into a Manifest struct.
+    /// Returns `None` if any chunk is missing its hash.
+    pub fn collect_manifest(&self) -> Option<crate::manifest::Manifest> {
+        let num = if self.is_stream_complete() {
+            let total = self.actual_total_bytes();
+            if total == 0 {
+                return None;
+            }
+            ((total + self.chunk_size - 1) / self.chunk_size) as usize
+        } else {
+            self.chunk_count()
+        };
+
+        let mut hashes = Vec::with_capacity(num);
+        for idx in 0..num {
+            hashes.push(self.chunks[idx].get_hash()?);
+        }
+
+        Some(crate::manifest::Manifest {
+            chunk_size: self.chunk_size,
+            total_size: if self.is_stream_complete() {
+                self.actual_total_bytes()
+            } else {
+                self.object_size
+            },
+            hashes,
+        })
     }
 }
 

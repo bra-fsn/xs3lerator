@@ -4,6 +4,7 @@ use std::sync::Arc;
 use xs3lerator::config::AppConfig;
 use xs3lerator::download::DownloadManager;
 use xs3lerator::handler::AppState;
+use xs3lerator::manifest::ManifestCache;
 use xs3lerator::s3::{AwsUpstream, S3Uploader};
 use xs3lerator::server::build_router;
 
@@ -23,6 +24,12 @@ fn test_config() -> AppConfig {
         min_chunk_size: 5 * 1024 * 1024,
         temp_dir: std::env::temp_dir(),
         upstream_tls_skip_verify: false,
+        data_prefix: "data/".to_string(),
+        map_prefix: "_map/".to_string(),
+        manifest_cache_size: 100,
+        chunk_cache_dir: None,
+        chunk_cache_max_size: 100 * 1024 * 1024 * 1024,
+        chunk_cache_max_object_size: 64 * 1024 * 1024,
     }
 }
 
@@ -59,6 +66,8 @@ async fn healthz_returns_ok() {
         s3_uploader: Arc::new(S3Uploader::new(s3_client)),
         downloads: Arc::new(DownloadManager::default()),
         trace: None,
+        manifest_cache: Arc::new(ManifestCache::new(100)),
+        chunk_cache: None,
     };
 
     let base = start_server(state).await;
@@ -81,18 +90,20 @@ async fn non_get_returns_405() {
         s3_uploader: Arc::new(S3Uploader::new(s3_client)),
         downloads: Arc::new(DownloadManager::default()),
         trace: None,
+        manifest_cache: Arc::new(ManifestCache::new(100)),
+        chunk_cache: None,
     };
 
     let base = start_server(state).await;
     let client = reqwest::Client::new();
 
-    // POST should return 405
+    // POST without the manifest alias header returns 500 (missing header)
     let resp = client
         .post(format!("{base}/test-bucket/test-key"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 405);
+    assert_eq!(resp.status(), 500);
 
     // PUT should return 405
     let resp = client
@@ -133,6 +144,8 @@ async fn get_without_upstream_url_returns_error() {
         s3_uploader: Arc::new(S3Uploader::new(s3_client)),
         downloads: Arc::new(DownloadManager::default()),
         trace: None,
+        manifest_cache: Arc::new(ManifestCache::new(100)),
+        chunk_cache: None,
     };
 
     let base = start_server(state).await;

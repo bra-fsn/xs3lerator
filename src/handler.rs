@@ -12,15 +12,18 @@ use futures::StreamExt;
 use serde_json::json;
 use tracing::{error, info};
 
+use crate::chunk_cache::ChunkCache;
+use crate::chunk_upload;
 use crate::config::AppConfig;
 use crate::download::{create_temp_chunk_file, pwrite_all, DownloadManager, InFlightDownload};
 use crate::error::{ProxyError, ProxyResult};
 use crate::headers::{
     self, parse_bucket_key, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
 };
+use crate::manifest::{Manifest, ManifestCache};
 use crate::planner::compute_chunk_plan;
 use crate::range::{parse_range_header, ByteRange};
-use crate::s3::{AwsUpstream, S3Uploader, Upstream};
+use crate::s3::{AwsUpstream, S3Uploader};
 use crate::trace::{trace_log, TraceWriter};
 use crate::upstream_fetcher;
 
@@ -42,6 +45,8 @@ pub struct AppState {
     pub s3_uploader: Arc<S3Uploader>,
     pub downloads: Arc<DownloadManager>,
     pub trace: Option<Arc<TraceWriter>>,
+    pub manifest_cache: Arc<ManifestCache>,
+    pub chunk_cache: Option<Arc<ChunkCache>>,
 }
 
 /// Health check endpoint: `GET /healthz`
@@ -49,13 +54,81 @@ pub async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Method-not-allowed handler for non-GET methods.
+/// Method-not-allowed handler for non-GET/POST methods.
 pub async fn method_not_allowed() -> impl IntoResponse {
     (
         StatusCode::METHOD_NOT_ALLOWED,
-        [(axum::http::header::ALLOW, "GET")],
-        "only GET is supported",
+        [(axum::http::header::ALLOW, "GET, POST")],
+        "only GET and POST are supported",
     )
+}
+
+/// POST handler for manifest alias: `POST /{bucket}/{target_key}`
+/// with `X-Xs3lerator-Link-Manifest: {source_key}`.
+/// Race-free Vary support: waits for in-flight download then copies manifest.
+pub async fn handle_post(
+    State(state): State<AppState>,
+    req: Request<Body>,
+) -> Result<Response, ProxyError> {
+    let path = req.uri().path().to_string();
+    let headers = req.headers().clone();
+
+    let (bucket, target_key) = parse_bucket_key(&path)
+        .ok_or_else(|| ProxyError::Internal("invalid path: expected /<bucket>/<key>".into()))?;
+
+    let source_key = headers
+        .get("x-xs3lerator-link-manifest")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            ProxyError::Internal("missing X-Xs3lerator-Link-Manifest header".into())
+        })?;
+
+    let source_cache_key = format!("{}/{}", bucket, source_key);
+    let target_cache_key = format!("{}/{}", bucket, target_key);
+
+    info!(
+        source = source_cache_key,
+        target = target_cache_key,
+        "manifest alias request"
+    );
+
+    // Wait for any in-flight download of the source key to complete its S3 upload
+    {
+        let active = state.downloads.get_inflight(&source_cache_key);
+        if let Some(inflight) = active {
+            info!(
+                source = source_cache_key,
+                "waiting for in-flight download to complete manifest write"
+            );
+            inflight.wait_for_s3_complete().await;
+        }
+    }
+
+    // Read source manifest (LRU or S3)
+    let manifest = fetch_manifest(&state, &bucket, &source_cache_key).await?;
+
+    // Write manifest under target key
+    let manifest_bytes = manifest.serialize();
+    chunk_upload::put_manifest(
+        &state.s3_uploader,
+        &bucket,
+        &state.config.map_prefix,
+        &target_cache_key,
+        manifest_bytes,
+    )
+    .await?;
+
+    // Cache under target key in LRU
+    state
+        .manifest_cache
+        .insert(target_cache_key.clone(), manifest);
+
+    info!(target = target_cache_key, "manifest alias created");
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap())
 }
 
 /// Main GET handler: `GET /<bucket>/<s3_key...>`
@@ -85,6 +158,7 @@ pub async fn handle_get(
     }));
 
     if contract.cache_skip {
+        state.manifest_cache.evict(&cache_key);
         return handle_upstream_path(
             &state,
             &contract,
@@ -129,79 +203,83 @@ pub async fn handle_get(
     }
 }
 
-/// Serve from S3 cache using parallel range-GETs.
+/// Serve from S3 cache using manifest-based chunk serving.
+/// 1. Fetch manifest from LRU cache or S3 at `_map/{key}`
+/// 2. Compute affected chunks for client range
+/// 3. Fetch chunks concurrently from local cache then `data/` prefix
 async fn handle_s3_path(
     state: &AppState,
-    contract: &headers::ContractHeaders,
+    _contract: &headers::ContractHeaders,
     bucket: &str,
     key: &str,
     cache_key: &str,
     client_range: Option<&str>,
 ) -> ProxyResult<Response> {
-    let object_size = if let Some(size) = contract.object_size {
-        size
-    } else {
-        let meta = state.s3_upstream.head_object(bucket, key).await?;
-        meta.content_length
-    };
+    let manifest = fetch_manifest(state, bucket, cache_key).await?;
+    let object_size = manifest.total_size;
 
     let client_byte_range = parse_range_header(client_range, object_size)?;
-
     let (serve_start, serve_end) = match client_byte_range {
         Some(ref r) => (r.start, r.end_inclusive),
         None => (0, object_size.saturating_sub(1)),
     };
 
-    // Only download the requested range from S3 (not the full file)
+    let chunk_range = manifest.chunks_for_range(serve_start, serve_end);
+    let _num_download_chunks = chunk_range.len();
+    let download_size = serve_end - serve_start + 1;
+
     let plan = compute_chunk_plan(
-        serve_end - serve_start + 1,
+        download_size,
         state.config.s3_concurrency,
-        state.config.min_chunk_size,
+        manifest.chunk_size,
     );
 
-    let download = Arc::new(InFlightDownload::new(
-        serve_end - serve_start + 1,
-        plan.chunk_size,
-    ));
+    let download = Arc::new(InFlightDownload::new(download_size, plan.chunk_size));
+    let ck = format!("{cache_key}:{serve_start}-{serve_end}");
 
-    let (download, is_new) = state.downloads.get_or_create(
-        &format!("{cache_key}:{serve_start}-{serve_end}"),
-        || download,
-    );
-
-    // Cache-hit: no S3 upload needed.  This lets try_release() free
-    // chunk files as soon as the consumer reads them, keeping page-cache
-    // pressure bounded to the prefetch window (~128 MiB).
+    let (download, is_new) = state.downloads.get_or_create(&ck, || download);
     download.mark_no_upload_needed();
 
     if is_new {
-        // Spawn S3 download workers
         let dl = download.clone();
         let s3 = state.s3_upstream.clone();
         let b = bucket.to_string();
         let k = key.to_string();
         let temp_dir = state.config.temp_dir.clone();
         let trace = state.trace.clone();
-        let ck = format!("{cache_key}:{serve_start}-{serve_end}");
         let dm = state.downloads.clone();
         let s3_concurrency = state.config.s3_concurrency;
+        let manifest = manifest.clone();
+        let data_prefix = state.config.data_prefix.clone();
+        let chunk_cache = state.chunk_cache.clone();
+        let ck_owned = ck.clone();
 
         tokio::spawn(async move {
-            let result = run_s3_download(
-                &s3, &b, &k, serve_start, &dl, &temp_dir, &trace, s3_concurrency,
+            let result = run_manifest_download(
+                &s3,
+                &b,
+                &manifest,
+                &data_prefix,
+                chunk_range,
+                serve_start,
+                &dl,
+                &temp_dir,
+                &trace,
+                s3_concurrency,
+                chunk_cache.as_deref(),
             )
             .await;
 
             match result {
                 Ok(()) => {
-                    info!(key = k, "S3 download complete");
+                    info!(key = k, "manifest-based download complete");
                 }
                 Err(e) => {
-                    error!(key = k, "S3 download failed: {e}");
+                    error!(key = k, "manifest-based download failed: {e}");
                     dl.mark_failed();
                 }
             }
-            dm.remove(&ck);
+            dm.remove(&ck_owned);
         });
     }
 
@@ -217,102 +295,156 @@ async fn handle_s3_path(
         object_size,
         client_byte_range,
         resp_headers,
-        true, // cancel S3 workers when client disconnects
-        0,    // download contains only the requested range
+        true,
+        0,
     )
 }
 
-/// Prefetch window: workers stay at most this many chunks ahead of the
-/// consumer.  Keeps page-cache pressure bounded so the kernel doesn't
-/// throttle on dirty-page writeback (critical on EBS-backed instances).
-const S3_PREFETCH_WINDOW: usize = 16;
+/// Fetch manifest from LRU cache or S3. Caches in LRU on success.
+async fn fetch_manifest(
+    state: &AppState,
+    bucket: &str,
+    cache_key: &str,
+) -> ProxyResult<Arc<Manifest>> {
+    if let Some(cached) = state.manifest_cache.get(cache_key) {
+        return Ok(cached);
+    }
 
-/// Persistent S3 download workers: each loops pulling the *next* chunk
-/// in priority order from a shared atomic cursor, streaming each range-GET
-/// incrementally to its temp file.  Workers wait for the consumer's
-/// prefetch window before starting each chunk, so the aggregate in-memory
-/// footprint stays at roughly `S3_PREFETCH_WINDOW × chunk_size` (128 MiB
-/// with 8 MiB chunks).
-async fn run_s3_download(
+    let manifest = chunk_upload::get_manifest(
+        &state.s3_uploader,
+        bucket,
+        &state.config.map_prefix,
+        cache_key,
+    )
+    .await?
+    .ok_or_else(|| ProxyError::NotFound(format!("no manifest for {cache_key}")))?;
+
+    let arc = Arc::new(manifest);
+    state
+        .manifest_cache
+        .insert(cache_key.to_string(), arc.clone());
+    Ok(arc)
+}
+
+/// Download chunks identified by a manifest, fetching from local cache then S3 `data/` prefix.
+async fn run_manifest_download(
     s3: &AwsUpstream,
     bucket: &str,
-    key: &str,
-    global_offset: u64,
+    manifest: &Manifest,
+    data_prefix: &str,
+    chunk_range: std::ops::Range<usize>,
+    _serve_start: u64,
     download: &InFlightDownload,
     temp_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
     max_concurrency: usize,
+    chunk_cache: Option<&ChunkCache>,
 ) -> ProxyResult<()> {
-    let chunk_indices: Vec<usize> = std::iter::from_fn(|| download.pop_chunk()).collect();
+    let chunk_indices: Vec<usize> = (0..download.chunk_count()).collect();
+    let manifest_chunk_indices: Vec<usize> = chunk_range.collect();
 
-    let num_workers = max_concurrency.min(chunk_indices.len());
+    let num_workers = max_concurrency.min(chunk_indices.len().max(1));
     let cursor = Arc::new(AtomicUsize::new(0));
     let chunks = Arc::new(chunk_indices);
+    let manifest_chunks = Arc::new(manifest_chunk_indices);
     let mut handles = Vec::with_capacity(num_workers);
 
     for _ in 0..num_workers {
         let cursor = cursor.clone();
         let chunks = chunks.clone();
+        let manifest_chunks = manifest_chunks.clone();
         let s3 = s3.clone();
         let b = bucket.to_string();
-        let k = key.to_string();
         let temp_dir = temp_dir.to_path_buf();
         let dl_ptr = download as *const InFlightDownload as usize;
         let trace_c = trace.clone();
+        let data_prefix = data_prefix.to_string();
+        let _chunk_size = manifest.chunk_size;
+
+        // Build hash list for the chunks we need
+        let hashes: Vec<[u8; 32]> = manifest_chunks
+            .iter()
+            .map(|&mi| manifest.hashes[mi])
+            .collect();
+
+        let chunk_cache_ptr = chunk_cache.map(|c| c as *const ChunkCache as usize);
 
         handles.push(tokio::spawn(async move {
             let download = unsafe { &*(dl_ptr as *const InFlightDownload) };
+            let chunk_cache: Option<&ChunkCache> =
+                chunk_cache_ptr.map(|p| unsafe { &*(p as *const ChunkCache) });
+
             loop {
-                if download.is_cancelled() { break; }
+                if download.is_cancelled() {
+                    break;
+                }
 
                 let pos = cursor.fetch_add(1, Ordering::Relaxed);
-                if pos >= chunks.len() { break; }
-                let idx = chunks[pos];
+                if pos >= chunks.len() {
+                    break;
+                }
+                let local_idx = chunks[pos];
+                let manifest_idx = manifest_chunks[pos];
+                let hash = &hashes[pos];
 
-                // Wait until this chunk is within the consumer's prefetch
-                // window.  This prevents aggressive pre-fetching from
-                // blowing out the page cache on bandwidth-limited disks.
-                download.wait_for_consumer_window(idx, S3_PREFETCH_WINDOW).await;
-                if download.is_cancelled() { break; }
+                download
+                    .wait_for_consumer_window(local_idx, S3_PREFETCH_WINDOW)
+                    .await;
+                if download.is_cancelled() {
+                    break;
+                }
 
-                // Create the temp file just-in-time (within the window),
-                // so we don't hold hundreds of open fds for a huge file.
-                let chunk_file = create_temp_chunk_file(&temp_dir)
-                    .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
+                // Try local chunk cache first
+                if let Some(cc) = chunk_cache {
+                    if let Some(file) = cc.get(hash) {
+                        let file = Arc::new(file);
+                        download.chunk(local_idx).set_file(file);
+                        download.mark_chunk_done(local_idx);
+                        continue;
+                    }
+                }
+
+                // Fetch from S3 data/ prefix
+                let s3_key = crate::manifest::hash_to_s3_key(hash, &data_prefix);
+
+                let chunk_file = create_temp_chunk_file(&temp_dir).map_err(|e| {
+                    ProxyError::Internal(format!("create temp file: {e}"))
+                })?;
                 let chunk_file = Arc::new(chunk_file);
-                download.chunk(idx).set_file(chunk_file.clone());
+                download.chunk(local_idx).set_file(chunk_file.clone());
 
-                let (local_start, local_end) = download.chunk_byte_range(idx);
-                let s3_start = global_offset + local_start;
-                let s3_end = global_offset + local_end;
-                let expected = download.expected_chunk_len(idx);
-
-                let mut body = s3.get_range_stream(&b, &k, s3_start, s3_end).await?;
+                let expected = download.expected_chunk_len(local_idx);
+                let mut body = s3.get_range_stream(&b, &s3_key, 0, expected - 1).await?;
                 let mut offset = 0u64;
                 while let Some(piece) = body.next().await {
-                    if download.is_cancelled() { break; }
+                    if download.is_cancelled() {
+                        break;
+                    }
                     let data = piece.map_err(|e| {
-                        ProxyError::Upstream(format!("s3 stream chunk {idx}: {e}"))
+                        ProxyError::Upstream(format!("s3 stream chunk {local_idx}: {e}"))
                     })?;
                     let to_write = min(data.len() as u64, expected - offset) as usize;
-                    if to_write == 0 { break; }
-                    pwrite_all(&chunk_file, offset, &data[..to_write])
-                        .map_err(|e| ProxyError::Internal(
-                            format!("pwrite s3 chunk {idx}: {e}")
-                        ))?;
+                    if to_write == 0 {
+                        break;
+                    }
+                    pwrite_all(&chunk_file, offset, &data[..to_write]).map_err(|e| {
+                        ProxyError::Internal(format!("pwrite chunk {local_idx}: {e}"))
+                    })?;
                     offset += to_write as u64;
-                    download.record_written(idx, to_write as u64);
+                    download.record_written(local_idx, to_write as u64);
                 }
                 if !download.is_cancelled() {
-                    download.mark_chunk_done(idx);
+                    download.mark_chunk_done(local_idx);
                 }
 
-                trace_log(&trace_c, || json!({
-                    "event": "s3_chunk_done",
-                    "chunk": idx,
-                    "bytes": offset,
-                    "cancelled": download.is_cancelled(),
-                }));
+                trace_log(&trace_c, || {
+                    json!({
+                        "event": "manifest_chunk_done",
+                        "local_idx": local_idx,
+                        "manifest_idx": manifest_idx,
+                        "bytes": offset,
+                    })
+                });
             }
             Ok::<(), ProxyError>(())
         }));
@@ -322,12 +454,17 @@ async fn run_s3_download(
         match handle.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(ProxyError::Internal(format!("s3 worker panicked: {e}"))),
+            Err(e) => return Err(ProxyError::Internal(format!("worker panicked: {e}"))),
         }
     }
 
     Ok(())
 }
+
+/// Prefetch window: workers stay at most this many chunks ahead of the
+/// consumer.  Keeps page-cache pressure bounded so the kernel doesn't
+/// throttle on dirty-page writeback (critical on EBS-backed instances).
+const S3_PREFETCH_WINDOW: usize = 16;
 
 /// Headers that should not be forwarded from upstream to the client.
 const UPSTREAM_STRIP_HEADERS: &[&str] = &[
@@ -387,6 +524,8 @@ async fn handle_upstream_path(
         &state.downloads,
         Some(state.s3_uploader.clone()),
         &state.trace,
+        Some(state.manifest_cache.clone()),
+        state.chunk_cache.clone(),
     )
     .await?;
 

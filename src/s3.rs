@@ -87,10 +87,10 @@ impl Upstream for AwsUpstream {
 }
 
 // ---------------------------------------------------------------------------
-// S3 Multipart Upload
+// S3 Upload / Storage Operations
 // ---------------------------------------------------------------------------
 
-/// Handles S3 multipart upload operations.
+/// Handles S3 upload and storage operations (content-addressed chunks + manifests).
 #[derive(Clone)]
 pub struct S3Uploader {
     client: Client,
@@ -100,6 +100,83 @@ impl S3Uploader {
     pub fn new(client: Client) -> Self {
         Self { client }
     }
+
+    /// Put an object with `If-None-Match: *` for idempotent content-addressed writes.
+    /// Returns `PreconditionFailed` if the object already exists.
+    pub async fn put_object_if_none_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: ByteStream,
+    ) -> Result<(), ProxyError> {
+        let result = self
+            .client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(body)
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let err_str = format_sdk_error(&e);
+                if err_str.contains("PreconditionFailed") || err_str.contains("412") || err_str.contains("ConditionalRequestConflict") {
+                    Err(ProxyError::PreconditionFailed)
+                } else {
+                    Err(ProxyError::Internal(format!("put_object {key}: {err_str}")))
+                }
+            }
+        }
+    }
+
+    /// Simple PutObject without conditions (for manifests).
+    pub async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: ByteStream,
+    ) -> Result<(), ProxyError> {
+        self.client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal(format!("put_object {key}: {}", format_sdk_error(&e))))?;
+        Ok(())
+    }
+
+    /// Get object contents as bytes.
+    pub async fn get_object_bytes(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<u8>, ProxyError> {
+        let output = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(map_get_err)?;
+
+        let data = output
+            .body
+            .collect()
+            .await
+            .map_err(|e| ProxyError::Internal(format!("read object body: {e}")))?
+            .into_bytes()
+            .to_vec();
+        Ok(data)
+    }
+
+    // Legacy multipart methods kept for backward compatibility during transition.
+    // These will be removed once all callers migrate to content-addressed uploads.
 
     pub async fn create_multipart(
         &self,

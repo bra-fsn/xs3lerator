@@ -6,19 +6,22 @@ use axum::routing::get;
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
-use crate::handler::{handle_get, healthz, method_not_allowed, AppState};
+use crate::handler::{handle_get, handle_post, healthz, method_not_allowed, AppState};
 
 async fn catch_all(
     State(state): State<AppState>,
     req: Request<Body>,
 ) -> Response {
-    if req.method() == Method::GET {
-        match handle_get(State(state), req).await {
+    match *req.method() {
+        Method::GET => match handle_get(State(state), req).await {
             Ok(resp) => resp,
             Err(err) => err.into_response(),
-        }
-    } else {
-        method_not_allowed().await.into_response()
+        },
+        Method::POST => match handle_post(State(state), req).await {
+            Ok(resp) => resp,
+            Err(err) => err.into_response(),
+        },
+        _ => method_not_allowed().await.into_response(),
     }
 }
 

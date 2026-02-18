@@ -1,8 +1,11 @@
+pub mod chunk_cache;
+pub mod chunk_upload;
 pub mod config;
 pub mod download;
 pub mod error;
 pub mod handler;
 pub mod headers;
+pub mod manifest;
 pub mod planner;
 pub mod range;
 pub mod s3;

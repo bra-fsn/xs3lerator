@@ -5,18 +5,21 @@ use std::time::Instant;
 use futures::StreamExt;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, TRANSFER_ENCODING};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use crate::chunk_cache::ChunkCache;
+use crate::chunk_upload;
 use crate::config::AppConfig;
 use crate::download::{
     create_temp_chunk_file, is_enospc, pwrite_all, DownloadManager, InFlightDownload,
 };
 use crate::error::ProxyError;
 use crate::headers::{filter_upstream_headers, ContractHeaders};
+use crate::manifest::ManifestCache;
 use crate::planner::compute_chunk_plan;
 use crate::range::parse_range_header;
 use crate::s3::S3Uploader;
-use crate::s3_upload::spawn_s3_upload;
 use crate::trace::{trace_log, TraceWriter};
 
 /// Fetch a file from an upstream HTTP(S) URL, buffer through per-chunk temp
@@ -60,6 +63,8 @@ pub async fn fetch_upstream(
     downloads: &DownloadManager,
     s3_uploader: Option<Arc<S3Uploader>>,
     trace: &Option<Arc<TraceWriter>>,
+    manifest_cache: Option<Arc<ManifestCache>>,
+    chunk_cache: Option<Arc<ChunkCache>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let upstream_url = contract
         .upstream_url
@@ -239,6 +244,8 @@ pub async fn fetch_upstream(
                 last_modified,
                 cache_control,
                 Some(all_upstream_headers),
+                manifest_cache.clone(),
+                chunk_cache.clone(),
             )
             .await;
         }
@@ -258,6 +265,8 @@ pub async fn fetch_upstream(
             last_modified,
             cache_control,
             Some(all_upstream_headers),
+            manifest_cache,
+            chunk_cache,
         )
         .await;
     }
@@ -279,6 +288,8 @@ pub async fn fetch_upstream(
         last_modified,
         cache_control,
         Some(all_upstream_headers),
+        manifest_cache,
+        chunk_cache,
     )
     .await
 }
@@ -293,7 +304,7 @@ async fn start_parallel_upstream_download(
     file_size: u64,
     cache_key: &str,
     s3_bucket: &str,
-    s3_key: &str,
+    _s3_key: &str,
     downloads: &DownloadManager,
     s3_uploader: Option<Arc<S3Uploader>>,
     trace: &Option<Arc<TraceWriter>>,
@@ -303,6 +314,8 @@ async fn start_parallel_upstream_download(
     last_modified: Option<String>,
     cache_control: Option<String>,
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
+    _manifest_cache: Option<Arc<ManifestCache>>,
+    chunk_cache: Option<Arc<ChunkCache>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let plan = compute_chunk_plan(file_size, config.http_concurrency, config.min_chunk_size);
 
@@ -353,13 +366,16 @@ async fn start_parallel_upstream_download(
         }
     }
 
-    // Spawn S3 upload if requested
+    // Spawn content-addressed chunk uploads to S3
     if let Some(uploader) = s3_uploader {
-        spawn_s3_upload(
+        chunk_upload::spawn_chunk_uploads(
             uploader,
             s3_bucket.to_string(),
-            s3_key.to_string(),
+            cache_key.to_string(),
+            config.data_prefix.clone(),
+            config.map_prefix.clone(),
             download.clone(),
+            chunk_cache.clone(),
         );
     }
 
@@ -677,6 +693,7 @@ async fn stream_response_into_chunks(
 ) -> Result<(), ProxyError> {
     let mut stream = response.bytes_stream();
     let mut global_offset = 0u64;
+    let mut hasher = Sha256::new();
 
     'outer: while let Some(piece) = stream.next().await {
         let data = piece.map_err(|e| ProxyError::Upstream(format!("sequential stream: {e}")))?;
@@ -709,14 +726,18 @@ async fn stream_response_into_chunks(
                 ProxyError::Internal("chunk file released during sequential".into())
             })?;
 
-            pwrite_all(&file, chunk_offset, &data[piece_offset..piece_offset + to_write])
+            let slice = &data[piece_offset..piece_offset + to_write];
+            pwrite_all(&file, chunk_offset, slice)
                 .map_err(|e| ProxyError::Internal(format!("pwrite chunk {chunk_idx}: {e}")))?;
 
+            hasher.update(slice);
             piece_offset += to_write;
             global_offset += to_write as u64;
             download.record_written(chunk_idx, to_write as u64);
 
             if download.is_chunk_done(chunk_idx) {
+                let hash: [u8; 32] = hasher.finalize_reset().into();
+                download.chunk(chunk_idx).set_hash(hash);
                 download.mark_chunk_done(chunk_idx);
                 trace_log(trace, || json!({
                     "event": "sequential_chunk_done",
@@ -740,6 +761,7 @@ async fn download_chunk_from_stream(
     let t0 = Instant::now();
     let mut stream = response.bytes_stream();
     let mut offset = 0u64;
+    let mut hasher = Sha256::new();
 
     while let Some(piece) = stream.next().await {
         let piece = piece.map_err(|e| ProxyError::Upstream(format!("stream chunk {idx}: {e}")))?;
@@ -747,12 +769,16 @@ async fn download_chunk_from_stream(
         if to_write == 0 {
             break;
         }
-        pwrite_all(file, offset, &piece[..to_write])
+        let slice = &piece[..to_write];
+        pwrite_all(file, offset, slice)
             .map_err(|e| ProxyError::Internal(format!("pwrite chunk {idx}: {e}")))?;
+        hasher.update(slice);
         offset += to_write as u64;
         download.record_written(idx, to_write as u64);
     }
 
+    let hash: [u8; 32] = hasher.finalize().into();
+    download.chunk(idx).set_hash(hash);
     download.mark_chunk_done(idx);
 
     trace_log(trace, || json!({
@@ -776,7 +802,7 @@ async fn start_sequential_download(
     file_size: Option<u64>,
     cache_key: &str,
     s3_bucket: &str,
-    s3_key: &str,
+    _s3_key: &str,
     downloads: &DownloadManager,
     s3_uploader: Option<Arc<S3Uploader>>,
     _trace: &Option<Arc<TraceWriter>>,
@@ -785,6 +811,8 @@ async fn start_sequential_download(
     last_modified: Option<String>,
     cache_control: Option<String>,
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
+    _manifest_cache: Option<Arc<ManifestCache>>,
+    chunk_cache: Option<Arc<ChunkCache>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let is_unknown_size = file_size.is_none();
     let effective_size = file_size
@@ -831,22 +859,27 @@ async fn start_sequential_download(
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
     }
 
-    // For known-size: spawn S3 upload immediately and pre-create temp files.
-    // For unknown-size: defer S3 upload until stream completes (actual size
-    // known); create temp files lazily inside the task.
+    // For known-size: spawn content-addressed chunk uploads immediately and pre-create temp files.
+    // For unknown-size: defer upload until stream completes (actual size known); create temp files lazily.
     let s3_uploader_for_task: Option<Arc<S3Uploader>>;
+    let chunk_cache_for_task: Option<Arc<ChunkCache>>;
     if is_unknown_size {
         s3_uploader_for_task = s3_uploader;
+        chunk_cache_for_task = chunk_cache;
     } else {
         if let Some(uploader) = s3_uploader {
-            spawn_s3_upload(
+            chunk_upload::spawn_chunk_uploads(
                 uploader,
                 s3_bucket.to_string(),
-                s3_key.to_string(),
+                cache_key.to_string(),
+                config.data_prefix.clone(),
+                config.map_prefix.clone(),
                 download.clone(),
+                chunk_cache.clone(),
             );
         }
         s3_uploader_for_task = None;
+        chunk_cache_for_task = None;
 
         for idx in 0..download.chunk_count() {
             let chunk_file = create_temp_chunk_file(&config.temp_dir)
@@ -860,12 +893,14 @@ async fn start_sequential_download(
     let dm_ptr = downloads as *const DownloadManager as usize;
     let temp_dir = config.temp_dir.clone();
     let s3b = s3_bucket.to_string();
-    let s3k = s3_key.to_string();
+    let data_prefix = config.data_prefix.clone();
+    let map_prefix = config.map_prefix.clone();
 
     tokio::spawn(async move {
         let downloads = unsafe { &*(dm_ptr as *const DownloadManager) };
         let mut stream = response.bytes_stream();
         let mut global_offset = 0u64;
+        let mut hasher = Sha256::new();
 
         'outer: while let Some(piece) = stream.next().await {
             match piece {
@@ -899,20 +934,20 @@ async fn start_sequential_download(
                             if to_write == 0 {
                                 break;
                             }
-                            if let Err(e) = pwrite_all(
-                                &file,
-                                chunk_offset,
-                                &data[piece_offset..piece_offset + to_write],
-                            ) {
+                            let slice = &data[piece_offset..piece_offset + to_write];
+                            if let Err(e) = pwrite_all(&file, chunk_offset, slice) {
                                 warn!(key = ck, "sequential write error: {e}");
                                 dl.mark_failed();
                                 break 'outer;
                             }
+                            hasher.update(slice);
                             piece_offset += to_write;
                             global_offset += to_write as u64;
                             dl.record_written(chunk_idx, to_write as u64);
 
                             if dl.is_chunk_done(chunk_idx) {
+                                let hash: [u8; 32] = hasher.finalize_reset().into();
+                                dl.chunk(chunk_idx).set_hash(hash);
                                 dl.mark_chunk_done(chunk_idx);
                             }
                         } else {
@@ -928,11 +963,30 @@ async fn start_sequential_download(
             }
         }
 
+        // Finalize hash for any partial last chunk
+        let last_chunk_idx = if global_offset > 0 {
+            ((global_offset - 1) / dl.chunk_size) as usize
+        } else {
+            0
+        };
+        if global_offset > 0 && dl.chunk(last_chunk_idx).get_hash().is_none() {
+            let hash: [u8; 32] = hasher.finalize_reset().into();
+            dl.chunk(last_chunk_idx).set_hash(hash);
+        }
+
         if is_unknown_size {
             dl.mark_stream_complete(global_offset);
             if let Some(uploader) = s3_uploader_for_task {
                 if global_offset > 0 {
-                    spawn_s3_upload(uploader, s3b, s3k, dl.clone());
+                    chunk_upload::spawn_chunk_uploads(
+                        uploader,
+                        s3b,
+                        ck.clone(),
+                        data_prefix,
+                        map_prefix,
+                        dl.clone(),
+                        chunk_cache_for_task,
+                    );
                 }
             }
         } else {

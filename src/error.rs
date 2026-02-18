@@ -19,6 +19,9 @@ pub enum ProxyError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("precondition failed")]
+    PreconditionFailed,
 }
 
 impl IntoResponse for ProxyError {
@@ -52,6 +55,9 @@ impl IntoResponse for ProxyError {
             ProxyError::Internal(msg) => {
                 error!(status = 500, error = %msg, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, None)
+            }
+            ProxyError::PreconditionFailed => {
+                (StatusCode::PRECONDITION_FAILED, None)
             }
         };
         let mut resp = (code, self.to_string()).into_response();

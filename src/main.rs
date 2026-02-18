@@ -6,11 +6,14 @@ use aws_sdk_s3::config::Region;
 use clap::Parser;
 use tracing::info;
 
+mod chunk_cache;
+mod chunk_upload;
 mod config;
 mod download;
 mod error;
 mod handler;
 mod headers;
+mod manifest;
 mod planner;
 mod range;
 mod s3;
@@ -21,6 +24,7 @@ mod upstream_fetcher;
 
 use config::{AppConfig, CliArgs};
 use handler::AppState;
+use manifest::ManifestCache;
 use s3::{AwsUpstream, S3Uploader};
 use trace::TraceWriter;
 
@@ -65,12 +69,36 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(TraceWriter::new(Box::new(file)))
     });
 
+    let manifest_cache = Arc::new(ManifestCache::new(config.manifest_cache_size));
+
+    let chunk_cache_arc = if let Some(ref dir) = config.chunk_cache_dir {
+        let cc = chunk_cache::ChunkCache::new(
+            dir.clone(),
+            config.chunk_cache_max_size,
+            config.chunk_cache_max_object_size,
+        )
+        .expect("initialize chunk cache");
+        let cc = Arc::new(cc);
+        chunk_cache::spawn_evictor(cc.clone(), std::time::Duration::from_secs(45));
+        info!(
+            dir = %dir.display(),
+            max_size = config.chunk_cache_max_size,
+            max_object_size = config.chunk_cache_max_object_size,
+            "local chunk cache enabled"
+        );
+        Some(cc)
+    } else {
+        None
+    };
+
     let state = AppState {
         config: Arc::new(config.clone()),
         s3_upstream,
         s3_uploader,
         downloads: Arc::new(download::DownloadManager::default()),
         trace: trace_writer,
+        manifest_cache,
+        chunk_cache: chunk_cache_arc,
     };
 
     let addr = SocketAddr::from((config.bind_ip, config.port));
