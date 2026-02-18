@@ -103,6 +103,10 @@ pub async fn fetch_upstream(
     let http_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(skip_tls)
         .redirect(redirect_policy)
+        .no_gzip()
+        .no_deflate()
+        .no_brotli()
+        .no_zstd()
         .build()
         .map_err(|e| ProxyError::Internal(format!("build http client: {e}")))?;
 
