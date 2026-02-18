@@ -1,7 +1,7 @@
 # xs3lerator
 
 High-performance Rust HTTP caching proxy with parallel chunked downloads,
-S3-backed storage via multipart upload, and per-chunk temporary file buffering.
+content-addressed S3 storage, and per-chunk temporary file buffering.
 Designed as the data-plane companion to [Passsage](https://github.com/bra-fsn/passsage), handling all
 GET request fetching and S3 content caching.
 
@@ -11,7 +11,8 @@ GET request fetching and S3 content caching.
   IAM instance profiles, ECS/EKS task roles — anything the official AWS SDK
   supports.
 - **HTTP/1.1 and HTTP/2** downstream (cleartext, no TLS).
-- **GET-only proxy** — all other methods return `405 Method Not Allowed`.
+- **GET-only proxy** — all other methods return `405 Method Not Allowed`
+  (except `POST` for manifest alias creation).
 - **Dual-mode operation**: serves from S3 cache on hit, fetches from upstream
   on miss (or when instructed to skip cache).
 - **Parallel multipart downloads** from both S3 and generic HTTP(S) upstreams
@@ -19,8 +20,12 @@ GET request fetching and S3 content caching.
 - **Adaptive parallelism**: starts a full GET to upstream (no HEAD first),
   sniffs the response, and converts to parallel range-GETs when possible.
   Falls back to sequential download for chunked/streaming responses.
-- **Concurrent S3 multipart upload**: uploads to S3 simultaneously with the
-  download — each chunk is streamed to S3 `UploadPart` as it arrives.
+- **Content-addressed S3 storage**: chunks are stored by SHA-256 hash
+  with `If-None-Match: *` deduplication. A manifest file maps each
+  cached object to its ordered list of chunk hashes.
+- **Manifest alias**: `POST /{bucket}/{key}` with
+  `X-Xs3lerator-Link-Manifest: {source_key}` copies a manifest under a
+  new key without re-uploading data — used by Passsage for Vary support.
 - **Stream-while-downloading**: downstream clients receive data as chunks
   arrive — no need to wait for the full object.
 - **In-flight download sharing**: concurrent requests for the same object
@@ -73,7 +78,9 @@ vary indexes) and caching policies; xs3lerator handles data transfer.
 3. If `Content-Length` + `Accept-Ranges: bytes`: converts to parallel download.
 4. If chunked/streaming: continues sequential download.
 5. Streams the requested range to Passsage/client immediately.
-6. Simultaneously uploads the full file to S3 via multipart upload.
+6. Simultaneously uploads chunks to S3 as content-addressed objects
+   (SHA-256 keyed, deduplicated via `If-None-Match: *`), then writes a
+   manifest mapping the object key to its chunk hashes.
 
 **S3 fallback**: if a cache-hit S3 fetch fails (404, 5xx), xs3lerator
 automatically falls back to fetching from the upstream URL.
@@ -118,6 +125,11 @@ OPTION                             ENV VAR                        DEFAULT
 --temp-dir <PATH>                  XS3_TEMP_DIR                   (system tmpdir)
 --upstream-tls-skip-verify         XS3_UPSTREAM_TLS_SKIP_VERIFY   false
 --debug-trace <PATH>               XS3_DEBUG_TRACE                (none)
+--data-prefix <PREFIX>             XS3_DATA_PREFIX                data/
+--map-prefix <PREFIX>              XS3_MAP_PREFIX                 _map/
+--manifest-cache-size <N>          XS3_MANIFEST_CACHE_SIZE        10000
+--chunk-cache-dir <PATH>           XS3_CHUNK_CACHE_DIR            (none)
+--chunk-cache-max-size <SIZE>      XS3_CHUNK_CACHE_MAX_SIZE       100GiB
 ```
 
 Run `xs3lerator --help` to see the generated help with defaults.
@@ -144,6 +156,7 @@ Contract headers (stripped before forwarding upstream):
 | `X-Xs3lerator-Cache-Skip` | `"true"` = skip S3, go upstream + upload to S3. Absent/false = try S3 first. |
 | `X-Xs3lerator-Object-Size` | Known file size (from metadata), for S3 range-GETs without HEAD |
 | `X-Xs3lerator-Tls-Skip-Verify` | `"true"` = skip TLS cert verification for this upstream request |
+| `X-Xs3lerator-Link-Manifest` | (POST only) S3 key of source manifest to copy |
 
 All other client headers pass through inline. xs3lerator strips contract
 headers, `Host`, `Range`, and hop-by-hop headers before forwarding upstream.
@@ -161,8 +174,10 @@ the client.
 
 ### Supported Methods
 
-Only `GET` is accepted. All other methods return `405 Method Not Allowed`
-with `Allow: GET`. Health check: `GET /healthz`.
+- `GET` — proxy fetch (cache hit or miss). Returns `405 Method Not Allowed`
+  with `Allow: GET, POST` for unsupported methods.
+- `POST` — manifest alias creation (see Manifest Alias below).
+- Health check: `GET /healthz`.
 
 ## Download Strategy
 
@@ -222,20 +237,34 @@ consumers finish, the fd is dropped and the kernel instantly reclaims the pages.
 For EBS-constrained environments, set `--temp-dir /dev/shm` for pure-RAM
 buffering.
 
-### Concurrent S3 Multipart Upload
+### Content-Addressed S3 Upload
 
-On cache miss, xs3lerator uploads the full file to S3 simultaneously with
-the download:
+On cache miss, xs3lerator uploads the file to S3 as content-addressed chunks
+simultaneously with the download:
 
-1. `CreateMultipartUpload` when the download starts.
-2. Each chunk is streamed to `UploadPart` as bytes arrive (part number =
-   chunk index + 1).
-3. `CompleteMultipartUpload` when all parts are done.
-4. `AbortMultipartUpload` on any error.
+1. Each chunk is hashed (SHA-256) and uploaded to `{data_prefix}{hash}` using
+   `PutObject` with `If-None-Match: *` — if the chunk already exists, the
+   upload is skipped (S3 returns `412 Precondition Failed`).
+2. Once all chunks are uploaded, a manifest is written to
+   `{map_prefix}{bucket}/{key}` containing the ordered list of chunk hashes.
+3. Duplicate data across different objects is stored only once.
 
-Parts upload out of order. S3 multipart constraints are satisfied: parts
-are >= 5 MiB (except the last), parts do not need to be the same size, and
-the maximum is 10,000 parts.
+### Manifest Alias
+
+`POST /{bucket}/{target_key}` with `X-Xs3lerator-Link-Manifest: {source_key}`
+copies the manifest for `source_key` to `target_key` without re-uploading any
+data. If the source manifest doesn't exist yet (download still in flight),
+xs3lerator waits for it to complete. Returns `204 No Content` on success.
+
+This is used by Passsage for Vary support — when the same upstream object
+is cached under a variant key, only a lightweight manifest copy is needed.
+
+### Local Chunk Cache
+
+When `--chunk-cache-dir` is set, xs3lerator maintains a local filesystem
+LRU cache of chunks. Cache hits skip the S3 GET entirely. The cache is
+bounded by `--chunk-cache-max-size` (default 100 GiB) and evicts
+least-recently-used chunks when full.
 
 ## Testing
 
@@ -248,13 +277,24 @@ cargo test
 Validates: range parsing, chunk planning, header parsing/filtering,
 download state management, temp file creation, byte range calculations.
 
-### Integration tests
+### Mock integration tests
 
 ```bash
 cargo test --test mock_integration
 ```
 
 Tests routing (healthz, 405 for non-GET), error handling.
+
+### Python integration tests
+
+```bash
+pytest tests/pytest/ -v
+```
+
+End-to-end tests against a real xs3lerator binary + LocalStack S3. Covers
+cache miss/hit flows, large file parallel downloads, range requests,
+content-addressed uploads, and manifest alias creation. Requires
+LocalStack running on `localhost:4566`.
 
 ## Troubleshooting
 
