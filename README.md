@@ -1,8 +1,9 @@
 # xs3lerator
 
-High-performance Rust HTTP proxy for Amazon S3 with a POSIX filesystem cache,
-parallel chunked downloads, content-addressed storage, and background LRU
-eviction.
+High-performance Rust HTTP caching proxy with parallel chunked downloads,
+S3-backed storage via multipart upload, and per-chunk temporary file buffering.
+Designed as the data-plane companion to [Passsage](https://github.com/bra-fsn/passsage), handling all
+GET request fetching and S3 content caching.
 
 ## Features
 
@@ -10,22 +11,72 @@ eviction.
   IAM instance profiles, ECS/EKS task roles — anything the official AWS SDK
   supports.
 - **HTTP/1.1 and HTTP/2** downstream (cleartext, no TLS).
-- **GET and HEAD** proxy requests — fully compliant HTTP range-request
-  support (single ranges).
-- **Content-addressed cache** keyed on `x-amz-meta-sha224` (falls back to
-  SHA-224 of the S3 key when the header is absent).
-- **Parallel multipart downloads** from S3 using configurable concurrency and
-  chunk sizes, optimized based on S3 throughput benchmarks.
+- **GET-only proxy** — all other methods return `405 Method Not Allowed`.
+- **Dual-mode operation**: serves from S3 cache on hit, fetches from upstream
+  on miss (or when instructed to skip cache).
+- **Parallel multipart downloads** from both S3 and generic HTTP(S) upstreams
+  using configurable concurrency and chunk sizes.
+- **Adaptive parallelism**: starts a full GET to upstream (no HEAD first),
+  sniffs the response, and converts to parallel range-GETs when possible.
+  Falls back to sequential download for chunked/streaming responses.
+- **Concurrent S3 multipart upload**: uploads to S3 simultaneously with the
+  download — each chunk is streamed to S3 `UploadPart` as it arrives.
 - **Stream-while-downloading**: downstream clients receive data as chunks
   arrive — no need to wait for the full object.
-- **Download deduplication**: concurrent requests for the same object share a
-  single upstream download.
-- **Range-aware prioritization**: the first byte ranges a client needs are
-  fetched first.
-- **Background LRU eviction** based on file mtime — minimal memory overhead,
-  no persistent in-memory index.
-- **Graceful degradation**: if the cache directory becomes unwritable the
-  proxy continues in passthrough mode.
+- **In-flight download sharing**: concurrent requests for the same object
+  join an existing download while chunks are still held. Once a chunk's fd
+  is released (S3 upload done + readers done), subsequent requests re-fetch
+  from S3 (if upload completed) or upstream.
+- **Range-aware prioritization**: the byte ranges a client needs are fetched
+  first, then the rest continues in the background for S3 caching.
+- **Per-chunk temp file buffering**: each download chunk gets its own
+  temporary file (opened and immediately unlinked). Closing the fd instantly
+  reclaims all pages. No persistent cache, no GC, no eviction.
+- **ENOSPC graceful degradation**: if temp storage fills up, xs3lerator
+  degrades to direct passthrough (no extra memory).
+
+## Architecture
+
+xs3lerator sits between Passsage (the caching policy engine) and both S3 and
+upstream HTTP servers. Passsage handles metadata (memcached, `.meta` files,
+vary indexes) and caching policies; xs3lerator handles data transfer.
+
+```
+                                    ┌──────────────────┐
+                                    │    Upstream      │
+                                    │  HTTP(S) Servers │
+                                    └────────▲─────────┘
+                                             │
+┌──────────┐     ┌──────────────┐     ┌──────┴───────┐     ┌──────────┐
+│  Client  │────▶│   Passsage   │────▶│  xs3lerator  │────▶│  AWS S3  │
+│(pip, curl│◀────│ (policy +    │◀────│ (data plane) │◀────│ (cache)  │
+│ docker…) │     │  metadata)   │     └──────────────┘     └──────────┘
+└──────────┘     └──────────────┘            │
+                                             ▼
+                                    ┌─────────────────┐
+                                    │   Temp Files    │
+                                    │ (open + unlink) │
+                                    └─────────────────┘
+```
+
+### Request Flow
+
+**Cache hit** (Passsage signals `X-Xs3lerator-Cache-Skip` absent/false):
+1. xs3lerator fetches the object from S3 using parallel range-GETs.
+2. Streams the requested range to Passsage/client.
+
+**Cache miss** (Passsage signals `X-Xs3lerator-Cache-Skip: true`):
+1. xs3lerator fetches from the real upstream URL (passed in
+   `X-Xs3lerator-Upstream-Url`, base64-encoded).
+2. Starts a full GET (no HEAD first — saving a full round-trip to upstream),
+   sniffs response headers.
+3. If `Content-Length` + `Accept-Ranges: bytes`: converts to parallel download.
+4. If chunked/streaming: continues sequential download.
+5. Streams the requested range to Passsage/client immediately.
+6. Simultaneously uploads the full file to S3 via multipart upload.
+
+**S3 fallback**: if a cache-hit S3 fetch fails (404, 5xx), xs3lerator
+automatically falls back to fetching from the upstream URL.
 
 ## Build
 
@@ -36,10 +87,18 @@ cargo build --release
 ## Run
 
 ```bash
-./target/release/xs3lerator \
-  --bucket my-bucket \
-  --cache-dir /data/xs3-cache \
-  --max-cache-size 500GiB
+./target/release/xs3lerator
+```
+
+xs3lerator is typically deployed alongside Passsage, which routes GET requests
+to it. It can also be used standalone:
+
+```bash
+# -w0 is required: base64 wraps at 76 chars by default, which injects a
+# newline into the header value and causes a 400 Bad Request from hyper.
+curl -H "X-Xs3lerator-Upstream-Url: $(echo -n 'https://example.com/file.iso' | base64 -w0)" \
+     -H "X-Xs3lerator-Cache-Skip: true" \
+     http://localhost:8080/my-bucket/https/example.com/a/b/c/d/hash.iso
 ```
 
 ## CLI Reference
@@ -50,98 +109,85 @@ Every option is also settable via an environment variable.
 OPTION                             ENV VAR                        DEFAULT
 --bind-ip <IP>                     XS3_BIND_IP                    0.0.0.0
 --port <PORT>                      XS3_PORT                       8080
---bucket <BUCKET>                  XS3_BUCKET                     (required)
 --region <REGION>                  XS3_REGION                     (SDK default)
 --s3-endpoint-url <URL>            XS3_S3_ENDPOINT_URL            (none)
 --s3-force-path-style              XS3_S3_FORCE_PATH_STYLE        false
---cache-dir <PATH>                 XS3_CACHE_DIR                  (required)
---max-cache-size <SIZE>            XS3_MAX_CACHE_SIZE             (required)
---cache-hierarchy-level <N>        XS3_CACHE_HIERARCHY_LEVEL      4
---max-concurrency <N>              XS3_MAX_CONCURRENCY            32
---min-chunk-size <SIZE>            XS3_MIN_CHUNK_SIZE             1MiB
---max-chunk-size <SIZE>            XS3_MAX_CHUNK_SIZE             256MiB
---gc-interval-seconds <SECONDS>    XS3_GC_INTERVAL_SECONDS        15
---gc-watermark-percent <PERCENT>   XS3_GC_WATERMARK_PERCENT       95
---gc-target-percent <PERCENT>      XS3_GC_TARGET_PERCENT          90
+--s3-concurrency <N>               XS3_S3_CONCURRENCY             32
+--http-concurrency <N>             XS3_HTTP_CONCURRENCY           8
+--min-chunk-size <SIZE>            XS3_MIN_CHUNK_SIZE             8MiB
+--temp-dir <PATH>                  XS3_TEMP_DIR                   (system tmpdir)
+--upstream-tls-skip-verify         XS3_UPSTREAM_TLS_SKIP_VERIFY   false
+--debug-trace <PATH>               XS3_DEBUG_TRACE                (none)
 ```
 
 Run `xs3lerator --help` to see the generated help with defaults.
 
-## Request Behavior
+## API Contract
 
-### `HEAD /<key>`
+### URL Scheme
 
-1. Executes `HeadObject` on S3.
-2. Returns the object metadata with `Server: xs3lerator/0.1.0` and
-   `Accept-Ranges: bytes`.
+xs3lerator receives: `GET /<s3_bucket>/<s3_key>`
 
-### `GET /<key>`
+The first path segment is the S3 bucket, the rest is the S3 key. Example:
 
-1. Executes `HeadObject` to obtain metadata and the `x-amz-meta-sha224`
-   content hash.
-2. Computes the cache key (SHA-224 from metadata, or SHA-224 of the key
-   path if the header is absent).
-3. Checks the local cache:
-   - **Hit** — verifies that the on-disk file size matches `Content-Length`.
-     On match, streams the file directly and updates mtime for LRU. On
-     mismatch, logs a warning, deletes the stale entry, and proceeds as a
-     miss.
-   - **Miss** — starts (or joins an existing) parallel download.
-4. The download pre-allocates a temp file, fetches chunks via concurrent
-   range-GET requests, writes them with `pwrite`, and streams completed
-   chunks to waiting clients as they arrive.
-5. On completion, the temp file is fsync'd and atomically renamed to the
-   final cache path, ensuring no corrupt data is served after a power
-   failure.
-
-If the cache directory is not writable, the proxy falls back to direct S3
-streaming without caching.
-
-### Range Requests
-
-Single-range `bytes=START-END`, `bytes=START-`, and `bytes=-SUFFIX` are
-fully supported. The proxy responds with `206 Partial Content` and
-`Content-Range`.  Multi-range requests are rejected with `416`.
-
-## Cache Layout
-
-For `x-amz-meta-sha224=e8b0356886eb5804f25ad799b3db28ca32ae0205a47639d6e7a0afea`
-and hierarchy level 4:
-
-```text
-<cache-dir>/e/8/b/0/e8b0356886eb5804f25ad799b3db28ca32ae0205a47639d6e7a0afea
+```
+GET /proxy-cache/https/ftp.bme.hu/f/f/3/0/ff30f95e79ebe67232635722c7c31666ebac8d7f8fb6c5075b13c9e3.iso
 ```
 
-All hierarchy directories (16^level leaf dirs) are pre-created on startup.
+### Request Headers (passsage -> xs3lerator)
 
-## Why a Parallelized Proxy?
+Contract headers (stripped before forwarding upstream):
 
-As of early 2026, a single HTTP stream to S3 inside the same region and
-availability zone tops out at roughly **60 MiB/s** for the Standard storage
-class and around **150 MiB/s** for the Express One Zone storage class
-(directory buckets). These are hard per-connection limits imposed by S3's
-internal architecture — they cannot be raised by tuning client buffers,
-TCP windows, or instance types.
+| Header | Description |
+|--------|-------------|
+| `X-Xs3lerator-Upstream-Url` | Base64-encoded real upstream URL |
+| `X-Xs3lerator-Cache-Skip` | `"true"` = skip S3, go upstream + upload to S3. Absent/false = try S3 first. |
+| `X-Xs3lerator-Object-Size` | Known file size (from metadata), for S3 range-GETs without HEAD |
+| `X-Xs3lerator-Tls-Skip-Verify` | `"true"` = skip TLS cert verification for this upstream request |
 
-Any workload that needs to pull multi-gigabyte objects faster than a single
-stream allows — ML model checkpoints, large datasets, container images,
-build artifacts — must open **multiple parallel byte-range requests** and
-reassemble the pieces. xs3lerator does this transparently: a single HTTP GET
-from a client fans out into many concurrent range-GETs to S3, and completed
-chunks are streamed back to the client as they arrive. With 32 streams the
-proxy routinely sustains **~3 GiB/s** from S3 Standard; see the benchmarks
-below.
+All other client headers pass through inline. xs3lerator strips contract
+headers, `Host`, `Range`, and hop-by-hop headers before forwarding upstream.
+
+### Response Headers (xs3lerator -> passsage)
+
+| Header | Description |
+|--------|-------------|
+| `X-Xs3lerator-Cache-Hit` | `"true"` if served from S3, `"false"` if fetched from upstream |
+| `X-Xs3lerator-Full-Size` | Full object size in bytes (always present, even on range responses) |
+| `X-Xs3lerator-Degraded` | Present with value `"enospc"` when temp storage is exhausted |
+
+Passsage strips all `X-Xs3lerator-*` response headers before forwarding to
+the client.
+
+### Supported Methods
+
+Only `GET` is accepted. All other methods return `405 Method Not Allowed`
+with `Allow: GET`. Health check: `GET /healthz`.
 
 ## Download Strategy
 
-The chunk planner adapts concurrency and chunk size to the object:
+### Dual-Ramp Chunk Sizing
 
-- Prefers an **8 MiB baseline** chunk size, aligned with S3's inferred
-  internal erasure-coding stripe boundary (~8–32 MiB based on throughput
-  benchmarks).
-- Scales concurrency proportionally to file size — a 1 MiB file uses a
-  single stream; a 10 GiB file uses up to `--max-concurrency` streams.
-- Respects `--min-chunk-size` and `--max-chunk-size`.
+Both concurrency and chunk size scale together. For small files, fewer
+connections are used; for large files, exactly `max_concurrency` connections
+each download 1/Nth:
+
+```
+chunk_size = max(min_chunk, ceil(file_size / max_concurrency))
+chunk_size = min(chunk_size, 5 GiB)  // S3 multipart part ceiling
+```
+
+| File size | Chunk size | Chunks | Connections |
+|-----------|-----------|--------|-------------|
+| 5 MB      | 8 MB      | 1      | 1           |
+| 16 MB     | 8 MB      | 2      | 2           |
+| 64 MB     | 8 MB      | 8      | 8           |
+| 128 MB    | 16 MB     | 8      | 8           |
+| 1 GB      | 128 MB    | 8      | 8           |
+| 10 GB     | 1.25 GB   | 8      | 8           |
+
+The same planner is used for both S3 and HTTP upstream downloads — only
+the `max_concurrency` differs (32 for S3, 8 for HTTP upstream).
 
 ### S3 Throughput Benchmarks (us-west-2)
 
@@ -154,52 +200,61 @@ Concurrency  Best chunk   Throughput
   128         4 MiB        ~5.7 GiB/s
 ```
 
-Throughput scales linearly up to ~64 connections, then plateaus. Small
-chunks (4–8 MiB) consistently outperform large ones at high concurrency.
+### Adaptive Upstream Parallelism
 
-## LRU Eviction
+For non-S3 HTTP(S) upstreams (cache miss):
 
-A background task runs every `--gc-interval-seconds`:
+1. Start a full GET (no HEAD first, to minimize round-trips).
+2. If `Content-Length` + `Accept-Ranges: bytes`: stop the initial connection
+   at the first chunk boundary, open `concurrency - 1` new range connections.
+3. If `Transfer-Encoding: chunked`: sequential download, stream into per-chunk
+   temp files.
+4. If range requests fail (416, unexpected response): fall back to completing
+   the full sequential download.
 
-1. Scans the entire cache directory tree.
-2. Computes total usage.
-3. If usage ≥ `watermark%` of `--max-cache-size`, evicts oldest files (by
-   mtime) until usage ≤ `target%`.
+### On-Disk Buffering
 
-The evictor keeps no persistent in-memory index — file count and total size
-do not affect the server's baseline memory usage.
+Per-chunk temp files are opened in `--temp-dir` and immediately unlinked.
+Data stays in the OS page cache. Both the client reader and S3 upload worker
+stream concurrently from the same file via progress tracking. When both
+consumers finish, the fd is dropped and the kernel instantly reclaims the pages.
+
+For EBS-constrained environments, set `--temp-dir /dev/shm` for pure-RAM
+buffering.
+
+### Concurrent S3 Multipart Upload
+
+On cache miss, xs3lerator uploads the full file to S3 simultaneously with
+the download:
+
+1. `CreateMultipartUpload` when the download starts.
+2. Each chunk is streamed to `UploadPart` as bytes arrive (part number =
+   chunk index + 1).
+3. `CompleteMultipartUpload` when all parts are done.
+4. `AbortMultipartUpload` on any error.
+
+Parts upload out of order. S3 multipart constraints are satisfied: parts
+are >= 5 MiB (except the last), parts do not need to be the same size, and
+the maximum is 10,000 parts.
 
 ## Testing
 
-### Rust unit tests
+### Unit tests
 
 ```bash
 cargo test
 ```
 
-Validates: range parsing, chunk planning, cache path computation, download
-state management, SHA-224 fallback.
+Validates: range parsing, chunk planning, header parsing/filtering,
+download state management, temp file creation, byte range calculations.
 
-### Rust integration test (mock upstream)
+### Integration tests
 
 ```bash
 cargo test --test mock_integration
 ```
 
-End-to-end test through the full proxy stack with a mock S3 backend:
-full GET, range GET, HEAD, cache hit, concurrent requests.
-
-### Python integration test (moto)
-
-```bash
-pip install -r tests/pytest/requirements.txt
-cargo build
-pytest tests/pytest/ -v
-```
-
-Requires `moto[server]` and `boto3`. Starts a real moto S3 endpoint and
-the proxy binary, then tests HEAD, GET, range requests, concurrent access,
-cache hits, and the SHA-224 fallback path.
+Tests routing (healthz, 405 for non-GET), error handling.
 
 ## Troubleshooting
 
@@ -208,21 +263,6 @@ If you see `502 upstream error: dispatch failure`:
 - Set `--region` explicitly for the bucket.
 - Verify credentials: `aws sts get-caller-identity`.
 - For LocalStack: use `--s3-endpoint-url` and `--s3-force-path-style`.
-
-## Architecture
-
-```
-┌─────────────────┐     ┌────────────────────┐     ┌─────────────┐
-│   HTTP Client   │────▶│     xs3lerator     │────▶│   AWS S3    │
-│   (downstream)  │◀────│  (proxy + cache)   │◀────│  (upstream) │
-└─────────────────┘     └────────────────────┘     └─────────────┘
-                                  │
-                                  ▼
-                         ┌───────────────┐
-                         │  POSIX Cache  │
-                         │  (hierarchy)  │
-                         └───────────────┘
-```
 
 ## License
 
