@@ -140,13 +140,15 @@ def proxy_binary():
     """
     if PROXY_URL:
         pytest.skip("PROXY_URL set — using external proxy")
-    subprocess.run(
-        ["cargo", "build", "--quiet"],
-        cwd=PROJECT_ROOT,
-        check=True,
-        timeout=300,
-    )
-    return PROJECT_ROOT / "target" / "debug" / "xs3lerator"
+    binary = PROJECT_ROOT / "target" / "debug" / "xs3lerator"
+    if not binary.exists():
+        subprocess.run(
+            ["cargo", "build", "--quiet"],
+            cwd=PROJECT_ROOT,
+            check=True,
+            timeout=300,
+        )
+    return binary
 
 
 @pytest.fixture(scope="session")

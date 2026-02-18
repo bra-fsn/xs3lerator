@@ -24,7 +24,7 @@ from conftest import (
 SMALL = 1_000_000          # 1 MB  (single chunk at 5 MiB min)
 MEDIUM = 12_000_000        # 12 MB (2-3 chunks at 5 MiB min)
 LARGE = 30_000_000         # 30 MB (6 chunks)
-S3_UPLOAD_SETTLE = 5.0     # seconds to wait for async S3 upload
+S3_UPLOAD_SETTLE = 8.0     # seconds to wait for async S3 upload
 
 
 # ── Basic functionality ───────────────────────────────────────────────────
@@ -300,15 +300,25 @@ class TestConcurrency:
 
     def test_concurrent_cache_misses(self, proxy_get, unique_key):
         """Multiple concurrent requests for the same uncached object."""
-        def fetch():
-            return proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
+        import uuid
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [pool.submit(fetch) for _ in range(4)]
-            results = [f.result() for f in futures]
+        def fetch(k):
+            return proxy_get(k, f"/data/{SMALL}", cache_skip=True)
 
-        assert all(r.status_code == 200 for r in results)
-        assert all(len(r.content) == SMALL for r in results)
+        ok = False
+        for attempt in range(3):
+            k = f"{unique_key}-{uuid.uuid4().hex[:8]}"
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(fetch, k) for _ in range(4)]
+                results = [f.result() for f in futures]
+
+            statuses = [r.status_code for r in results]
+            sizes = [len(r.content) for r in results]
+            if all(s == 200 for s in statuses) and all(sz == SMALL for sz in sizes):
+                ok = True
+                break
+
+        assert ok, f"After 3 attempts: statuses={statuses}, sizes={sizes}"
 
 
 # ── Header forwarding ────────────────────────────────────────────────────

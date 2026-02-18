@@ -21,7 +21,6 @@ use crate::headers::{
     self, parse_bucket_key, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
 };
 use crate::manifest::{Manifest, ManifestCache};
-use crate::planner::compute_chunk_plan;
 use crate::range::{parse_range_header, ByteRange};
 use crate::s3::{AwsUpstream, S3Uploader};
 use crate::trace::{trace_log, TraceWriter};
@@ -225,16 +224,17 @@ async fn handle_s3_path(
     };
 
     let chunk_range = manifest.chunks_for_range(serve_start, serve_end);
-    let _num_download_chunks = chunk_range.len();
-    let download_size = serve_end - serve_start + 1;
 
-    let plan = compute_chunk_plan(
-        download_size,
-        state.config.s3_concurrency,
-        manifest.chunk_size,
-    );
+    let first_chunk_start = chunk_range.start as u64 * manifest.chunk_size;
+    let last_chunk_end = if chunk_range.end >= manifest.num_chunks() {
+        manifest.total_size
+    } else {
+        chunk_range.end as u64 * manifest.chunk_size
+    };
+    let chunk_data_size = last_chunk_end - first_chunk_start;
+    let offset_in_chunks = serve_start - first_chunk_start;
 
-    let download = Arc::new(InFlightDownload::new(download_size, plan.chunk_size));
+    let download = Arc::new(InFlightDownload::new(chunk_data_size, manifest.chunk_size));
     let ck = format!("{cache_key}:{serve_start}-{serve_end}");
 
     let (download, is_new) = state.downloads.get_or_create(&ck, || download);
@@ -296,7 +296,7 @@ async fn handle_s3_path(
         client_byte_range,
         resp_headers,
         true,
-        0,
+        offset_in_chunks,
     )
 }
 
