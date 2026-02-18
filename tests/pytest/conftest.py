@@ -183,20 +183,21 @@ def proxy(
         "XS3_MIN_CHUNK_SIZE": "5MiB",
         "XS3_TEMP_DIR": str(temp_dir),
     })
+    log_file = temp_dir / "xs3lerator.log"
+    log_fh = open(log_file, "w")
     proc = subprocess.Popen(
         [str(proxy_binary)],
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
     )
     base_url = f"http://127.0.0.1:{port}"
     try:
         _wait_for_url(f"{base_url}/healthz", timeout=20)
     except RuntimeError:
         proc.terminate()
-        stderr = ""
-        if proc.stderr:
-            stderr = proc.stderr.read().decode(errors="replace")[:4000]
+        log_fh.close()
+        stderr = log_file.read_text(errors="replace")[-4000:]
         pytest.fail(f"xs3lerator failed to start:\n{stderr}")
 
     yield base_url
@@ -205,6 +206,7 @@ def proxy(
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
+    log_fh.close()
 
 
 # ---------------------------------------------------------------------------

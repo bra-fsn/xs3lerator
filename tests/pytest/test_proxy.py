@@ -24,7 +24,21 @@ from conftest import (
 SMALL = 1_000_000          # 1 MB  (single chunk at 5 MiB min)
 MEDIUM = 12_000_000        # 12 MB (2-3 chunks at 5 MiB min)
 LARGE = 30_000_000         # 30 MB (6 chunks)
-S3_UPLOAD_SETTLE = 8.0     # seconds to wait for async S3 upload
+
+
+def wait_for_manifest(s3_client, bucket, key, timeout=30.0, interval=1.0):
+    """Poll S3 until the manifest appears or timeout is reached."""
+    from botocore.exceptions import ClientError
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            obj = s3_client.get_object(Bucket=bucket, Key=key)
+            return obj["Body"].read()
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "NoSuchKey":
+                raise
+        time.sleep(interval)
+    pytest.fail(f"manifest {key!r} not found after {timeout}s")
 
 
 # ── Basic functionality ───────────────────────────────────────────────────
@@ -79,11 +93,9 @@ class TestCacheMiss:
     def test_cache_miss_uploads_to_s3(self, proxy_get, unique_key, s3_client, test_bucket):
         r = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r.status_code == 200
-        time.sleep(S3_UPLOAD_SETTLE)
 
         manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
-        obj = s3_client.get_object(Bucket=test_bucket, Key=manifest_key)
-        manifest_data = obj["Body"].read()
+        manifest_data = wait_for_manifest(s3_client, test_bucket, manifest_key)
         assert manifest_data[:4] == b"XS3M", "Manifest should start with XS3M magic"
 
         paginator = s3_client.get_paginator("list_objects_v2")
@@ -236,22 +248,20 @@ class TestLargeFile:
     def test_large_file_uploads_to_s3(self, proxy_get, unique_key, s3_client, test_bucket):
         r = proxy_get(unique_key, f"/data/{LARGE}", cache_skip=True, timeout=60)
         assert r.status_code == 200
-        time.sleep(S3_UPLOAD_SETTLE * 2)
 
         manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
-        obj = s3_client.get_object(Bucket=test_bucket, Key=manifest_key)
-        manifest_data = obj["Body"].read()
+        manifest_data = wait_for_manifest(s3_client, test_bucket, manifest_key, timeout=60)
         assert manifest_data[:4] == b"XS3M"
 
     def test_large_file_cache_hit_after_upload(
-        self, proxy_get, s3_client, test_bucket
+        self, proxy_get, unique_key, s3_client, test_bucket
     ):
-        key = "test/large-cache-hit"
         payload = generate_payload(LARGE)
-        r1 = proxy_get(key, f"/data/{LARGE}", cache_skip=True, timeout=60)
+        r1 = proxy_get(unique_key, f"/data/{LARGE}", cache_skip=True, timeout=60)
         assert r1.status_code == 200
-        time.sleep(S3_UPLOAD_SETTLE * 2)
-        r2 = proxy_get(key, "/data/1", object_size=LARGE, timeout=60)
+        manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
+        wait_for_manifest(s3_client, test_bucket, manifest_key, timeout=60)
+        r2 = proxy_get(unique_key, "/data/1", object_size=LARGE, timeout=60)
         assert r2.status_code == 200
         assert r2.headers["x-xs3lerator-cache-hit"] == "true"
         assert len(r2.content) == LARGE
@@ -376,7 +386,8 @@ class TestManifestAlias:
         payload = generate_payload(SMALL)
         r = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r.status_code == 200
-        time.sleep(S3_UPLOAD_SETTLE)
+        source_manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
+        wait_for_manifest(s3_client, test_bucket, source_manifest_key)
 
         alias_key = f"{unique_key}-alias"
         resp = requests.post(
@@ -387,8 +398,8 @@ class TestManifestAlias:
         assert resp.status_code == 204
 
         alias_manifest_key = f"{MAP_PREFIX}{test_bucket}/{alias_key}"
-        obj = s3_client.get_object(Bucket=test_bucket, Key=alias_manifest_key)
-        assert obj["Body"].read()[:4] == b"XS3M"
+        alias_data = wait_for_manifest(s3_client, test_bucket, alias_manifest_key)
+        assert alias_data[:4] == b"XS3M"
 
     def test_manifest_alias_serves_same_content(
         self, proxy, proxy_get, unique_key, s3_client, test_bucket
@@ -397,7 +408,8 @@ class TestManifestAlias:
         payload = generate_payload(SMALL)
         r1 = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r1.status_code == 200
-        time.sleep(S3_UPLOAD_SETTLE)
+        source_manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
+        wait_for_manifest(s3_client, test_bucket, source_manifest_key)
 
         alias_key = f"{unique_key}-alias2"
         resp = requests.post(
