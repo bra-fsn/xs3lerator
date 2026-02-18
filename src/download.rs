@@ -118,10 +118,6 @@ impl ChunkSlot {
         *self.hash.lock()
     }
 
-    pub fn set_cache_path(&self, path: PathBuf) {
-        *self.cache_path.lock() = Some(path);
-    }
-
     pub fn get_cache_path(&self) -> Option<PathBuf> {
         self.cache_path.lock().clone()
     }
@@ -374,35 +370,6 @@ impl InFlightDownload {
             }
             self.notify.notified().await;
         }
-    }
-
-    /// Collect all chunk hashes into a Manifest struct.
-    /// Returns `None` if any chunk is missing its hash.
-    pub fn collect_manifest(&self) -> Option<crate::manifest::Manifest> {
-        let num = if self.is_stream_complete() {
-            let total = self.actual_total_bytes();
-            if total == 0 {
-                return None;
-            }
-            ((total + self.chunk_size - 1) / self.chunk_size) as usize
-        } else {
-            self.chunk_count()
-        };
-
-        let mut hashes = Vec::with_capacity(num);
-        for idx in 0..num {
-            hashes.push(self.chunks[idx].get_hash()?);
-        }
-
-        Some(crate::manifest::Manifest {
-            chunk_size: self.chunk_size,
-            total_size: if self.is_stream_complete() {
-                self.actual_total_bytes()
-            } else {
-                self.object_size
-            },
-            hashes,
-        })
     }
 }
 

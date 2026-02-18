@@ -14,9 +14,6 @@ pub enum ProxyError {
     #[error("upstream error: {0}")]
     Upstream(String),
 
-    #[error("upstream returned {status}")]
-    UpstreamStatus { status: u16, message: String },
-
     #[error("internal error: {0}")]
     Internal(String),
 
@@ -44,13 +41,6 @@ impl IntoResponse for ProxyError {
             ProxyError::Upstream(msg) => {
                 error!(status = 502, error = %msg, "upstream error");
                 (StatusCode::BAD_GATEWAY, None)
-            }
-            ProxyError::UpstreamStatus { status, message } => {
-                warn!(status, error = %message, "upstream status error");
-                (
-                    StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    None,
-                )
             }
             ProxyError::Internal(msg) => {
                 error!(status = 500, error = %msg, "internal error");

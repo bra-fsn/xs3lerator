@@ -26,19 +26,6 @@ impl Manifest {
         self.hashes.len()
     }
 
-    /// Byte range `[start, end]` (inclusive) of chunk `idx` within the original object.
-    pub fn chunk_byte_range(&self, idx: usize) -> (u64, u64) {
-        let start = idx as u64 * self.chunk_size;
-        let end = std::cmp::min(start + self.chunk_size, self.total_size) - 1;
-        (start, end)
-    }
-
-    /// Length of chunk `idx` in bytes.
-    pub fn chunk_len(&self, idx: usize) -> u64 {
-        let (start, end) = self.chunk_byte_range(idx);
-        end - start + 1
-    }
-
     /// Compute the range of chunk indexes that overlap `[byte_start, byte_end]` (inclusive).
     pub fn chunks_for_range(&self, byte_start: u64, byte_end: u64) -> Range<usize> {
         let first = (byte_start / self.chunk_size) as usize;
@@ -47,11 +34,6 @@ impl Manifest {
             self.num_chunks().saturating_sub(1),
         );
         first..last + 1
-    }
-
-    /// S3 key for chunk `idx` under the given data prefix with 4-level prefix hashing.
-    pub fn chunk_s3_key(&self, idx: usize, data_prefix: &str) -> String {
-        hash_to_s3_key(&self.hashes[idx], data_prefix)
     }
 
     /// Serialize to compact binary format.
@@ -227,22 +209,6 @@ mod tests {
         // bytes 8M..17M spans chunks 1 and 2
         let r = m.chunks_for_range(8_388_608, 17_000_000);
         assert_eq!(r, 1..3);
-    }
-
-    #[test]
-    fn chunk_s3_key_format() {
-        let m = sample_manifest();
-        let key = m.chunk_s3_key(0, "data/");
-        assert!(key.starts_with("data/a/b/a/b/"));
-        assert!(key.contains("abababab"));
-    }
-
-    #[test]
-    fn chunk_byte_range_last() {
-        let m = sample_manifest();
-        let (s, e) = m.chunk_byte_range(2);
-        assert_eq!(s, 2 * 8_388_608);
-        assert_eq!(e, 19_999_999);
     }
 
     #[test]

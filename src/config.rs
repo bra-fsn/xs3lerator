@@ -98,15 +98,6 @@ pub struct CliArgs {
         value_parser = parse_byte_size
     )]
     pub chunk_cache_max_size: u64,
-
-    /// Objects larger than this skip local chunk caching.
-    #[arg(
-        long,
-        env = "XS3_CHUNK_CACHE_MAX_OBJECT_SIZE",
-        default_value = "64MiB",
-        value_parser = parse_byte_size
-    )]
-    pub chunk_cache_max_object_size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +117,6 @@ pub struct AppConfig {
     pub manifest_cache_size: usize,
     pub chunk_cache_dir: Option<PathBuf>,
     pub chunk_cache_max_size: u64,
-    pub chunk_cache_max_object_size: u64,
 }
 
 impl TryFrom<CliArgs> for AppConfig {
@@ -171,7 +161,6 @@ impl TryFrom<CliArgs> for AppConfig {
             manifest_cache_size: args.manifest_cache_size,
             chunk_cache_dir: args.chunk_cache_dir,
             chunk_cache_max_size: args.chunk_cache_max_size,
-            chunk_cache_max_object_size: args.chunk_cache_max_object_size,
         })
     }
 }

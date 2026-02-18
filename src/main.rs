@@ -17,7 +17,6 @@ mod manifest;
 mod planner;
 mod range;
 mod s3;
-mod s3_upload;
 mod server;
 mod trace;
 mod upstream_fetcher;
@@ -75,7 +74,6 @@ async fn main() -> anyhow::Result<()> {
         let cc = chunk_cache::ChunkCache::new(
             dir.clone(),
             config.chunk_cache_max_size,
-            config.chunk_cache_max_object_size,
         )
         .expect("initialize chunk cache");
         let cc = Arc::new(cc);
@@ -83,7 +81,6 @@ async fn main() -> anyhow::Result<()> {
         info!(
             dir = %dir.display(),
             max_size = config.chunk_cache_max_size,
-            max_object_size = config.chunk_cache_max_object_size,
             "local chunk cache enabled"
         );
         Some(cc)

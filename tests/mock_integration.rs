@@ -29,7 +29,6 @@ fn test_config() -> AppConfig {
         manifest_cache_size: 100,
         chunk_cache_dir: None,
         chunk_cache_max_size: 100 * 1024 * 1024 * 1024,
-        chunk_cache_max_object_size: 64 * 1024 * 1024,
     }
 }
 

@@ -9,7 +9,6 @@ pub mod manifest;
 pub mod planner;
 pub mod range;
 pub mod s3;
-pub mod s3_upload;
 pub mod server;
 pub mod trace;
 pub mod upstream_fetcher;
