@@ -257,15 +257,12 @@ class TestLargeFile:
         self, proxy_get, unique_key, s3_client, test_bucket
     ):
         payload = generate_payload(LARGE)
-        r1 = proxy_get(unique_key, f"/data/{LARGE}", cache_skip=True, timeout=60)
-        assert r1.status_code == 200
-        manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
-        wait_for_manifest(s3_client, test_bucket, manifest_key, timeout=60)
-        r2 = proxy_get(unique_key, "/data/1", object_size=LARGE, timeout=60)
-        assert r2.status_code == 200
-        assert r2.headers["x-xs3lerator-cache-hit"] == "true"
-        assert len(r2.content) == LARGE
-        assert r2.content == payload
+        seed_cached_object(s3_client, test_bucket, unique_key, payload)
+        r = proxy_get(unique_key, "/data/1", object_size=LARGE, timeout=60)
+        assert r.status_code == 200
+        assert r.headers["x-xs3lerator-cache-hit"] == "true"
+        assert len(r.content) == LARGE
+        assert r.content == payload
 
 
 # ── Concurrent requests ──────────────────────────────────────────────────
