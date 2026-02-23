@@ -84,49 +84,6 @@ impl S3Uploader {
             }
         }
     }
-
-    /// Simple PutObject without conditions (for manifests).
-    pub async fn put_object(
-        &self,
-        bucket: &str,
-        key: &str,
-        body: ByteStream,
-    ) -> Result<(), ProxyError> {
-        self.client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| ProxyError::Internal(format!("put_object {key}: {}", format_sdk_error(&e))))?;
-        Ok(())
-    }
-
-    /// Get object contents as bytes.
-    pub async fn get_object_bytes(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Vec<u8>, ProxyError> {
-        let output = self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(map_get_err)?;
-
-        let data = output
-            .body
-            .collect()
-            .await
-            .map_err(|e| ProxyError::Internal(format!("read object body: {e}")))?
-            .into_bytes()
-            .to_vec();
-        Ok(data)
-    }
 }
 
 // ---------------------------------------------------------------------------
