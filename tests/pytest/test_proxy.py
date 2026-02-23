@@ -1,6 +1,6 @@
 """End-to-end integration tests for xs3lerator.
 
-Requires LocalStack (S3) and the xs3lerator binary.
+Requires LocalStack (S3), Elasticsearch, and the xs3lerator binary.
 Fixtures are defined in conftest.py.
 """
 
@@ -13,7 +13,9 @@ import requests
 from test_server import generate_payload
 from conftest import (
     DATA_PREFIX,
-    MAP_PREFIX,
+    ELASTICSEARCH_URL,
+    ES_MANIFEST_INDEX,
+    es_get_manifest_b64,
     seed_cached_object,
 )
 
@@ -26,19 +28,17 @@ MEDIUM = 12_000_000        # 12 MB (2-3 chunks at 5 MiB min)
 LARGE = 30_000_000         # 30 MB (6 chunks)
 
 
-def wait_for_manifest(s3_client, bucket, key, timeout=30.0, interval=1.0):
-    """Poll S3 until the manifest appears or timeout is reached."""
-    from botocore.exceptions import ClientError
+def wait_for_manifest_es(
+    es_url: str, index: str, doc_id: str, timeout: float = 30.0, interval: float = 1.0,
+) -> str:
+    """Poll Elasticsearch until the manifest doc appears or timeout is reached."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            obj = s3_client.get_object(Bucket=bucket, Key=key)
-            return obj["Body"].read()
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "NoSuchKey":
-                raise
+        b64 = es_get_manifest_b64(es_url, index, doc_id)
+        if b64 is not None:
+            return b64
         time.sleep(interval)
-    pytest.fail(f"manifest {key!r} not found after {timeout}s")
+    pytest.fail(f"manifest doc {doc_id!r} not found in ES after {timeout}s")
 
 
 # ── Basic functionality ───────────────────────────────────────────────────
@@ -90,12 +90,18 @@ class TestCacheMiss:
         r = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r.headers.get("etag") == f'"test-{SMALL}"'
 
-    def test_cache_miss_uploads_to_s3(self, proxy_get, unique_key, s3_client, test_bucket):
+    def test_cache_miss_uploads_to_s3_and_es(
+        self, proxy_get, unique_key, s3_client, test_bucket, elasticsearch_url,
+    ):
         r = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r.status_code == 200
 
-        manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
-        manifest_data = wait_for_manifest(s3_client, test_bucket, manifest_key)
+        cache_key = f"{test_bucket}/{unique_key}"
+        manifest_b64 = wait_for_manifest_es(
+            elasticsearch_url, ES_MANIFEST_INDEX, cache_key,
+        )
+        import base64
+        manifest_data = base64.b64decode(manifest_b64)
         assert manifest_data[:4] == b"XS3M", "Manifest should start with XS3M magic"
 
         paginator = s3_client.get_paginator("list_objects_v2")
@@ -111,10 +117,13 @@ class TestCacheMiss:
 
 class TestCacheHit:
     @pytest.fixture
-    def cached_key(self, unique_key, s3_client, test_bucket):
-        """Pre-populate S3 with a properly formatted manifest + chunks."""
+    def cached_key(self, unique_key, s3_client, test_bucket, elasticsearch_url):
+        """Pre-populate S3 chunks + ES manifest for cache hit tests."""
         payload = generate_payload(SMALL)
-        seed_cached_object(s3_client, test_bucket, unique_key, payload)
+        seed_cached_object(
+            s3_client, test_bucket, unique_key, payload,
+            es_url=elasticsearch_url, es_index=ES_MANIFEST_INDEX,
+        )
         return unique_key, payload
 
     def test_cache_hit_serves_from_s3(self, proxy_get, cached_key):
@@ -153,10 +162,13 @@ class TestS3Fallback:
 
 class TestRangeRequests:
     @pytest.fixture(scope="class")
-    def cached_object(self, s3_client, test_bucket):
+    def cached_object(self, s3_client, test_bucket, elasticsearch_url):
         key = f"test/range-{SMALL}"
         payload = generate_payload(SMALL)
-        seed_cached_object(s3_client, test_bucket, key, payload)
+        seed_cached_object(
+            s3_client, test_bucket, key, payload,
+            es_url=elasticsearch_url, es_index=ES_MANIFEST_INDEX,
+        )
         return key, payload
 
     def test_range_explicit(self, proxy_get, cached_object):
@@ -245,19 +257,28 @@ class TestLargeFile:
         assert len(r.content) == LARGE
         assert r.content == generate_payload(LARGE)
 
-    def test_large_file_uploads_to_s3(self, proxy_get, unique_key, s3_client, test_bucket):
+    def test_large_file_uploads_to_es(
+        self, proxy_get, unique_key, test_bucket, elasticsearch_url,
+    ):
         r = proxy_get(unique_key, f"/data/{LARGE}", cache_skip=True, timeout=60)
         assert r.status_code == 200
 
-        manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
-        manifest_data = wait_for_manifest(s3_client, test_bucket, manifest_key, timeout=60)
+        cache_key = f"{test_bucket}/{unique_key}"
+        manifest_b64 = wait_for_manifest_es(
+            elasticsearch_url, ES_MANIFEST_INDEX, cache_key, timeout=60,
+        )
+        import base64
+        manifest_data = base64.b64decode(manifest_b64)
         assert manifest_data[:4] == b"XS3M"
 
     def test_large_file_cache_hit_after_upload(
-        self, proxy_get, unique_key, s3_client, test_bucket
+        self, proxy_get, unique_key, s3_client, test_bucket, elasticsearch_url,
     ):
         payload = generate_payload(LARGE)
-        seed_cached_object(s3_client, test_bucket, unique_key, payload)
+        seed_cached_object(
+            s3_client, test_bucket, unique_key, payload,
+            es_url=elasticsearch_url, es_index=ES_MANIFEST_INDEX,
+        )
         r = proxy_get(unique_key, "/data/1", object_size=LARGE, timeout=60)
         assert r.status_code == 200
         assert r.headers["x-xs3lerator-cache-hit"] == "true"
@@ -269,10 +290,15 @@ class TestLargeFile:
 
 
 class TestConcurrency:
-    def test_concurrent_gets_same_key(self, proxy_get, s3_client, test_bucket):
+    def test_concurrent_gets_same_key(
+        self, proxy_get, s3_client, test_bucket, elasticsearch_url,
+    ):
         key = "test/concurrent-same"
         payload = generate_payload(SMALL)
-        seed_cached_object(s3_client, test_bucket, key, payload)
+        seed_cached_object(
+            s3_client, test_bucket, key, payload,
+            es_url=elasticsearch_url, es_index=ES_MANIFEST_INDEX,
+        )
 
         def fetch():
             return proxy_get(key, "/data/1", object_size=len(payload))
@@ -284,10 +310,15 @@ class TestConcurrency:
         assert all(r.status_code == 200 for r in results)
         assert all(r.content == payload for r in results)
 
-    def test_concurrent_range_gets(self, proxy_get, s3_client, test_bucket):
+    def test_concurrent_range_gets(
+        self, proxy_get, s3_client, test_bucket, elasticsearch_url,
+    ):
         key = "test/concurrent-ranges"
         payload = generate_payload(SMALL)
-        seed_cached_object(s3_client, test_bucket, key, payload)
+        seed_cached_object(
+            s3_client, test_bucket, key, payload,
+            es_url=elasticsearch_url, es_index=ES_MANIFEST_INDEX,
+        )
 
         def fetch_range(start, end):
             return proxy_get(
@@ -377,14 +408,13 @@ class TestHeaders:
 
 class TestManifestAlias:
     def test_manifest_alias_creates_copy(
-        self, proxy, proxy_get, unique_key, s3_client, test_bucket
+        self, proxy, proxy_get, unique_key, elasticsearch_url, test_bucket,
     ):
-        """POST with X-Xs3lerator-Link-Manifest creates an alias manifest."""
-        payload = generate_payload(SMALL)
+        """POST with X-Xs3lerator-Link-Manifest creates an alias manifest in ES."""
         r = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r.status_code == 200
-        source_manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
-        wait_for_manifest(s3_client, test_bucket, source_manifest_key)
+        source_cache_key = f"{test_bucket}/{unique_key}"
+        wait_for_manifest_es(elasticsearch_url, ES_MANIFEST_INDEX, source_cache_key)
 
         alias_key = f"{unique_key}-alias"
         resp = requests.post(
@@ -394,19 +424,23 @@ class TestManifestAlias:
         )
         assert resp.status_code == 204
 
-        alias_manifest_key = f"{MAP_PREFIX}{test_bucket}/{alias_key}"
-        alias_data = wait_for_manifest(s3_client, test_bucket, alias_manifest_key)
+        alias_cache_key = f"{test_bucket}/{alias_key}"
+        alias_b64 = wait_for_manifest_es(
+            elasticsearch_url, ES_MANIFEST_INDEX, alias_cache_key,
+        )
+        import base64
+        alias_data = base64.b64decode(alias_b64)
         assert alias_data[:4] == b"XS3M"
 
     def test_manifest_alias_serves_same_content(
-        self, proxy, proxy_get, unique_key, s3_client, test_bucket
+        self, proxy, proxy_get, unique_key, elasticsearch_url, test_bucket,
     ):
         """Content served via an alias key should match the original."""
         payload = generate_payload(SMALL)
         r1 = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r1.status_code == 200
-        source_manifest_key = f"{MAP_PREFIX}{test_bucket}/{unique_key}"
-        wait_for_manifest(s3_client, test_bucket, source_manifest_key)
+        source_cache_key = f"{test_bucket}/{unique_key}"
+        wait_for_manifest_es(elasticsearch_url, ES_MANIFEST_INDEX, source_cache_key)
 
         alias_key = f"{unique_key}-alias2"
         resp = requests.post(

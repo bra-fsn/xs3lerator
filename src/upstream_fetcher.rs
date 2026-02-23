@@ -15,6 +15,7 @@ use crate::download::{
     create_temp_chunk_file, is_enospc, pwrite_all, DownloadManager, InFlightDownload,
 };
 use crate::error::ProxyError;
+use crate::es_client::EsClient;
 use crate::headers::{filter_upstream_headers, ContractHeaders};
 use crate::manifest::ManifestCache;
 use crate::planner::compute_chunk_plan;
@@ -65,6 +66,7 @@ pub async fn fetch_upstream(
     trace: &Option<Arc<TraceWriter>>,
     manifest_cache: Option<Arc<ManifestCache>>,
     chunk_cache: Option<Arc<ChunkCache>>,
+    es_client: Option<Arc<EsClient>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let upstream_url = contract
         .upstream_url
@@ -246,6 +248,7 @@ pub async fn fetch_upstream(
                 Some(all_upstream_headers),
                 manifest_cache.clone(),
                 chunk_cache.clone(),
+                es_client.clone(),
             )
             .await;
         }
@@ -267,6 +270,7 @@ pub async fn fetch_upstream(
             Some(all_upstream_headers),
             manifest_cache,
             chunk_cache,
+            es_client,
         )
         .await;
     }
@@ -290,6 +294,7 @@ pub async fn fetch_upstream(
         Some(all_upstream_headers),
         manifest_cache,
         chunk_cache,
+        es_client,
     )
     .await
 }
@@ -316,6 +321,7 @@ async fn start_parallel_upstream_download(
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
     _manifest_cache: Option<Arc<ManifestCache>>,
     chunk_cache: Option<Arc<ChunkCache>>,
+    es_client: Option<Arc<EsClient>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let plan = compute_chunk_plan(file_size, config.http_concurrency, config.min_chunk_size);
 
@@ -373,9 +379,9 @@ async fn start_parallel_upstream_download(
             s3_bucket.to_string(),
             cache_key.to_string(),
             config.data_prefix.clone(),
-            config.map_prefix.clone(),
             download.clone(),
             chunk_cache.clone(),
+            es_client,
         );
     }
 
@@ -813,6 +819,7 @@ async fn start_sequential_download(
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
     _manifest_cache: Option<Arc<ManifestCache>>,
     chunk_cache: Option<Arc<ChunkCache>>,
+    es_client: Option<Arc<EsClient>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let is_unknown_size = file_size.is_none();
     let effective_size = file_size
@@ -873,9 +880,9 @@ async fn start_sequential_download(
                 s3_bucket.to_string(),
                 cache_key.to_string(),
                 config.data_prefix.clone(),
-                config.map_prefix.clone(),
                 download.clone(),
                 chunk_cache.clone(),
+                es_client.clone(),
             );
         }
         s3_uploader_for_task = None;
@@ -894,7 +901,7 @@ async fn start_sequential_download(
     let temp_dir = config.temp_dir.clone();
     let s3b = s3_bucket.to_string();
     let data_prefix = config.data_prefix.clone();
-    let map_prefix = config.map_prefix.clone();
+    let es_for_task = es_client;
 
     tokio::spawn(async move {
         let downloads = unsafe { &*(dm_ptr as *const DownloadManager) };
@@ -983,9 +990,9 @@ async fn start_sequential_download(
                         s3b,
                         ck.clone(),
                         data_prefix,
-                        map_prefix,
                         dl.clone(),
                         chunk_cache_for_task,
+                        es_for_task,
                     );
                 }
             }

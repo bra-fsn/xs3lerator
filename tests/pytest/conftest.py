@@ -3,17 +3,18 @@
 Supports two modes:
 
   Docker Compose mode (CI or `docker compose up`):
-    Set PROXY_URL, LOCALSTACK_ENDPOINT, and TEST_SERVER_HOST env vars.
+    Set PROXY_URL, LOCALSTACK_ENDPOINT, ELASTICSEARCH_URL, and TEST_SERVER_HOST env vars.
     The test server binds to 0.0.0.0 so the container can reach it via
     host.docker.internal.
 
   Local mode (no Docker, default):
-    Builds the Rust binary, starts LocalStack (must already be running),
-    and launches xs3lerator directly.  Everything runs on localhost.
+    Builds the Rust binary, starts LocalStack and Elasticsearch (must already
+    be running), and launches xs3lerator directly.  Everything runs on localhost.
 
 Environment variables:
     PROXY_URL              xs3lerator base URL (skip build/launch if set)
     LOCALSTACK_ENDPOINT    S3 endpoint        (default: http://localhost:4566)
+    ELASTICSEARCH_URL      ES endpoint        (default: http://localhost:9200)
     TEST_SERVER_BIND_HOST  Bind address        (default: 127.0.0.1)
     TEST_SERVER_HOST       Host xs3lerator uses to reach the test server
                            (default: 127.0.0.1, use host.docker.internal
@@ -22,12 +23,14 @@ Environment variables:
 
 import base64
 import hashlib
+import json
 import os
 import socket
 import struct
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import quote as url_quote
 
 import boto3
 import pytest
@@ -41,6 +44,8 @@ from test_server import TestServer, generate_payload  # noqa: F401 (re-export)
 
 PROXY_URL = os.environ.get("PROXY_URL")  # None → local mode
 LOCALSTACK_ENDPOINT = os.environ.get("LOCALSTACK_ENDPOINT", "http://localhost:4566")
+ELASTICSEARCH_URL = os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200")
+ES_MANIFEST_INDEX = os.environ.get("XS3_ELASTICSEARCH_MANIFEST_INDEX", "xs3_manifests")
 TEST_SERVER_BIND_HOST = os.environ.get("TEST_SERVER_BIND_HOST", "127.0.0.1")
 TEST_SERVER_HOST = os.environ.get("TEST_SERVER_HOST", "127.0.0.1")
 TEST_BUCKET = "xs3lerator-test"
@@ -71,6 +76,65 @@ def encode_upstream_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Elasticsearch helpers
+# ---------------------------------------------------------------------------
+
+
+def _es_doc_url(es_url: str, index: str, doc_id: str) -> str:
+    encoded_id = url_quote(doc_id, safe="")
+    return f"{es_url}/{index}/_doc/{encoded_id}"
+
+
+def es_get_manifest_b64(es_url: str, index: str, doc_id: str) -> str | None:
+    """Fetch manifest_b64 from Elasticsearch, return None if not found."""
+    url = _es_doc_url(es_url, index, doc_id)
+    resp = requests.get(url, timeout=5)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("found"):
+        return None
+    return data["_source"]["manifest_b64"]
+
+
+def es_put_manifest(es_url: str, index: str, doc_id: str, manifest_bytes: bytes):
+    """Write a manifest to Elasticsearch."""
+    url = _es_doc_url(es_url, index, doc_id)
+    b64 = base64.b64encode(manifest_bytes).decode()
+    resp = requests.put(
+        url,
+        json={"manifest_b64": b64},
+        headers={"Content-Type": "application/json"},
+        timeout=5,
+    )
+    resp.raise_for_status()
+    requests.post(f"{es_url}/{index}/_refresh", timeout=5)
+
+
+def es_create_index(es_url: str, index: str):
+    """Create the ES manifest index if it doesn't exist."""
+    url = f"{es_url}/{index}"
+    body = {
+        "settings": {
+            "number_of_shards": 1,
+            "number_of_replicas": 0,
+            "refresh_interval": "1s",
+        },
+        "mappings": {
+            "dynamic": False,
+            "properties": {
+                "manifest_b64": {"type": "keyword", "index": False, "doc_values": False}
+            },
+        },
+    }
+    resp = requests.put(url, json=body, timeout=5)
+    if resp.status_code == 400 and "resource_already_exists_exception" in resp.text:
+        return
+    resp.raise_for_status()
+
+
+# ---------------------------------------------------------------------------
 # Session-scoped fixtures
 # ---------------------------------------------------------------------------
 
@@ -84,6 +148,18 @@ def localstack_endpoint():
     except Exception:
         pytest.skip(f"LocalStack not reachable at {LOCALSTACK_ENDPOINT}")
     return LOCALSTACK_ENDPOINT
+
+
+@pytest.fixture(scope="session")
+def elasticsearch_url():
+    """Return the Elasticsearch URL, skipping if not reachable."""
+    try:
+        resp = requests.get(ELASTICSEARCH_URL, timeout=3)
+        resp.raise_for_status()
+    except Exception:
+        pytest.skip(f"Elasticsearch not reachable at {ELASTICSEARCH_URL}")
+    es_create_index(ELASTICSEARCH_URL, ES_MANIFEST_INDEX)
+    return ELASTICSEARCH_URL
 
 
 @pytest.fixture(scope="session")
@@ -155,6 +231,7 @@ def proxy_binary():
 def proxy(
     proxy_binary,
     localstack_endpoint,
+    elasticsearch_url,
     test_bucket,
     test_server,
     tmp_path_factory,
@@ -182,6 +259,10 @@ def proxy(
         "XS3_HTTP_CONCURRENCY": "4",
         "XS3_MIN_CHUNK_SIZE": "5MiB",
         "XS3_TEMP_DIR": str(temp_dir),
+        "XS3_ELASTICSEARCH_URL": elasticsearch_url,
+        "XS3_ELASTICSEARCH_MANIFEST_INDEX": ES_MANIFEST_INDEX,
+        "XS3_ELASTICSEARCH_REPLICAS": "0",
+        "XS3_ELASTICSEARCH_SHARDS": "1",
     })
     log_file = temp_dir / "xs3lerator.log"
     log_fh = open(log_file, "w")
@@ -263,7 +344,6 @@ def unique_key():
 # ---------------------------------------------------------------------------
 
 DATA_PREFIX = "data/"
-MAP_PREFIX = "_map/"
 CHUNK_SIZE = 5 * 1024 * 1024  # 5 MiB -- matches XS3_MIN_CHUNK_SIZE in proxy fixture
 
 
@@ -305,11 +385,19 @@ def build_manifest(payload: bytes, chunk_size: int = CHUNK_SIZE) -> tuple[bytes,
     return bytes(buf), chunks
 
 
-def seed_cached_object(s3_client, bucket: str, key: str, payload: bytes, chunk_size: int = CHUNK_SIZE):
-    """Upload a properly formatted manifest + chunks to S3 for cache hit tests.
+def seed_cached_object(
+    s3_client,
+    bucket: str,
+    key: str,
+    payload: bytes,
+    chunk_size: int = CHUNK_SIZE,
+    es_url: str = ELASTICSEARCH_URL,
+    es_index: str = ES_MANIFEST_INDEX,
+):
+    """Upload chunks to S3 and write manifest to Elasticsearch for cache hit tests.
 
-    xs3lerator builds cache_key as "{bucket}/{key}", so the manifest S3 key
-    is "_map/{bucket}/{key}" stored inside the same bucket.
+    xs3lerator builds cache_key as "{bucket}/{key}", so the ES doc _id is
+    "{bucket}/{key}".
     """
     manifest_bytes, chunks = build_manifest(payload, chunk_size)
 
@@ -317,13 +405,16 @@ def seed_cached_object(s3_client, bucket: str, key: str, payload: bytes, chunk_s
         s3_key = _chunk_s3_key(chunk_hash)
         s3_client.put_object(Bucket=bucket, Key=s3_key, Body=chunk_data)
 
-    manifest_key = f"{MAP_PREFIX}{bucket}/{key}"
-    s3_client.put_object(Bucket=bucket, Key=manifest_key, Body=manifest_bytes)
+    cache_key = f"{bucket}/{key}"
+    es_put_manifest(es_url, es_index, cache_key, manifest_bytes)
 
 
 @pytest.fixture(scope="session")
-def seed_object(s3_client, test_bucket):
+def seed_object(s3_client, test_bucket, elasticsearch_url):
     """Factory fixture for seeding content-addressed objects."""
     def _seed(key: str, payload: bytes, chunk_size: int = CHUNK_SIZE):
-        seed_cached_object(s3_client, test_bucket, key, payload, chunk_size)
+        seed_cached_object(
+            s3_client, test_bucket, key, payload, chunk_size,
+            es_url=elasticsearch_url, es_index=ES_MANIFEST_INDEX,
+        )
     return _seed

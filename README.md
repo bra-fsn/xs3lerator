@@ -43,8 +43,8 @@ GET request fetching and S3 content caching.
 ## Architecture
 
 xs3lerator sits between Passsage (the caching policy engine) and both S3 and
-upstream HTTP servers. Passsage handles metadata (memcached, `.meta` files,
-vary indexes) and caching policies; xs3lerator handles data transfer.
+upstream HTTP servers. Passsage handles metadata (Elasticsearch indexes) and
+caching policies; xs3lerator handles data transfer.
 
 ```
                                     ┌──────────────────┐
@@ -113,23 +113,26 @@ curl -H "X-Xs3lerator-Upstream-Url: $(echo -n 'https://example.com/file.iso' | b
 Every option is also settable via an environment variable.
 
 ```text
-OPTION                             ENV VAR                        DEFAULT
---bind-ip <IP>                     XS3_BIND_IP                    0.0.0.0
---port <PORT>                      XS3_PORT                       8080
---region <REGION>                  XS3_REGION                     (SDK default)
---s3-endpoint-url <URL>            XS3_S3_ENDPOINT_URL            (none)
---s3-force-path-style              XS3_S3_FORCE_PATH_STYLE        false
---s3-concurrency <N>               XS3_S3_CONCURRENCY             32
---http-concurrency <N>             XS3_HTTP_CONCURRENCY           8
---min-chunk-size <SIZE>            XS3_MIN_CHUNK_SIZE             8MiB
---temp-dir <PATH>                  XS3_TEMP_DIR                   (system tmpdir)
---upstream-tls-skip-verify         XS3_UPSTREAM_TLS_SKIP_VERIFY   false
---debug-trace <PATH>               XS3_DEBUG_TRACE                (none)
---data-prefix <PREFIX>             XS3_DATA_PREFIX                data/
---map-prefix <PREFIX>              XS3_MAP_PREFIX                 _map/
---manifest-cache-size <N>          XS3_MANIFEST_CACHE_SIZE        10000
---chunk-cache-dir <PATH>           XS3_CHUNK_CACHE_DIR            (none)
---chunk-cache-max-size <SIZE>      XS3_CHUNK_CACHE_MAX_SIZE       100GiB
+OPTION                             ENV VAR                            DEFAULT
+--bind-ip <IP>                     XS3_BIND_IP                        0.0.0.0
+--port <PORT>                      XS3_PORT                           8080
+--region <REGION>                  XS3_REGION                         (SDK default)
+--s3-endpoint-url <URL>            XS3_S3_ENDPOINT_URL                (none)
+--s3-force-path-style              XS3_S3_FORCE_PATH_STYLE            false
+--s3-concurrency <N>               XS3_S3_CONCURRENCY                 32
+--http-concurrency <N>             XS3_HTTP_CONCURRENCY               8
+--min-chunk-size <SIZE>            XS3_MIN_CHUNK_SIZE                 8MiB
+--temp-dir <PATH>                  XS3_TEMP_DIR                       (system tmpdir)
+--upstream-tls-skip-verify         XS3_UPSTREAM_TLS_SKIP_VERIFY       false
+--debug-trace <PATH>               XS3_DEBUG_TRACE                    (none)
+--data-prefix <PREFIX>             XS3_DATA_PREFIX                    data/
+--manifest-cache-size <N>          XS3_MANIFEST_CACHE_SIZE            10000
+--chunk-cache-dir <PATH>           XS3_CHUNK_CACHE_DIR                (none)
+--chunk-cache-max-size <SIZE>      XS3_CHUNK_CACHE_MAX_SIZE           100GiB
+--elasticsearch-url <URL>          XS3_ELASTICSEARCH_URL              (none)
+--elasticsearch-manifest-index     XS3_ELASTICSEARCH_MANIFEST_INDEX   xs3_manifests
+--elasticsearch-replicas <N>       XS3_ELASTICSEARCH_REPLICAS         1
+--elasticsearch-shards <N>         XS3_ELASTICSEARCH_SHARDS           9
 ```
 
 Run `xs3lerator --help` to see the generated help with defaults.
@@ -245,8 +248,9 @@ simultaneously with the download:
 1. Each chunk is hashed (SHA-256) and uploaded to `{data_prefix}{hash}` using
    `PutObject` with `If-None-Match: *` — if the chunk already exists, the
    upload is skipped (S3 returns `412 Precondition Failed`).
-2. Once all chunks are uploaded, a manifest is written to
-   `{map_prefix}{bucket}/{key}` containing the ordered list of chunk hashes.
+2. Once all chunks are uploaded, a manifest is written to Elasticsearch
+   (index configurable via `--elasticsearch-manifest-index`) containing the
+   ordered list of chunk hashes, keyed by `{bucket}/{key}`.
 3. Duplicate data across different objects is stored only once.
 
 ### Manifest Alias
@@ -291,10 +295,11 @@ Tests routing (healthz, 405 for non-GET), error handling.
 pytest tests/pytest/ -v
 ```
 
-End-to-end tests against a real xs3lerator binary + LocalStack S3. Covers
-cache miss/hit flows, large file parallel downloads, range requests,
-content-addressed uploads, and manifest alias creation. Requires
-LocalStack running on `localhost:4566`.
+End-to-end tests against a real xs3lerator binary + LocalStack S3 +
+Elasticsearch. Covers cache miss/hit flows, large file parallel downloads,
+range requests, content-addressed uploads, and manifest alias creation.
+Requires LocalStack running on `localhost:4566` and Elasticsearch on
+`localhost:9200`.
 
 ## Troubleshooting
 

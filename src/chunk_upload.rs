@@ -8,6 +8,7 @@ use tracing::{debug, error, info};
 use crate::chunk_cache::ChunkCache;
 use crate::download::InFlightDownload;
 use crate::error::ProxyError;
+use crate::es_client::EsClient;
 use crate::manifest::{hash_to_s3_key, Manifest};
 use crate::s3::S3Uploader;
 
@@ -45,37 +46,6 @@ pub async fn put_chunk(
     }
 }
 
-/// Upload manifest bytes to S3 at `{map_prefix}{key}`.
-pub async fn put_manifest(
-    uploader: &S3Uploader,
-    bucket: &str,
-    map_prefix: &str,
-    key: &str,
-    manifest_bytes: Vec<u8>,
-) -> Result<(), ProxyError> {
-    let s3_key = format!("{map_prefix}{key}");
-    let body = ByteStream::from(Bytes::from(manifest_bytes));
-    uploader.put_object(bucket, &s3_key, body).await
-}
-
-/// Fetch a manifest from S3 at `{map_prefix}{key}`.
-pub async fn get_manifest(
-    uploader: &S3Uploader,
-    bucket: &str,
-    map_prefix: &str,
-    key: &str,
-) -> Result<Option<Manifest>, ProxyError> {
-    let s3_key = format!("{map_prefix}{key}");
-    match uploader.get_object_bytes(bucket, &s3_key).await {
-        Ok(data) => {
-            let manifest = Manifest::deserialize(&data)?;
-            Ok(Some(manifest))
-        }
-        Err(ProxyError::NotFound(_)) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
 /// Spawn background tasks that upload all chunks of an in-flight download
 /// to S3 as content-addressed objects, then write the manifest.
 pub fn spawn_chunk_uploads(
@@ -83,9 +53,9 @@ pub fn spawn_chunk_uploads(
     bucket: String,
     key: String,
     data_prefix: String,
-    map_prefix: String,
     download: Arc<InFlightDownload>,
     chunk_cache: Option<Arc<ChunkCache>>,
+    es_client: Option<Arc<EsClient>>,
 ) {
     tokio::spawn(async move {
         if let Err(e) = run_chunk_uploads(
@@ -93,9 +63,9 @@ pub fn spawn_chunk_uploads(
             &bucket,
             &key,
             &data_prefix,
-            &map_prefix,
             &download,
             chunk_cache.as_deref(),
+            es_client.as_deref(),
         )
         .await
         {
@@ -109,9 +79,9 @@ async fn run_chunk_uploads(
     bucket: &str,
     key: &str,
     data_prefix: &str,
-    map_prefix: &str,
     download: &InFlightDownload,
     _chunk_cache: Option<&ChunkCache>,
+    es_client: Option<&EsClient>,
 ) -> Result<(), ProxyError> {
     let num_chunks = if download.is_stream_complete() {
         let total = download.actual_total_bytes();
@@ -182,7 +152,9 @@ async fn run_chunk_uploads(
                 },
                 hashes,
             };
-            put_manifest(uploader, bucket, map_prefix, key, manifest.serialize()).await?;
+            if let Some(es) = es_client {
+                es.put_manifest(key, manifest.serialize()).await?;
+            }
             download.s3_upload_complete.store(true, Ordering::Release);
             info!(key, "manifest written");
         }

@@ -13,10 +13,10 @@ use serde_json::json;
 use tracing::{error, info};
 
 use crate::chunk_cache::ChunkCache;
-use crate::chunk_upload;
 use crate::config::AppConfig;
 use crate::download::{create_temp_chunk_file, pwrite_all, DownloadManager, InFlightDownload};
 use crate::error::{ProxyError, ProxyResult};
+use crate::es_client::EsClient;
 use crate::headers::{
     self, parse_bucket_key, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
 };
@@ -46,6 +46,7 @@ pub struct AppState {
     pub trace: Option<Arc<TraceWriter>>,
     pub manifest_cache: Arc<ManifestCache>,
     pub chunk_cache: Option<Arc<ChunkCache>>,
+    pub es_client: Option<Arc<EsClient>>,
 }
 
 /// Health check endpoint: `GET /healthz`
@@ -106,16 +107,11 @@ pub async fn handle_post(
     // Read source manifest (LRU or S3)
     let manifest = fetch_manifest(&state, &bucket, &source_cache_key).await?;
 
-    // Write manifest under target key
+    // Write manifest under target key to ES
     let manifest_bytes = manifest.serialize();
-    chunk_upload::put_manifest(
-        &state.s3_uploader,
-        &bucket,
-        &state.config.map_prefix,
-        &target_cache_key,
-        manifest_bytes,
-    )
-    .await?;
+    if let Some(ref es) = state.es_client {
+        es.put_manifest(&target_cache_key, manifest_bytes).await?;
+    }
 
     // Cache under target key in LRU
     state
@@ -300,24 +296,24 @@ async fn handle_s3_path(
     )
 }
 
-/// Fetch manifest from LRU cache or S3. Caches in LRU on success.
+/// Fetch manifest from LRU cache or Elasticsearch. Caches in LRU on success.
 async fn fetch_manifest(
     state: &AppState,
-    bucket: &str,
+    _bucket: &str,
     cache_key: &str,
 ) -> ProxyResult<Arc<Manifest>> {
     if let Some(cached) = state.manifest_cache.get(cache_key) {
         return Ok(cached);
     }
 
-    let manifest = chunk_upload::get_manifest(
-        &state.s3_uploader,
-        bucket,
-        &state.config.map_prefix,
-        cache_key,
-    )
-    .await?
-    .ok_or_else(|| ProxyError::NotFound(format!("no manifest for {cache_key}")))?;
+    let manifest = if let Some(ref es) = state.es_client {
+        es.get_manifest(cache_key).await?
+    } else {
+        None
+    };
+
+    let manifest: Manifest = manifest
+        .ok_or_else(|| ProxyError::NotFound(format!("no manifest for {cache_key}")))?;
 
     let arc = Arc::new(manifest);
     state
@@ -526,6 +522,7 @@ async fn handle_upstream_path(
         &state.trace,
         Some(state.manifest_cache.clone()),
         state.chunk_cache.clone(),
+        state.es_client.clone(),
     )
     .await?;
 

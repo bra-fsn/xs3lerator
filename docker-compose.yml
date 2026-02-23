@@ -15,6 +15,20 @@ services:
       timeout: 5s
       retries: 10
 
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
+    ports:
+      - "9200:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms256m -Xmx256m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   xs3lerator:
     build:
       context: .
@@ -31,15 +45,17 @@ services:
       - XS3_S3_CONCURRENCY=4
       - XS3_HTTP_CONCURRENCY=4
       - XS3_MIN_CHUNK_SIZE=5MiB
+      - XS3_ELASTICSEARCH_URL=http://elasticsearch:9200
+      - XS3_ELASTICSEARCH_MANIFEST_INDEX=xs3_manifests
+      - XS3_ELASTICSEARCH_REPLICAS=0
+      - XS3_ELASTICSEARCH_SHARDS=1
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       localstack:
         condition: service_healthy
-    # distroless has no shell or curl — use wget from busybox or skip healthcheck.
-    # The test suite waits for /healthz instead.
-    # healthcheck:
-    #   test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/healthz"]
+      elasticsearch:
+        condition: service_healthy
 
 volumes:
   localstack-data:

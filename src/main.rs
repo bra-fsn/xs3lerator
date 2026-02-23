@@ -11,6 +11,7 @@ mod chunk_upload;
 mod config;
 mod download;
 mod error;
+mod es_client;
 mod handler;
 mod headers;
 mod manifest;
@@ -70,6 +71,21 @@ async fn main() -> anyhow::Result<()> {
 
     let manifest_cache = Arc::new(ManifestCache::new(config.manifest_cache_size));
 
+    let es_client = if let Some(ref es_url) = config.elasticsearch_url {
+        let client = es_client::EsClient::new(es_url, &config.elasticsearch_manifest_index);
+        client
+            .create_index_if_not_exists(config.elasticsearch_shards, config.elasticsearch_replicas)
+            .await?;
+        info!(
+            url = es_url,
+            index = config.elasticsearch_manifest_index,
+            "Elasticsearch manifest storage initialized"
+        );
+        Some(Arc::new(client))
+    } else {
+        None
+    };
+
     let chunk_cache_arc = if let Some(ref dir) = config.chunk_cache_dir {
         let cc = chunk_cache::ChunkCache::new(
             dir.clone(),
@@ -96,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
         trace: trace_writer,
         manifest_cache,
         chunk_cache: chunk_cache_arc,
+        es_client,
     };
 
     let addr = SocketAddr::from((config.bind_ip, config.port));

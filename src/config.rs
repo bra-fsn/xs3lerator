@@ -78,9 +78,21 @@ pub struct CliArgs {
     #[arg(long, env = "XS3_DATA_PREFIX", default_value = "data/")]
     pub data_prefix: String,
 
-    /// S3 prefix for chunk manifests.
-    #[arg(long, env = "XS3_MAP_PREFIX", default_value = "_map/")]
-    pub map_prefix: String,
+    /// Elasticsearch URL for manifest storage.
+    #[arg(long, env = "XS3_ELASTICSEARCH_URL")]
+    pub elasticsearch_url: Option<String>,
+
+    /// Elasticsearch index name for manifests.
+    #[arg(long, env = "XS3_ELASTICSEARCH_MANIFEST_INDEX", default_value = "xs3_manifests")]
+    pub elasticsearch_manifest_index: String,
+
+    /// Number of Elasticsearch index replicas.
+    #[arg(long, env = "XS3_ELASTICSEARCH_REPLICAS", default_value_t = 1)]
+    pub elasticsearch_replicas: u32,
+
+    /// Number of Elasticsearch index shards.
+    #[arg(long, env = "XS3_ELASTICSEARCH_SHARDS", default_value_t = 9)]
+    pub elasticsearch_shards: u32,
 
     /// In-memory LRU cache capacity for manifests.
     #[arg(long, env = "XS3_MANIFEST_CACHE_SIZE", default_value_t = 10_000)]
@@ -113,7 +125,10 @@ pub struct AppConfig {
     pub temp_dir: PathBuf,
     pub upstream_tls_skip_verify: bool,
     pub data_prefix: String,
-    pub map_prefix: String,
+    pub elasticsearch_url: Option<String>,
+    pub elasticsearch_manifest_index: String,
+    pub elasticsearch_replicas: u32,
+    pub elasticsearch_shards: u32,
     pub manifest_cache_size: usize,
     pub chunk_cache_dir: Option<PathBuf>,
     pub chunk_cache_max_size: u64,
@@ -157,7 +172,10 @@ impl TryFrom<CliArgs> for AppConfig {
             temp_dir,
             upstream_tls_skip_verify: args.upstream_tls_skip_verify,
             data_prefix: args.data_prefix,
-            map_prefix: args.map_prefix,
+            elasticsearch_url: args.elasticsearch_url,
+            elasticsearch_manifest_index: args.elasticsearch_manifest_index,
+            elasticsearch_replicas: args.elasticsearch_replicas,
+            elasticsearch_shards: args.elasticsearch_shards,
             manifest_cache_size: args.manifest_cache_size,
             chunk_cache_dir: args.chunk_cache_dir,
             chunk_cache_max_size: args.chunk_cache_max_size,
