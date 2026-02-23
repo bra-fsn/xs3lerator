@@ -25,7 +25,10 @@ fn test_config() -> AppConfig {
         temp_dir: std::env::temp_dir(),
         upstream_tls_skip_verify: false,
         data_prefix: "data/".to_string(),
-        map_prefix: "_map/".to_string(),
+        elasticsearch_url: None,
+        elasticsearch_manifest_index: "xs3_manifests".to_string(),
+        elasticsearch_replicas: 0,
+        elasticsearch_shards: 1,
         manifest_cache_size: 100,
         chunk_cache_dir: None,
         chunk_cache_max_size: 100 * 1024 * 1024 * 1024,
@@ -67,6 +70,7 @@ async fn healthz_returns_ok() {
         trace: None,
         manifest_cache: Arc::new(ManifestCache::new(100)),
         chunk_cache: None,
+        es_client: None,
     };
 
     let base = start_server(state).await;
@@ -91,6 +95,7 @@ async fn non_get_returns_405() {
         trace: None,
         manifest_cache: Arc::new(ManifestCache::new(100)),
         chunk_cache: None,
+        es_client: None,
     };
 
     let base = start_server(state).await;
@@ -145,6 +150,7 @@ async fn get_without_upstream_url_returns_error() {
         trace: None,
         manifest_cache: Arc::new(ManifestCache::new(100)),
         chunk_cache: None,
+        es_client: None,
     };
 
     let base = start_server(state).await;
