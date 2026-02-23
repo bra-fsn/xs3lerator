@@ -41,8 +41,8 @@ jobs:
       - name: Build debug binary
         run: cargo build
 
-      - name: Start LocalStack
-        run: docker compose up -d localstack --wait
+      - name: Start LocalStack & Elasticsearch
+        run: docker compose up -d localstack elasticsearch --wait
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -56,6 +56,7 @@ jobs:
         run: pytest tests/pytest/ -v --tb=short
         env:
           LOCALSTACK_ENDPOINT: http://localhost:4566
+          ELASTICSEARCH_URL: http://localhost:9200
           RUST_LOG: xs3lerator=debug
 
       - name: Dump xs3lerator logs on failure
@@ -65,7 +66,7 @@ jobs:
             [ -f "$f" ] && echo "=== $f ===" && cat "$f"
           done
 
-      - name: Dump LocalStack logs on failure
+      - name: Dump LocalStack & Elasticsearch logs on failure
         if: failure()
         run: docker compose logs --no-color
 
