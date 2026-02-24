@@ -20,11 +20,12 @@ exec mount-s3 \
     --endpoint-url "${ENDPOINT}" \
     --region "${REGION}" \
     --allow-delete \
+    --allow-overwrite \
     --allow-other \
     --force-path-style \
     --uid "${MOUNT_UID:-0}" \
     --gid "${MOUNT_GID:-0}" \
-    --dir-mode 0755 \
-    --file-mode 0644 \
+    --dir-mode 0777 \
+    --file-mode 0666 \
     -f \
     "${BUCKET}" "${MOUNTPOINT}"
