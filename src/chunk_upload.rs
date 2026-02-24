@@ -192,9 +192,7 @@ async fn persist_single_chunk(
     let expected = download.expected_chunk_len(idx);
     download.wait_for_bytes(idx, expected).await?;
 
-    let hash = download.chunk(idx).get_hash().ok_or_else(|| {
-        ProxyError::Internal(format!("chunk {idx}: hash not available after download"))
-    })?;
+    let hash = download.wait_for_hash(idx).await?;
 
     let actual_written = download.chunk(idx).bytes_written();
     let persist_size = std::cmp::min(expected, actual_written);

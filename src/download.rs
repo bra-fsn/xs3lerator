@@ -241,6 +241,27 @@ impl InFlightDownload {
         }
     }
 
+    /// Wait until the hash for chunk `idx` is available.
+    /// The hash is set by the download worker just before `mark_chunk_done`,
+    /// which fires `notify`.
+    pub async fn wait_for_hash(
+        &self,
+        idx: usize,
+    ) -> Result<[u8; 32], ProxyError> {
+        loop {
+            if let Some(h) = self.chunks[idx].get_hash() {
+                return Ok(h);
+            }
+            if self.has_failed() {
+                return Err(ProxyError::Upstream("upstream download failed".into()));
+            }
+            if self.is_cancelled() {
+                return Err(ProxyError::Internal("download cancelled".into()));
+            }
+            self.notify.notified().await;
+        }
+    }
+
     /// Mark the upstream stream as fully received.  Used for unknown-size
     /// (chunked) responses where `object_size` is an upper bound and the
     /// actual data may be smaller.  Wakes all `wait_for_bytes` waiters so
