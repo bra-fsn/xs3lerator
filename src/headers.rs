@@ -112,19 +112,16 @@ pub fn filter_upstream_headers(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
-/// Parse bucket and S3 key from the URL path.
+/// Parse the cache key from the URL path.
 ///
-/// Path format: `/<bucket>/<key...>`
-/// Returns `(bucket, key)` or None if the path is malformed.
-pub fn parse_bucket_key(path: &str) -> Option<(String, String)> {
-    let trimmed = path.trim_start_matches('/');
-    let slash = trimmed.find('/')?;
-    let bucket = &trimmed[..slash];
-    let key = &trimmed[slash + 1..];
-    if bucket.is_empty() || key.is_empty() {
+/// Path format: `/<key...>`
+/// Returns the key (everything after the leading `/`), or None if empty.
+pub fn parse_key(path: &str) -> Option<String> {
+    let key = path.trim_start_matches('/');
+    if key.is_empty() {
         return None;
     }
-    Some((bucket.to_string(), key.to_string()))
+    Some(key.to_string())
 }
 
 #[cfg(test)]
@@ -133,16 +130,15 @@ mod tests {
     use axum::http::HeaderValue;
 
     #[test]
-    fn parse_bucket_key_normal() {
-        let (b, k) = parse_bucket_key("/my-bucket/https/host/a/b/c/hash.iso").unwrap();
-        assert_eq!(b, "my-bucket");
+    fn parse_key_normal() {
+        let k = parse_key("/https/host/a/b/c/hash.iso").unwrap();
         assert_eq!(k, "https/host/a/b/c/hash.iso");
     }
 
     #[test]
-    fn parse_bucket_key_no_key() {
-        assert!(parse_bucket_key("/bucket/").is_none());
-        assert!(parse_bucket_key("/bucket").is_none());
+    fn parse_key_empty() {
+        assert!(parse_key("/").is_none());
+        assert!(parse_key("").is_none());
     }
 
     #[test]

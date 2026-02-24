@@ -1,0 +1,15 @@
+# Minimal mount-s3 image for integration tests.
+# Downloads the official RPM from AWS and installs it.
+FROM amazonlinux:2023
+
+RUN dnf install -y wget fuse fuse-libs && dnf clean all
+
+RUN ARCH=$(uname -m) && \
+    wget -q "https://s3.amazonaws.com/mountpoint-s3-release/latest/${ARCH}/mount-s3.rpm" \
+         -O /tmp/mount-s3.rpm && \
+    dnf install -y /tmp/mount-s3.rpm && \
+    rm -f /tmp/mount-s3.rpm
+
+RUN echo "user_allow_other" >> /etc/fuse.conf
+
+ENTRYPOINT ["mount-s3"]

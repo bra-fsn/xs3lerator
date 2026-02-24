@@ -1,5 +1,6 @@
 use std::fmt;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use lru::LruCache;
@@ -111,10 +112,11 @@ impl fmt::Debug for Manifest {
     }
 }
 
-/// Derive a 4-level prefix-hashed S3 key from a SHA-256 digest.
-pub fn hash_to_s3_key(hash: &[u8; HASH_LEN], prefix: &str) -> String {
+/// Derive the filesystem path for a content-addressed chunk relative to data_dir.
+/// Layout: `{prefix}{h[0]}/{h[1]}/{h[2]}/{h[3]}/{full_hex}`
+pub fn hash_to_chunk_path(hash: &[u8; HASH_LEN], prefix: &str) -> PathBuf {
     let hex = hex_encode(hash);
-    format!(
+    PathBuf::from(format!(
         "{}{}/{}/{}/{}/{}",
         prefix,
         &hex[0..1],
@@ -122,13 +124,7 @@ pub fn hash_to_s3_key(hash: &[u8; HASH_LEN], prefix: &str) -> String {
         &hex[2..3],
         &hex[3..4],
         hex
-    )
-}
-
-/// Derive the local cache path segments from a SHA-256 digest (2-level prefix).
-pub fn hash_to_cache_path(hash: &[u8; HASH_LEN]) -> (String, String, String) {
-    let hex = hex_encode(hash);
-    (hex[0..1].to_string(), hex[1..2].to_string(), hex)
+    ))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -235,12 +231,12 @@ mod tests {
     }
 
     #[test]
-    fn hash_to_cache_path_format() {
+    fn hash_to_chunk_path_format() {
         let hash = [0xab; 32];
-        let (p0, p1, hex) = hash_to_cache_path(&hash);
-        assert_eq!(p0, "a");
-        assert_eq!(p1, "b");
-        assert!(hex.starts_with("ab"));
-        assert_eq!(hex.len(), 64);
+        let p = hash_to_chunk_path(&hash, "data/");
+        assert_eq!(
+            p.to_str().unwrap(),
+            "data/a/b/a/b/abababababababababababababababababababababababababababababababababab"
+        );
     }
 }

@@ -29,6 +29,38 @@ services:
       timeout: 5s
       retries: 20
 
+  # FUSE sidecar: mounts the LocalStack S3 test bucket at /data via mount-s3.
+  # The mount is shared with xs3lerator through a bind-propagated volume so
+  # xs3lerator can read/write S3 objects as ordinary files.
+  mount-s3:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.mount-s3
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    volumes:
+      - ./docker/mount-s3-entrypoint.sh:/entrypoint.sh:ro
+      - xs3-data:/data:rshared
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - MOUNT_S3_BUCKET=xs3lerator-test
+      - MOUNT_S3_MOUNTPOINT=/data
+      - MOUNT_S3_ENDPOINT=http://localstack:4566
+    depends_on:
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "ls /data/data 2>/dev/null || mount | grep -q /data"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
   xs3lerator:
     build:
       context: .
@@ -40,15 +72,15 @@ services:
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
-      - XS3_S3_ENDPOINT_URL=http://localstack:4566
-      - XS3_S3_FORCE_PATH_STYLE=true
-      - XS3_S3_CONCURRENCY=4
+      - XS3_DATA_DIR=/data
       - XS3_HTTP_CONCURRENCY=4
-      - XS3_MIN_CHUNK_SIZE=5MiB
+      - XS3_CHUNK_SIZE=5MiB
       - XS3_ELASTICSEARCH_URL=http://elasticsearch:9200
       - XS3_ELASTICSEARCH_MANIFEST_INDEX=xs3_manifests
       - XS3_ELASTICSEARCH_REPLICAS=0
       - XS3_ELASTICSEARCH_SHARDS=1
+    volumes:
+      - xs3-data:/data:rshared
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -56,6 +88,9 @@ services:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
+      mount-s3:
+        condition: service_healthy
 
 volumes:
   localstack-data:
+  xs3-data:

@@ -49,21 +49,21 @@ class TestBasic:
         r = requests.get(f"{proxy}/healthz", timeout=5)
         assert r.status_code == 200
 
-    def test_method_not_allowed_post_without_header(self, proxy, test_bucket):
+    def test_method_not_allowed_post_without_header(self, proxy):
         """POST without X-Xs3lerator-Link-Manifest header returns 500."""
-        r = requests.post(f"{proxy}/{test_bucket}/any-key", timeout=5)
+        r = requests.post(f"{proxy}/any-key", timeout=5)
         assert r.status_code == 500
 
-    def test_method_not_allowed_put(self, proxy, test_bucket):
-        r = requests.put(f"{proxy}/{test_bucket}/any-key", timeout=5)
+    def test_method_not_allowed_put(self, proxy):
+        r = requests.put(f"{proxy}/any-key", timeout=5)
         assert r.status_code == 405
 
-    def test_method_not_allowed_delete(self, proxy, test_bucket):
-        r = requests.delete(f"{proxy}/{test_bucket}/any-key", timeout=5)
+    def test_method_not_allowed_delete(self, proxy):
+        r = requests.delete(f"{proxy}/any-key", timeout=5)
         assert r.status_code == 405
 
-    def test_missing_upstream_url(self, proxy, test_bucket):
-        r = requests.get(f"{proxy}/{test_bucket}/some-key", timeout=5)
+    def test_missing_upstream_url(self, proxy):
+        r = requests.get(f"{proxy}/some-key", timeout=5)
         assert r.status_code >= 400
 
 
@@ -96,7 +96,7 @@ class TestCacheMiss:
         r = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r.status_code == 200
 
-        cache_key = f"{test_bucket}/{unique_key}"
+        cache_key = unique_key
         manifest_b64 = wait_for_manifest_es(
             elasticsearch_url, ES_MANIFEST_INDEX, cache_key,
         )
@@ -263,7 +263,7 @@ class TestLargeFile:
         r = proxy_get(unique_key, f"/data/{LARGE}", cache_skip=True, timeout=60)
         assert r.status_code == 200
 
-        cache_key = f"{test_bucket}/{unique_key}"
+        cache_key = unique_key
         manifest_b64 = wait_for_manifest_es(
             elasticsearch_url, ES_MANIFEST_INDEX, cache_key, timeout=60,
         )
@@ -408,23 +408,23 @@ class TestHeaders:
 
 class TestManifestAlias:
     def test_manifest_alias_creates_copy(
-        self, proxy, proxy_get, unique_key, elasticsearch_url, test_bucket,
+        self, proxy, proxy_get, unique_key, elasticsearch_url,
     ):
         """POST with X-Xs3lerator-Link-Manifest creates an alias manifest in ES."""
         r = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r.status_code == 200
-        source_cache_key = f"{test_bucket}/{unique_key}"
+        source_cache_key = unique_key
         wait_for_manifest_es(elasticsearch_url, ES_MANIFEST_INDEX, source_cache_key)
 
         alias_key = f"{unique_key}-alias"
         resp = requests.post(
-            f"{proxy}/{test_bucket}/{alias_key}",
+            f"{proxy}/{alias_key}",
             headers={"X-Xs3lerator-Link-Manifest": unique_key},
             timeout=30,
         )
         assert resp.status_code == 204
 
-        alias_cache_key = f"{test_bucket}/{alias_key}"
+        alias_cache_key = alias_key
         alias_b64 = wait_for_manifest_es(
             elasticsearch_url, ES_MANIFEST_INDEX, alias_cache_key,
         )
@@ -433,18 +433,18 @@ class TestManifestAlias:
         assert alias_data[:4] == b"XS3M"
 
     def test_manifest_alias_serves_same_content(
-        self, proxy, proxy_get, unique_key, elasticsearch_url, test_bucket,
+        self, proxy, proxy_get, unique_key, elasticsearch_url,
     ):
         """Content served via an alias key should match the original."""
         payload = generate_payload(SMALL)
         r1 = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r1.status_code == 200
-        source_cache_key = f"{test_bucket}/{unique_key}"
+        source_cache_key = unique_key
         wait_for_manifest_es(elasticsearch_url, ES_MANIFEST_INDEX, source_cache_key)
 
         alias_key = f"{unique_key}-alias2"
         resp = requests.post(
-            f"{proxy}/{test_bucket}/{alias_key}",
+            f"{proxy}/{alias_key}",
             headers={"X-Xs3lerator-Link-Manifest": unique_key},
             timeout=30,
         )

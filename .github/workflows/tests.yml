@@ -25,24 +25,16 @@ jobs:
         run: cargo test
 
   integration-tests:
-    name: Integration tests (LocalStack + pytest)
+    name: Integration tests (Docker Compose + pytest)
     runs-on: ubuntu-latest
     needs: rust-tests
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build debug binary
-        run: cargo build
-
-      - name: Start LocalStack & Elasticsearch
-        run: docker compose up -d localstack elasticsearch --wait
+      - name: Start all services
+        run: docker compose up -d --build --wait
+        timeout-minutes: 10
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -55,18 +47,17 @@ jobs:
       - name: Run integration tests
         run: pytest tests/pytest/ -v --tb=short
         env:
+          PROXY_URL: http://localhost:8888
           LOCALSTACK_ENDPOINT: http://localhost:4566
           ELASTICSEARCH_URL: http://localhost:9200
-          RUST_LOG: xs3lerator=debug
+          TEST_SERVER_BIND_HOST: "0.0.0.0"
+          TEST_SERVER_HOST: host.docker.internal
 
       - name: Dump xs3lerator logs on failure
         if: failure()
-        run: |
-          for f in /tmp/pytest-of-*/pytest-*/xs3-temp*/xs3lerator.log; do
-            [ -f "$f" ] && echo "=== $f ===" && cat "$f"
-          done
+        run: docker compose logs xs3lerator --no-color --tail=500
 
-      - name: Dump LocalStack & Elasticsearch logs on failure
+      - name: Dump all service logs on failure
         if: failure()
         run: docker compose logs --no-color
 

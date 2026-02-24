@@ -1,35 +1,24 @@
 """Fixtures for xs3lerator integration tests.
 
-Supports two modes:
-
-  Docker Compose mode (CI or `docker compose up`):
-    Set PROXY_URL, LOCALSTACK_ENDPOINT, ELASTICSEARCH_URL, and TEST_SERVER_HOST env vars.
-    The test server binds to 0.0.0.0 so the container can reach it via
-    host.docker.internal.
-
-  Local mode (no Docker, default):
-    Builds the Rust binary, starts LocalStack and Elasticsearch (must already
-    be running), and launches xs3lerator directly.  Everything runs on localhost.
+Requires Docker Compose: all services (LocalStack, Elasticsearch, mount-s3,
+xs3lerator) must be running.  The test server runs on the host and is
+reached by the xs3lerator container via host.docker.internal.
 
 Environment variables:
-    PROXY_URL              xs3lerator base URL (skip build/launch if set)
+    PROXY_URL              xs3lerator base URL (required)
     LOCALSTACK_ENDPOINT    S3 endpoint        (default: http://localhost:4566)
     ELASTICSEARCH_URL      ES endpoint        (default: http://localhost:9200)
-    TEST_SERVER_BIND_HOST  Bind address        (default: 127.0.0.1)
+    TEST_SERVER_BIND_HOST  Bind address        (default: 0.0.0.0)
     TEST_SERVER_HOST       Host xs3lerator uses to reach the test server
-                           (default: 127.0.0.1, use host.docker.internal
-                            when xs3lerator runs in Docker)
+                           (default: host.docker.internal)
 """
 
 import base64
 import hashlib
-import json
 import os
 import socket
 import struct
-import subprocess
 import time
-from pathlib import Path
 from urllib.parse import quote as url_quote
 
 import boto3
@@ -42,14 +31,13 @@ from test_server import TestServer, generate_payload  # noqa: F401 (re-export)
 # Configuration from environment
 # ---------------------------------------------------------------------------
 
-PROXY_URL = os.environ.get("PROXY_URL")  # None → local mode
+PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8888")
 LOCALSTACK_ENDPOINT = os.environ.get("LOCALSTACK_ENDPOINT", "http://localhost:4566")
 ELASTICSEARCH_URL = os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200")
 ES_MANIFEST_INDEX = os.environ.get("XS3_ELASTICSEARCH_MANIFEST_INDEX", "xs3_manifests")
-TEST_SERVER_BIND_HOST = os.environ.get("TEST_SERVER_BIND_HOST", "127.0.0.1")
-TEST_SERVER_HOST = os.environ.get("TEST_SERVER_HOST", "127.0.0.1")
+TEST_SERVER_BIND_HOST = os.environ.get("TEST_SERVER_BIND_HOST", "0.0.0.0")
+TEST_SERVER_HOST = os.environ.get("TEST_SERVER_HOST", "host.docker.internal")
 TEST_BUCKET = "xs3lerator-test"
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _free_port() -> int:
@@ -58,12 +46,12 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_for_url(url: str, timeout: float = 20.0, interval: float = 0.3):
+def _wait_for_url(url: str, timeout: float = 30.0, interval: float = 0.5):
     deadline = time.monotonic() + timeout
     last_err = None
     while time.monotonic() < deadline:
         try:
-            requests.get(url, timeout=1)
+            requests.get(url, timeout=2)
             return
         except Exception as e:
             last_err = e
@@ -190,8 +178,8 @@ def test_bucket(s3_client):
 def test_server():
     """Start the test HTTP server.
 
-    Binds to TEST_SERVER_BIND_HOST so Docker containers can reach it
-    via host.docker.internal when running in compose mode.
+    Binds to 0.0.0.0 so the xs3lerator container can reach it via
+    host.docker.internal.
     """
     server = TestServer(host=TEST_SERVER_BIND_HOST)
     server.start()
@@ -201,93 +189,15 @@ def test_server():
 
 @pytest.fixture(scope="session")
 def test_server_external_url(test_server):
-    """Base URL that xs3lerator should use to reach the test server.
-
-    In Docker mode this uses host.docker.internal; locally it's 127.0.0.1.
-    """
+    """Base URL that xs3lerator should use to reach the test server."""
     return f"http://{TEST_SERVER_HOST}:{test_server.port}"
 
 
 @pytest.fixture(scope="session")
-def proxy_binary():
-    """Build the proxy in debug mode and return the binary path.
-
-    Skipped in Docker Compose mode where PROXY_URL is set.
-    """
-    if PROXY_URL:
-        pytest.skip("PROXY_URL set — using external proxy")
-    binary = PROJECT_ROOT / "target" / "debug" / "xs3lerator"
-    if not binary.exists():
-        subprocess.run(
-            ["cargo", "build", "--quiet"],
-            cwd=PROJECT_ROOT,
-            check=True,
-            timeout=300,
-        )
-    return binary
-
-
-@pytest.fixture(scope="session")
-def proxy(
-    proxy_binary,
-    localstack_endpoint,
-    elasticsearch_url,
-    test_bucket,
-    test_server,
-    tmp_path_factory,
-):
-    """Start xs3lerator and return its base URL.
-
-    In Docker Compose mode (PROXY_URL set), returns the external URL directly.
-    """
-    if PROXY_URL:
-        _wait_for_url(f"{PROXY_URL}/healthz", timeout=30)
-        return PROXY_URL
-
-    temp_dir = tmp_path_factory.mktemp("xs3-temp")
-    port = _free_port()
-    env = os.environ.copy()
-    env.update({
-        "RUST_LOG": "xs3lerator=debug",
-        "AWS_ACCESS_KEY_ID": "test",
-        "AWS_SECRET_ACCESS_KEY": "test",
-        "AWS_DEFAULT_REGION": "us-east-1",
-        "XS3_PORT": str(port),
-        "XS3_S3_ENDPOINT_URL": localstack_endpoint,
-        "XS3_S3_FORCE_PATH_STYLE": "true",
-        "XS3_S3_CONCURRENCY": "4",
-        "XS3_HTTP_CONCURRENCY": "4",
-        "XS3_MIN_CHUNK_SIZE": "5MiB",
-        "XS3_TEMP_DIR": str(temp_dir),
-        "XS3_ELASTICSEARCH_URL": elasticsearch_url,
-        "XS3_ELASTICSEARCH_MANIFEST_INDEX": ES_MANIFEST_INDEX,
-        "XS3_ELASTICSEARCH_REPLICAS": "0",
-        "XS3_ELASTICSEARCH_SHARDS": "1",
-    })
-    log_file = temp_dir / "xs3lerator.log"
-    log_fh = open(log_file, "w")
-    proc = subprocess.Popen(
-        [str(proxy_binary)],
-        env=env,
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-    )
-    base_url = f"http://127.0.0.1:{port}"
-    try:
-        _wait_for_url(f"{base_url}/healthz", timeout=20)
-    except RuntimeError:
-        proc.terminate()
-        log_fh.close()
-        stderr = log_file.read_text(errors="replace")[-4000:]
-        pytest.fail(f"xs3lerator failed to start:\n{stderr}")
-
-    yield base_url
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    log_fh.close()
+def proxy(localstack_endpoint, elasticsearch_url, test_bucket, test_server):
+    """Wait for xs3lerator to be ready and return its base URL."""
+    _wait_for_url(f"{PROXY_URL}/healthz", timeout=60)
+    return PROXY_URL
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +206,7 @@ def proxy(
 
 
 @pytest.fixture(scope="session")
-def proxy_get(proxy, test_bucket, test_server_external_url):
+def proxy_get(proxy, test_server_external_url):
     """Helper to make a GET to xs3lerator with proper contract headers.
 
     Usage:
@@ -325,7 +235,7 @@ def proxy_get(proxy, test_bucket, test_server_external_url):
         if extra_headers:
             headers.update(extra_headers)
         return requests.get(
-            f"{proxy}/{test_bucket}/{s3_key}",
+            f"{proxy}/{s3_key}",
             headers=headers,
             timeout=timeout,
         )
@@ -344,7 +254,7 @@ def unique_key():
 # ---------------------------------------------------------------------------
 
 DATA_PREFIX = "data/"
-CHUNK_SIZE = 5 * 1024 * 1024  # 5 MiB -- matches XS3_MIN_CHUNK_SIZE in proxy fixture
+CHUNK_SIZE = 5 * 1024 * 1024  # 5 MiB -- matches XS3_CHUNK_SIZE in docker-compose
 
 
 def _sha256(data: bytes) -> bytes:
@@ -394,10 +304,11 @@ def seed_cached_object(
     es_url: str = ELASTICSEARCH_URL,
     es_index: str = ES_MANIFEST_INDEX,
 ):
-    """Upload chunks to S3 and write manifest to Elasticsearch for cache hit tests.
+    """Upload chunks to S3 and write manifest to ES for cache-hit tests.
 
-    xs3lerator builds cache_key as "{bucket}/{key}", so the ES doc _id is
-    "{bucket}/{key}".
+    mount-s3 bridges S3 to the xs3lerator filesystem, so writing chunks
+    to S3 via boto3 is sufficient — they appear at the expected paths
+    inside the xs3lerator container.
     """
     manifest_bytes, chunks = build_manifest(payload, chunk_size)
 
@@ -405,8 +316,7 @@ def seed_cached_object(
         s3_key = _chunk_s3_key(chunk_hash)
         s3_client.put_object(Bucket=bucket, Key=s3_key, Body=chunk_data)
 
-    cache_key = f"{bucket}/{key}"
-    es_put_manifest(es_url, es_index, cache_key, manifest_bytes)
+    es_put_manifest(es_url, es_index, key, manifest_bytes)
 
 
 @pytest.fixture(scope="session")

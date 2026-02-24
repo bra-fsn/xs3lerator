@@ -12,19 +12,17 @@ use xs3lerator::config::AppConfig;
 use xs3lerator::download::DownloadManager;
 use xs3lerator::handler::AppState;
 use xs3lerator::manifest::ManifestCache;
-use xs3lerator::s3::{AwsUpstream, S3Uploader};
 use xs3lerator::server::build_router;
 
 fn test_config() -> AppConfig {
+    let data_dir = std::env::temp_dir().join("xs3-redirect-test-data");
+    std::fs::create_dir_all(&data_dir).ok();
     AppConfig {
         bind_ip: std::net::IpAddr::from([127, 0, 0, 1]),
         port: 0,
-        region: None,
-        s3_endpoint_url: None,
-        s3_force_path_style: false,
-        s3_concurrency: 4,
+        data_dir,
         http_concurrency: 4,
-        min_chunk_size: 5 * 1024 * 1024,
+        chunk_size: 5 * 1024 * 1024,
         temp_dir: std::env::temp_dir(),
         upstream_tls_skip_verify: false,
         data_prefix: "data/".to_string(),
@@ -33,8 +31,6 @@ fn test_config() -> AppConfig {
         elasticsearch_replicas: 0,
         elasticsearch_shards: 1,
         manifest_cache_size: 100,
-        chunk_cache_dir: None,
-        chunk_cache_max_size: 100 * 1024 * 1024 * 1024,
     }
 }
 
@@ -139,26 +135,19 @@ async fn handle_final_target() -> impl IntoResponse {
     )
 }
 
-async fn make_state() -> AppState {
-    let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new("us-east-1"))
-        .load()
-        .await;
-    let s3_client = aws_sdk_s3::Client::new(&sdk_config);
-
+fn make_state() -> AppState {
+    let config = test_config();
+    let data_dir = config.data_dir.clone();
     AppState {
-        config: Arc::new(test_config()),
-        s3_upstream: Arc::new(AwsUpstream::new(s3_client.clone())),
-        s3_uploader: Arc::new(S3Uploader::new(s3_client)),
+        config: Arc::new(config),
+        data_dir,
         downloads: Arc::new(DownloadManager::default()),
         trace: None,
         manifest_cache: Arc::new(ManifestCache::new(100)),
-        chunk_cache: None,
         es_client: None,
     }
 }
 
-/// Helper: send a GET through xs3lerator to the given upstream path.
 async fn proxy_get(
     client: &reqwest::Client,
     xs3_base: &str,
@@ -167,7 +156,7 @@ async fn proxy_get(
 ) -> reqwest::Response {
     let upstream_b64 = BASE64.encode(upstream_url);
     let mut req = client
-        .get(format!("{xs3_base}/test-bucket/test-key"))
+        .get(format!("{xs3_base}/test-key"))
         .header("X-Xs3lerator-Upstream-Url", &upstream_b64)
         .header("X-Xs3lerator-Cache-Skip", "true");
     if follow_redirects {
@@ -183,7 +172,7 @@ async fn proxy_get(
 #[tokio::test]
 async fn redirect_301_passed_through() {
     let upstream = start_mock_upstream().await;
-    let state = make_state().await;
+    let state = make_state();
     let xs3 = start_xs3lerator(state).await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -218,7 +207,7 @@ async fn redirect_301_passed_through() {
 #[tokio::test]
 async fn redirect_302_passed_through() {
     let upstream = start_mock_upstream().await;
-    let state = make_state().await;
+    let state = make_state();
     let xs3 = start_xs3lerator(state).await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -237,7 +226,7 @@ async fn redirect_302_passed_through() {
 #[tokio::test]
 async fn redirect_307_preserves_retry_after() {
     let upstream = start_mock_upstream().await;
-    let state = make_state().await;
+    let state = make_state();
     let xs3 = start_xs3lerator(state).await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -260,7 +249,7 @@ async fn redirect_307_preserves_retry_after() {
 #[tokio::test]
 async fn redirect_308_passed_through() {
     let upstream = start_mock_upstream().await;
-    let state = make_state().await;
+    let state = make_state();
     let xs3 = start_xs3lerator(state).await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -279,7 +268,7 @@ async fn redirect_308_passed_through() {
 #[tokio::test]
 async fn redirect_301_preserves_cache_headers() {
     let upstream = start_mock_upstream().await;
-    let state = make_state().await;
+    let state = make_state();
     let xs3 = start_xs3lerator(state).await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -316,7 +305,7 @@ async fn redirect_301_preserves_cache_headers() {
 #[tokio::test]
 async fn redirect_strips_contract_headers() {
     let upstream = start_mock_upstream().await;
-    let state = make_state().await;
+    let state = make_state();
     let xs3 = start_xs3lerator(state).await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -326,11 +315,7 @@ async fn redirect_strips_contract_headers() {
     let resp = proxy_get(&client, &xs3, &format!("{upstream}/redirect/301"), false).await;
 
     assert_eq!(resp.status(), 301);
-    // x-xs3lerator-cache-hit is an xs3lerator response header (expected)
     assert!(resp.headers().get("x-xs3lerator-cache-hit").is_some());
-    // But upstream x-xs3lerator-* headers should be stripped from the
-    // redirect response.  The mock doesn't send any, so just verify
-    // no unexpected contract headers leaked through.
     for (name, _) in resp.headers().iter() {
         if name.as_str().starts_with("x-xs3lerator-") && name.as_str() != "x-xs3lerator-cache-hit"
         {
@@ -349,17 +334,13 @@ async fn redirect_strips_contract_headers() {
 #[tokio::test]
 async fn follow_redirects_follows_single_redirect() {
     let upstream = start_mock_upstream().await;
-    let state = make_state().await;
+    let state = make_state();
     let xs3 = start_xs3lerator(state).await;
-    // Client doesn't follow redirects — we want to see what xs3lerator returns
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
 
-    // With follow_redirects, xs3lerator should follow the chain and return
-    // the final target's response (200). The chain redirect's Location
-    // points to a relative path on the same mock server.
     let resp = proxy_get(
         &client,
         &xs3,
@@ -376,14 +357,13 @@ async fn follow_redirects_follows_single_redirect() {
 #[tokio::test]
 async fn without_follow_redirects_chain_returns_first_redirect() {
     let upstream = start_mock_upstream().await;
-    let state = make_state().await;
+    let state = make_state();
     let xs3 = start_xs3lerator(state).await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
 
-    // Without follow_redirects, only the first 302 is returned
     let resp = proxy_get(
         &client,
         &xs3,
@@ -406,7 +386,7 @@ async fn without_follow_redirects_chain_returns_first_redirect() {
 #[tokio::test]
 async fn non_redirect_200_unaffected() {
     let upstream = start_mock_upstream().await;
-    let state = make_state().await;
+    let state = make_state();
     let xs3 = start_xs3lerator(state).await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())

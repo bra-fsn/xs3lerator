@@ -8,7 +8,6 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use crate::chunk_cache::ChunkCache;
 use crate::chunk_upload;
 use crate::config::AppConfig;
 use crate::download::{
@@ -20,7 +19,6 @@ use crate::headers::{filter_upstream_headers, ContractHeaders};
 use crate::manifest::ManifestCache;
 use crate::planner::compute_chunk_plan;
 use crate::range::parse_range_header;
-use crate::s3::S3Uploader;
 use crate::trace::{trace_log, TraceWriter};
 
 /// Fetch a file from an upstream HTTP(S) URL, buffer through per-chunk temp
@@ -57,15 +55,12 @@ pub async fn fetch_upstream(
     config: &AppConfig,
     contract: &ContractHeaders,
     client_headers: &axum::http::HeaderMap,
-    s3_bucket: &str,
-    s3_key: &str,
     cache_key: &str,
     client_range: Option<&str>,
     downloads: &DownloadManager,
-    s3_uploader: Option<Arc<S3Uploader>>,
+    data_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
     manifest_cache: Option<Arc<ManifestCache>>,
-    chunk_cache: Option<Arc<ChunkCache>>,
     es_client: Option<Arc<EsClient>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let upstream_url = contract
@@ -78,7 +73,7 @@ pub async fn fetch_upstream(
     {
         let (existing, is_new) = downloads.get_or_create(cache_key, || {
             // Placeholder — will be replaced below if we're the creator.
-            Arc::new(InFlightDownload::new(0, config.min_chunk_size))
+            Arc::new(InFlightDownload::new(0, config.chunk_size))
         });
         if !is_new {
             let full_size = existing.object_size;
@@ -146,7 +141,7 @@ pub async fn fetch_upstream(
             "upstream returned redirect, passing through to client"
         );
         return Ok(UpstreamResult {
-            download: Arc::new(InFlightDownload::new(0, config.min_chunk_size)),
+            download: Arc::new(InFlightDownload::new(0, config.chunk_size)),
             content_type: None,
             etag: None,
             last_modified: None,
@@ -164,7 +159,7 @@ pub async fn fetch_upstream(
         let status_code = status.as_u16();
         warn!(status = status_code, "upstream returned error, passing through");
         return Ok(UpstreamResult {
-            download: Arc::new(InFlightDownload::new(0, config.min_chunk_size)),
+            download: Arc::new(InFlightDownload::new(0, config.chunk_size)),
             content_type: None,
             etag: None,
             last_modified: None,
@@ -226,7 +221,7 @@ pub async fn fetch_upstream(
     }));
 
     if let Some(file_size) = content_length {
-        if can_parallel && file_size > config.min_chunk_size {
+        if can_parallel && file_size > config.chunk_size {
             return start_parallel_upstream_download(
                 config,
                 upstream_url,
@@ -235,10 +230,8 @@ pub async fn fetch_upstream(
                 response,
                 file_size,
                 cache_key,
-                s3_bucket,
-                s3_key,
                 downloads,
-                s3_uploader,
+                data_dir,
                 trace,
                 client_range,
                 content_type,
@@ -247,7 +240,6 @@ pub async fn fetch_upstream(
                 cache_control,
                 Some(all_upstream_headers),
                 manifest_cache.clone(),
-                chunk_cache.clone(),
                 es_client.clone(),
             )
             .await;
@@ -258,10 +250,8 @@ pub async fn fetch_upstream(
             response,
             Some(file_size),
             cache_key,
-            s3_bucket,
-            s3_key,
             downloads,
-            s3_uploader,
+            data_dir,
             trace,
             content_type,
             etag,
@@ -269,23 +259,20 @@ pub async fn fetch_upstream(
             cache_control,
             Some(all_upstream_headers),
             manifest_cache,
-            chunk_cache,
             es_client,
         )
         .await;
     }
 
-    // Chunked / unknown size — buffer through sequential download with S3 cache
-    info!("upstream response is chunked/unknown size, using sequential download with S3 cache");
+    // Chunked / unknown size — buffer through sequential download
+    info!("upstream response is chunked/unknown size, using sequential download");
     start_sequential_download(
         config,
         response,
         None,
         cache_key,
-        s3_bucket,
-        s3_key,
         downloads,
-        s3_uploader,
+        data_dir,
         trace,
         content_type,
         etag,
@@ -293,7 +280,6 @@ pub async fn fetch_upstream(
         cache_control,
         Some(all_upstream_headers),
         manifest_cache,
-        chunk_cache,
         es_client,
     )
     .await
@@ -308,10 +294,8 @@ async fn start_parallel_upstream_download(
     initial_response: reqwest::Response,
     file_size: u64,
     cache_key: &str,
-    s3_bucket: &str,
-    _s3_key: &str,
     downloads: &DownloadManager,
-    s3_uploader: Option<Arc<S3Uploader>>,
+    data_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
     client_range: Option<&str>,
     content_type: Option<String>,
@@ -320,10 +304,9 @@ async fn start_parallel_upstream_download(
     cache_control: Option<String>,
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
     _manifest_cache: Option<Arc<ManifestCache>>,
-    chunk_cache: Option<Arc<ChunkCache>>,
     es_client: Option<Arc<EsClient>>,
 ) -> Result<UpstreamResult, ProxyError> {
-    let plan = compute_chunk_plan(file_size, config.http_concurrency, config.min_chunk_size);
+    let plan = compute_chunk_plan(file_size, config.http_concurrency, config.chunk_size);
 
     let download = Arc::new(InFlightDownload::new(file_size, plan.chunk_size));
     let (download, is_new) = downloads.get_or_create(cache_key, || download);
@@ -349,7 +332,7 @@ async fn start_parallel_upstream_download(
         if is_enospc(&e) {
             warn!("ENOSPC: degrading to direct passthrough (parallel)");
             return Ok(UpstreamResult {
-                download: Arc::new(InFlightDownload::new(0, config.min_chunk_size)),
+                download: Arc::new(InFlightDownload::new(0, config.chunk_size)),
                 content_type,
                 etag,
                 last_modified,
@@ -372,18 +355,14 @@ async fn start_parallel_upstream_download(
         }
     }
 
-    // Spawn content-addressed chunk uploads to S3
-    if let Some(uploader) = s3_uploader {
-        chunk_upload::spawn_chunk_uploads(
-            uploader,
-            s3_bucket.to_string(),
-            cache_key.to_string(),
-            config.data_prefix.clone(),
-            download.clone(),
-            chunk_cache.clone(),
-            es_client,
-        );
-    }
+    // Spawn content-addressed chunk persistence to mounted filesystem
+    chunk_upload::spawn_chunk_persist(
+        data_dir.to_path_buf(),
+        config.data_prefix.clone(),
+        cache_key.to_string(),
+        download.clone(),
+        es_client,
+    );
 
     let temp_dir = config.temp_dir.clone();
     let dl = download.clone();
@@ -807,10 +786,8 @@ async fn start_sequential_download(
     response: reqwest::Response,
     file_size: Option<u64>,
     cache_key: &str,
-    s3_bucket: &str,
-    _s3_key: &str,
     downloads: &DownloadManager,
-    s3_uploader: Option<Arc<S3Uploader>>,
+    data_dir: &std::path::Path,
     _trace: &Option<Arc<TraceWriter>>,
     content_type: Option<String>,
     etag: Option<String>,
@@ -818,13 +795,12 @@ async fn start_sequential_download(
     cache_control: Option<String>,
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
     _manifest_cache: Option<Arc<ManifestCache>>,
-    chunk_cache: Option<Arc<ChunkCache>>,
     es_client: Option<Arc<EsClient>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let is_unknown_size = file_size.is_none();
     let effective_size = file_size
-        .unwrap_or(config.min_chunk_size * MAX_UNKNOWN_SIZE_CHUNKS);
-    let chunk_size = config.min_chunk_size;
+        .unwrap_or(config.chunk_size * MAX_UNKNOWN_SIZE_CHUNKS);
+    let chunk_size = config.chunk_size;
 
     let download = Arc::new(InFlightDownload::new(effective_size, chunk_size));
     let (download, is_new) = downloads.get_or_create(cache_key, || download);
@@ -850,7 +826,7 @@ async fn start_sequential_download(
         if is_enospc(&e) {
             warn!("ENOSPC: degrading to direct passthrough (sequential)");
             return Ok(UpstreamResult {
-                download: Arc::new(InFlightDownload::new(0, config.min_chunk_size)),
+                download: Arc::new(InFlightDownload::new(0, config.chunk_size)),
                 content_type,
                 etag,
                 last_modified,
@@ -866,27 +842,20 @@ async fn start_sequential_download(
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
     }
 
-    // For known-size: spawn content-addressed chunk uploads immediately and pre-create temp files.
-    // For unknown-size: defer upload until stream completes (actual size known); create temp files lazily.
-    let s3_uploader_for_task: Option<Arc<S3Uploader>>;
-    let chunk_cache_for_task: Option<Arc<ChunkCache>>;
+    // For known-size: spawn content-addressed chunk persistence immediately and pre-create temp files.
+    // For unknown-size: defer persistence until stream completes (actual size known); create temp files lazily.
+    let data_dir_for_task: Option<std::path::PathBuf>;
     if is_unknown_size {
-        s3_uploader_for_task = s3_uploader;
-        chunk_cache_for_task = chunk_cache;
+        data_dir_for_task = Some(data_dir.to_path_buf());
     } else {
-        if let Some(uploader) = s3_uploader {
-            chunk_upload::spawn_chunk_uploads(
-                uploader,
-                s3_bucket.to_string(),
-                cache_key.to_string(),
-                config.data_prefix.clone(),
-                download.clone(),
-                chunk_cache.clone(),
-                es_client.clone(),
-            );
-        }
-        s3_uploader_for_task = None;
-        chunk_cache_for_task = None;
+        chunk_upload::spawn_chunk_persist(
+            data_dir.to_path_buf(),
+            config.data_prefix.clone(),
+            cache_key.to_string(),
+            download.clone(),
+            es_client.clone(),
+        );
+        data_dir_for_task = None;
 
         for idx in 0..download.chunk_count() {
             let chunk_file = create_temp_chunk_file(&config.temp_dir)
@@ -899,7 +868,6 @@ async fn start_sequential_download(
     let ck = cache_key.to_string();
     let dm_ptr = downloads as *const DownloadManager as usize;
     let temp_dir = config.temp_dir.clone();
-    let s3b = s3_bucket.to_string();
     let data_prefix = config.data_prefix.clone();
     let es_for_task = es_client;
 
@@ -983,15 +951,13 @@ async fn start_sequential_download(
 
         if is_unknown_size {
             dl.mark_stream_complete(global_offset);
-            if let Some(uploader) = s3_uploader_for_task {
+            if let Some(dd) = data_dir_for_task {
                 if global_offset > 0 {
-                    chunk_upload::spawn_chunk_uploads(
-                        uploader,
-                        s3b,
-                        ck.clone(),
+                    chunk_upload::spawn_chunk_persist(
+                        dd,
                         data_prefix,
+                        ck.clone(),
                         dl.clone(),
-                        chunk_cache_for_task,
                         es_for_task,
                     );
                 }
