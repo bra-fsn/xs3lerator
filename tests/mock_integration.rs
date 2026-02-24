@@ -4,7 +4,6 @@ use std::sync::Arc;
 use xs3lerator::config::AppConfig;
 use xs3lerator::download::DownloadManager;
 use xs3lerator::handler::AppState;
-use xs3lerator::manifest::ManifestCache;
 use xs3lerator::server::build_router;
 
 fn test_config() -> AppConfig {
@@ -23,7 +22,6 @@ fn test_config() -> AppConfig {
         elasticsearch_manifest_index: "xs3_manifests".to_string(),
         elasticsearch_replicas: 0,
         elasticsearch_shards: 1,
-        manifest_cache_size: 100,
     }
 }
 
@@ -47,7 +45,6 @@ fn make_state() -> AppState {
         data_dir,
         downloads: Arc::new(DownloadManager::default()),
         trace: None,
-        manifest_cache: Arc::new(ManifestCache::new(100)),
         es_client: None,
     }
 }

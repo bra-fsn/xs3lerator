@@ -16,7 +16,6 @@ use crate::download::{
 use crate::error::ProxyError;
 use crate::es_client::EsClient;
 use crate::headers::{filter_upstream_headers, ContractHeaders};
-use crate::manifest::ManifestCache;
 use crate::planner::compute_chunk_plan;
 use crate::range::parse_range_header;
 use crate::trace::{trace_log, TraceWriter};
@@ -60,7 +59,6 @@ pub async fn fetch_upstream(
     downloads: &DownloadManager,
     data_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
-    manifest_cache: Option<Arc<ManifestCache>>,
     es_client: Option<Arc<EsClient>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let upstream_url = contract
@@ -239,7 +237,6 @@ pub async fn fetch_upstream(
                 last_modified,
                 cache_control,
                 Some(all_upstream_headers),
-                manifest_cache.clone(),
                 es_client.clone(),
             )
             .await;
@@ -258,7 +255,6 @@ pub async fn fetch_upstream(
             last_modified,
             cache_control,
             Some(all_upstream_headers),
-            manifest_cache,
             es_client,
         )
         .await;
@@ -279,7 +275,6 @@ pub async fn fetch_upstream(
         last_modified,
         cache_control,
         Some(all_upstream_headers),
-        manifest_cache,
         es_client,
     )
     .await
@@ -303,7 +298,6 @@ async fn start_parallel_upstream_download(
     last_modified: Option<String>,
     cache_control: Option<String>,
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
-    _manifest_cache: Option<Arc<ManifestCache>>,
     es_client: Option<Arc<EsClient>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let plan = compute_chunk_plan(file_size, config.http_concurrency, config.chunk_size);
@@ -794,7 +788,6 @@ async fn start_sequential_download(
     last_modified: Option<String>,
     cache_control: Option<String>,
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
-    _manifest_cache: Option<Arc<ManifestCache>>,
     es_client: Option<Arc<EsClient>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let is_unknown_size = file_size.is_none();
@@ -842,21 +835,18 @@ async fn start_sequential_download(
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
     }
 
-    // For known-size: spawn content-addressed chunk persistence immediately and pre-create temp files.
-    // For unknown-size: defer persistence until stream completes (actual size known); create temp files lazily.
-    let data_dir_for_task: Option<std::path::PathBuf>;
-    if is_unknown_size {
-        data_dir_for_task = Some(data_dir.to_path_buf());
-    } else {
-        chunk_upload::spawn_chunk_persist(
-            data_dir.to_path_buf(),
-            config.data_prefix.clone(),
-            cache_key.to_string(),
-            download.clone(),
-            es_client.clone(),
-        );
-        data_dir_for_task = None;
+    // Spawn persist immediately for both known-size and unknown-size.
+    // For unknown-size the persist task will wait for stream completion
+    // before processing chunks.
+    chunk_upload::spawn_chunk_persist(
+        data_dir.to_path_buf(),
+        config.data_prefix.clone(),
+        cache_key.to_string(),
+        download.clone(),
+        es_client.clone(),
+    );
 
+    if !is_unknown_size {
         for idx in 0..download.chunk_count() {
             let chunk_file = create_temp_chunk_file(&config.temp_dir)
                 .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
@@ -868,8 +858,6 @@ async fn start_sequential_download(
     let ck = cache_key.to_string();
     let dm_ptr = downloads as *const DownloadManager as usize;
     let temp_dir = config.temp_dir.clone();
-    let data_prefix = config.data_prefix.clone();
-    let es_for_task = es_client;
 
     tokio::spawn(async move {
         let downloads = unsafe { &*(dm_ptr as *const DownloadManager) };
@@ -951,17 +939,6 @@ async fn start_sequential_download(
 
         if is_unknown_size {
             dl.mark_stream_complete(global_offset);
-            if let Some(dd) = data_dir_for_task {
-                if global_offset > 0 {
-                    chunk_upload::spawn_chunk_persist(
-                        dd,
-                        data_prefix,
-                        ck.clone(),
-                        dl.clone(),
-                        es_for_task,
-                    );
-                }
-            }
         } else {
             for idx in 0..dl.chunk_count() {
                 if !dl.is_chunk_done(idx) && !dl.has_failed() {

@@ -20,7 +20,6 @@ mod upstream_fetcher;
 
 use config::{AppConfig, CliArgs};
 use handler::AppState;
-use manifest::ManifestCache;
 use trace::TraceWriter;
 
 #[tokio::main]
@@ -45,8 +44,6 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(TraceWriter::new(Box::new(file)))
     });
 
-    let manifest_cache = Arc::new(ManifestCache::new(config.manifest_cache_size));
-
     let es_client = if let Some(ref es_url) = config.elasticsearch_url {
         let client = es_client::EsClient::new(es_url, &config.elasticsearch_manifest_index);
         client
@@ -69,7 +66,6 @@ async fn main() -> anyhow::Result<()> {
         data_dir,
         downloads: Arc::new(download::DownloadManager::default()),
         trace: trace_writer,
-        manifest_cache,
         es_client,
     };
 

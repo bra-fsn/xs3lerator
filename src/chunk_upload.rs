@@ -104,6 +104,13 @@ async fn run_chunk_persist(
     download: &InFlightDownload,
     es_client: Option<&EsClient>,
 ) -> Result<(), ProxyError> {
+    // For unknown-size (chunked) responses the persist task is spawned
+    // immediately but must wait until the stream finishes to know the
+    // actual number of chunks.
+    if !download.is_stream_complete() {
+        download.wait_for_stream_complete().await;
+    }
+
     let num_chunks = if download.is_stream_complete() {
         let total = download.actual_total_bytes();
         if total == 0 {

@@ -80,10 +80,6 @@ pub struct CliArgs {
     /// Number of Elasticsearch index shards.
     #[arg(long, env = "XS3_ELASTICSEARCH_SHARDS", default_value_t = 9)]
     pub elasticsearch_shards: u32,
-
-    /// In-memory LRU cache capacity for manifests.
-    #[arg(long, env = "XS3_MANIFEST_CACHE_SIZE", default_value_t = 10_000)]
-    pub manifest_cache_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +96,6 @@ pub struct AppConfig {
     pub elasticsearch_manifest_index: String,
     pub elasticsearch_replicas: u32,
     pub elasticsearch_shards: u32,
-    pub manifest_cache_size: usize,
 }
 
 impl TryFrom<CliArgs> for AppConfig {
@@ -136,7 +131,6 @@ impl TryFrom<CliArgs> for AppConfig {
             elasticsearch_manifest_index: args.elasticsearch_manifest_index,
             elasticsearch_replicas: args.elasticsearch_replicas,
             elasticsearch_shards: args.elasticsearch_shards,
-            manifest_cache_size: args.manifest_cache_size,
         })
     }
 }

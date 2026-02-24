@@ -21,7 +21,7 @@ use crate::es_client::EsClient;
 use crate::headers::{
     self, parse_key, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
 };
-use crate::manifest::{Manifest, ManifestCache, hash_to_chunk_path};
+use crate::manifest::{Manifest, hash_to_chunk_path};
 use crate::range::{parse_range_header, ByteRange};
 use crate::trace::{trace_log, TraceWriter};
 use crate::upstream_fetcher;
@@ -33,7 +33,6 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub downloads: Arc<DownloadManager>,
     pub trace: Option<Arc<TraceWriter>>,
-    pub manifest_cache: Arc<ManifestCache>,
     pub es_client: Option<Arc<EsClient>>,
 }
 
@@ -90,7 +89,7 @@ pub async fn handle_post(
         }
     }
 
-    // Read source manifest (LRU or ES)
+    // Read source manifest from ES
     let manifest = fetch_manifest(&state, &source_key).await?;
 
     // Write manifest under target key to ES
@@ -98,11 +97,6 @@ pub async fn handle_post(
     if let Some(ref es) = state.es_client {
         es.put_manifest(&target_key, manifest_bytes).await?;
     }
-
-    // Cache under target key in LRU
-    state
-        .manifest_cache
-        .insert(target_key.clone(), manifest);
 
     info!(target = target_key, "manifest alias created");
 
@@ -137,7 +131,6 @@ pub async fn handle_get(
     }));
 
     if contract.cache_skip {
-        state.manifest_cache.evict(&key);
         return handle_upstream_path(
             &state,
             &contract,
@@ -325,15 +318,11 @@ fn make_file_stream(
     }
 }
 
-/// Fetch manifest from LRU cache or Elasticsearch.
+/// Fetch manifest from Elasticsearch.
 async fn fetch_manifest(
     state: &AppState,
     cache_key: &str,
 ) -> ProxyResult<Arc<Manifest>> {
-    if let Some(cached) = state.manifest_cache.get(cache_key) {
-        return Ok(cached);
-    }
-
     let manifest = if let Some(ref es) = state.es_client {
         es.get_manifest(cache_key).await?
     } else {
@@ -343,11 +332,7 @@ async fn fetch_manifest(
     let manifest: Manifest = manifest
         .ok_or_else(|| ProxyError::NotFound(format!("no manifest for {cache_key}")))?;
 
-    let arc = Arc::new(manifest);
-    state
-        .manifest_cache
-        .insert(cache_key.to_string(), arc.clone());
-    Ok(arc)
+    Ok(Arc::new(manifest))
 }
 
 /// Headers that should not be forwarded from upstream to the client.
@@ -402,7 +387,6 @@ async fn handle_upstream_path(
         &state.downloads,
         &state.data_dir,
         &state.trace,
-        Some(state.manifest_cache.clone()),
         state.es_client.clone(),
     )
     .await?;

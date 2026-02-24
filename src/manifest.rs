@@ -1,10 +1,6 @@
 use std::fmt;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Arc;
-
-use lru::LruCache;
-use parking_lot::Mutex;
 
 use crate::error::ProxyError;
 
@@ -131,36 +127,6 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// ---------------------------------------------------------------------------
-// In-memory manifest LRU cache
-// ---------------------------------------------------------------------------
-
-pub struct ManifestCache {
-    inner: Mutex<LruCache<String, Arc<Manifest>>>,
-}
-
-impl ManifestCache {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            inner: Mutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(capacity.max(1)).unwrap(),
-            )),
-        }
-    }
-
-    pub fn get(&self, key: &str) -> Option<Arc<Manifest>> {
-        self.inner.lock().get(key).cloned()
-    }
-
-    pub fn insert(&self, key: String, manifest: Arc<Manifest>) {
-        self.inner.lock().put(key, manifest);
-    }
-
-    pub fn evict(&self, key: &str) {
-        self.inner.lock().pop(key);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,17 +183,6 @@ mod tests {
         let mut data = sample_manifest().serialize();
         data[0] = 0;
         assert!(Manifest::deserialize(&data).is_err());
-    }
-
-    #[test]
-    fn manifest_cache_basics() {
-        let cache = ManifestCache::new(2);
-        let m = Arc::new(sample_manifest());
-        cache.insert("key1".into(), m.clone());
-        assert!(cache.get("key1").is_some());
-        assert!(cache.get("key2").is_none());
-        cache.evict("key1");
-        assert!(cache.get("key1").is_none());
     }
 
     #[test]

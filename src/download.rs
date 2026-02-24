@@ -276,6 +276,21 @@ impl InFlightDownload {
         self.stream_complete.load(Ordering::Acquire)
     }
 
+    /// Wait until the upstream stream has finished (unknown-size responses).
+    /// Returns immediately if the stream is already complete or if the
+    /// download failed/was cancelled.
+    pub async fn wait_for_stream_complete(&self) {
+        loop {
+            if self.stream_complete.load(Ordering::Acquire) {
+                return;
+            }
+            if self.has_failed() || self.is_cancelled() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+
     pub fn actual_total_bytes(&self) -> u64 {
         self.actual_total_bytes.load(Ordering::Acquire)
     }
