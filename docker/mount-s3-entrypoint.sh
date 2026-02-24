@@ -15,6 +15,7 @@ done
 echo "S3 endpoint ready."
 
 echo "Mounting s3://${BUCKET} to ${MOUNTPOINT}"
+mkdir -p "${MOUNTPOINT}"
 exec mount-s3 \
     --endpoint-url "${ENDPOINT}" \
     --region "${REGION}" \
