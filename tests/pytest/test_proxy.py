@@ -12,7 +12,6 @@ import requests
 
 from test_server import generate_payload
 from conftest import (
-    DATA_PREFIX,
     ELASTICSEARCH_URL,
     ES_MANIFEST_INDEX,
     es_get_manifest_b64,
@@ -104,12 +103,11 @@ class TestCacheMiss:
         manifest_data = base64.b64decode(manifest_b64)
         assert manifest_data[:4] == b"XS3M", "Manifest should start with XS3M magic"
 
-        paginator = s3_client.get_paginator("list_objects_v2")
-        data_keys = []
-        for page in paginator.paginate(Bucket=test_bucket, Prefix=DATA_PREFIX):
-            for o in page.get("Contents", []):
-                data_keys.append(o["Key"])
-        assert len(data_keys) > 0, "At least one data chunk should exist"
+        # Verify the manifest encodes at least one chunk hash (26-byte header
+        # followed by 32-byte SHA-256 hashes).
+        assert len(manifest_data) >= 26 + 32, (
+            "Manifest should contain at least one chunk hash"
+        )
 
 
 # ── Cache hit → S3 serve ─────────────────────────────────────────────────

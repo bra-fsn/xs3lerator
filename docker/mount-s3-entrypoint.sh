@@ -23,6 +23,7 @@ exec mount-s3 \
     --allow-overwrite \
     --allow-other \
     --force-path-style \
+    --upload-checksums off \
     --uid "${MOUNT_UID:-0}" \
     --gid "${MOUNT_GID:-0}" \
     --dir-mode 0777 \
