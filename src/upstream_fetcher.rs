@@ -68,7 +68,9 @@ pub async fn fetch_upstream(
 
     // Check for an existing in-flight download for the same cache key.
     // This handles the deduplication case within a single instance.
-    {
+    // When cache_skip is set the caller explicitly wants a fresh upstream
+    // fetch (e.g. AlwaysUpstream / no-store), so bypass the dedup check.
+    if !contract.cache_skip {
         let (existing, is_new) = downloads.get_or_create(cache_key, || {
             // Placeholder — will be replaced below if we're the creator.
             Arc::new(InFlightDownload::new(0, config.chunk_size))
