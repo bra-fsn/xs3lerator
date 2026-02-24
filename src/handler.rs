@@ -13,7 +13,7 @@ use futures::StreamExt;
 use nix::fcntl::{posix_fadvise, PosixFadviseAdvice};
 use serde_json::json;
 use axum::http::header::CONTENT_LENGTH;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 use crate::download::{InFlightDownload, DownloadManager};
@@ -224,8 +224,15 @@ pub async fn handle_get(
     }
 }
 
-/// Serve from cache: open chunk files directly from data_dir with
-/// posix_fadvise prefetching.
+/// Chunk file handle ready for streaming, opened and fadvise'd by the
+/// prefetch pipeline.
+struct PreparedChunk {
+    file: Arc<std::fs::File>,
+    chunk_len: u64,
+}
+
+/// Serve from cache using a prefetch pipeline: a background task opens and
+/// warms chunk files in parallel while the stream task reads sequentially.
 async fn handle_cache_hit(
     state: &AppState,
     cache_key: &str,
@@ -245,32 +252,68 @@ async fn handle_cache_hit(
     };
 
     let chunk_range = manifest.chunks_for_range(serve_start, serve_end);
-    let data_prefix = &state.config.data_prefix;
+    let data_prefix = state.config.data_prefix.clone();
+    let data_dir = state.data_dir.clone();
+    let prefetch_window = state.config.prefetch_window;
+    let open_parallelism = state.config.open_parallelism;
 
-    let mut chunk_files: Vec<(usize, Arc<std::fs::File>, u64)> = Vec::new();
-    for idx in chunk_range.clone() {
-        let hash = &manifest.hashes[idx];
-        let rel_path = hash_to_chunk_path(hash, data_prefix);
-        let full_path = state.data_dir.join(&rel_path);
-        let file = std::fs::File::open(&full_path).map_err(|e| {
-            ProxyError::NotFound(format!("chunk file {}: {e}", full_path.display()))
-        })?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<PreparedChunk>(prefetch_window);
+
+    let chunks_meta: Vec<(usize, [u8; 32], u64)> = chunk_range.clone().map(|idx| {
+        let hash = manifest.hashes[idx];
         let chunk_len = if idx == manifest.num_chunks() - 1 {
             manifest.total_size - (idx as u64 * manifest.chunk_size)
         } else {
             manifest.chunk_size
         };
-        chunk_files.push((idx, Arc::new(file), chunk_len));
-    }
+        (idx, hash, chunk_len)
+    }).collect();
 
-    for (_, file, chunk_len) in &chunk_files {
-        let _ = posix_fadvise(
-            file.as_raw_fd(),
-            0,
-            *chunk_len as i64,
-            PosixFadviseAdvice::POSIX_FADV_WILLNEED,
-        );
-    }
+    tokio::spawn(async move {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(open_parallelism));
+        let mut join_handles = Vec::with_capacity(chunks_meta.len());
+
+        for (_idx, hash, chunk_len) in chunks_meta {
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let tx = tx.clone();
+            let dir = data_dir.clone();
+            let prefix = data_prefix.clone();
+
+            let handle = tokio::task::spawn_blocking(move || {
+                let rel_path = hash_to_chunk_path(&hash, &prefix);
+                let full_path = dir.join(&rel_path);
+                let file = match std::fs::File::open(&full_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(path = %full_path.display(), error = %e, "prefetch open failed");
+                        drop(permit);
+                        return;
+                    }
+                };
+
+                let _ = posix_fadvise(
+                    file.as_raw_fd(),
+                    0,
+                    chunk_len as i64,
+                    PosixFadviseAdvice::POSIX_FADV_WILLNEED,
+                );
+
+                let _ = tx.blocking_send(PreparedChunk {
+                    file: Arc::new(file),
+                    chunk_len,
+                });
+                drop(permit);
+            });
+            join_handles.push(handle);
+        }
+
+        for h in join_handles {
+            let _ = h.await;
+        }
+    });
 
     let first_chunk_start = chunk_range.start as u64 * manifest.chunk_size;
     let offset_in_first_chunk = serve_start - first_chunk_start;
@@ -307,7 +350,7 @@ async fn handle_cache_hit(
     );
     resp_headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
 
-    let stream = make_file_stream(chunk_files, offset_in_first_chunk, serve_len);
+    let stream = make_prefetch_stream(rx, offset_in_first_chunk, serve_len);
     let body = Body::from_stream(stream);
     let mut response = Response::builder()
         .status(status)
@@ -318,9 +361,9 @@ async fn handle_cache_hit(
     Ok(response)
 }
 
-/// Stream data directly from opened chunk files.
-fn make_file_stream(
-    chunk_files: Vec<(usize, Arc<std::fs::File>, u64)>,
+/// Stream data from chunk files received through the prefetch channel.
+fn make_prefetch_stream(
+    mut rx: tokio::sync::mpsc::Receiver<PreparedChunk>,
     offset_in_first_chunk: u64,
     read_len: u64,
 ) -> impl futures::Stream<Item = Result<Bytes, ProxyError>> {
@@ -332,7 +375,7 @@ fn make_file_stream(
         let mut remaining = read_len;
         let mut first = true;
 
-        for (_idx, file, chunk_len) in &chunk_files {
+        while let Some(chunk) = rx.recv().await {
             let start_offset = if first {
                 first = false;
                 offset_in_first_chunk
@@ -340,14 +383,14 @@ fn make_file_stream(
                 0
             };
 
-            let readable_in_chunk = chunk_len - start_offset;
+            let readable_in_chunk = chunk.chunk_len - start_offset;
             let to_read_from_chunk = min(readable_in_chunk, remaining);
             let mut pos = start_offset;
             let mut left = to_read_from_chunk;
 
             while left > 0 {
                 let buf_size = min(left, 256 * 1024) as usize;
-                let file_clone = file.clone();
+                let file_clone = chunk.file.clone();
                 let offset = pos;
 
                 let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {

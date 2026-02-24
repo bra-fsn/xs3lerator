@@ -21,6 +21,15 @@ fn test_config() -> AppConfig {
         elasticsearch_url: None,
         elasticsearch_manifest_index: "passsage_meta".to_string(),
         passthrough: false,
+        prefetch_window: 16,
+        open_parallelism: 8,
+    }
+}
+
+fn test_config_with_dir(data_dir: std::path::PathBuf) -> AppConfig {
+    AppConfig {
+        data_dir,
+        ..test_config()
     }
 }
 
@@ -38,6 +47,18 @@ async fn start_server(state: AppState) -> String {
 
 fn make_state() -> AppState {
     let config = test_config();
+    let data_dir = config.data_dir.clone();
+    AppState {
+        config: Arc::new(config),
+        data_dir,
+        downloads: Arc::new(DownloadManager::default()),
+        trace: None,
+        es_client: None,
+        http_pool: Arc::new(xs3lerator::http_pool::HttpClientPool::new()),
+    }
+}
+
+fn make_state_with_config(config: AppConfig) -> AppState {
     let data_dir = config.data_dir.clone();
     AppState {
         config: Arc::new(config),
@@ -106,4 +127,152 @@ async fn get_without_upstream_url_returns_error() {
         .await
         .unwrap();
     assert!(resp.status().is_client_error() || resp.status().is_server_error());
+}
+
+#[tokio::test]
+async fn cache_hit_multi_chunk_prefetch_pipeline() {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use xs3lerator::manifest::{hash_to_chunk_path, Manifest};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+
+    let chunk_size: u64 = 1024;
+    let num_chunks = 3;
+    let last_chunk_len: u64 = 500;
+    let total_size = chunk_size * (num_chunks - 1) + last_chunk_len;
+
+    let mut expected_bytes = Vec::new();
+    let mut hashes: Vec<[u8; 32]> = Vec::new();
+    let prefix = "data/";
+
+    for i in 0..num_chunks as u8 {
+        let len = if (i as u64) == num_chunks - 1 {
+            last_chunk_len as usize
+        } else {
+            chunk_size as usize
+        };
+        let data: Vec<u8> = (0..len).map(|j| i.wrapping_add(j as u8)).collect();
+        expected_bytes.extend_from_slice(&data);
+
+        let hash: [u8; 32] = Sha256::digest(&data).into();
+        let rel_path = hash_to_chunk_path(&hash, prefix);
+        let full_path = data_dir.join(&rel_path);
+        std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        std::fs::write(&full_path, &data).unwrap();
+        hashes.push(hash);
+    }
+
+    let manifest = Manifest {
+        chunk_size,
+        total_size,
+        hashes,
+    };
+    let manifest_b64 = base64::engine::general_purpose::STANDARD.encode(manifest.serialize());
+
+    let config = test_config_with_dir(data_dir);
+    let state = make_state_with_config(AppConfig {
+        chunk_size,
+        ..config
+    });
+    let base = start_server(state).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/http://fake-upstream/file.bin"))
+        .header("X-Xs3lerator-Cache-Key", "test-multi-chunk")
+        .header("X-Xs3lerator-Manifest", &manifest_b64)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-xs3lerator-cache-hit")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "true"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        total_size.to_string()
+    );
+
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), total_size as usize);
+    assert_eq!(&body[..], &expected_bytes[..]);
+}
+
+#[tokio::test]
+async fn cache_hit_range_request() {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use xs3lerator::manifest::{hash_to_chunk_path, Manifest};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+
+    let chunk_size: u64 = 1024;
+    let total_size = chunk_size * 2;
+
+    let mut all_bytes = Vec::new();
+    let mut hashes: Vec<[u8; 32]> = Vec::new();
+    let prefix = "data/";
+
+    for i in 0..2u8 {
+        let data: Vec<u8> = (0..chunk_size as usize).map(|j| i.wrapping_add(j as u8)).collect();
+        all_bytes.extend_from_slice(&data);
+
+        let hash: [u8; 32] = Sha256::digest(&data).into();
+        let rel_path = hash_to_chunk_path(&hash, prefix);
+        let full_path = data_dir.join(&rel_path);
+        std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        std::fs::write(&full_path, &data).unwrap();
+        hashes.push(hash);
+    }
+
+    let manifest = Manifest {
+        chunk_size,
+        total_size,
+        hashes,
+    };
+    let manifest_b64 = base64::engine::general_purpose::STANDARD.encode(manifest.serialize());
+
+    let config = test_config_with_dir(data_dir);
+    let state = make_state_with_config(AppConfig {
+        chunk_size,
+        ..config
+    });
+    let base = start_server(state).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/http://fake-upstream/file.bin"))
+        .header("X-Xs3lerator-Cache-Key", "test-range")
+        .header("X-Xs3lerator-Manifest", &manifest_b64)
+        .header("Range", "bytes=512-1535")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 206);
+    assert_eq!(
+        resp.headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "1024"
+    );
+
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), 1024);
+    assert_eq!(&body[..], &all_bytes[512..1536]);
 }
