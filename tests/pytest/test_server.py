@@ -49,6 +49,8 @@ _stats = _Stats()
 
 
 class TestHandler(BaseHTTPRequestHandler):
+    __test__ = False
+
     """Quiet handler — suppress access logs."""
 
     def log_message(self, format, *args):
@@ -206,6 +208,8 @@ class TestHandler(BaseHTTPRequestHandler):
 
 
 class TestServer:
+    __test__ = False
+
     """Wrapper to start/stop the test HTTP server."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 0):
