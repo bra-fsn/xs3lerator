@@ -93,6 +93,7 @@ pub fn spawn_chunk_persist(
         .await
         {
             error!(key = cache_key, "chunk persist pipeline failed: {e}");
+            download.mark_failed();
         }
     });
 }
@@ -106,9 +107,8 @@ async fn run_chunk_persist(
 ) -> Result<(), ProxyError> {
     // For unknown-size (chunked) responses the persist task is spawned
     // immediately but must wait until the stream finishes to know the
-    // actual number of chunks. Known-size downloads (object_size > 0) have
-    // their chunk count fixed at creation, so no wait is needed.
-    if download.object_size == 0 && !download.is_stream_complete() {
+    // actual number of chunks.
+    if download.unknown_size && !download.is_stream_complete() {
         download.wait_for_stream_complete().await;
     }
 
@@ -183,8 +183,13 @@ async fn run_chunk_persist(
                 es.put_manifest(key, manifest.serialize()).await?;
             }
             download.s3_upload_complete.store(true, Ordering::Release);
+            download.wake_waiters();
             info!(key, "manifest written");
         }
+    }
+
+    if !all_ok {
+        download.mark_failed();
     }
 
     // Release chunk file handles
@@ -203,7 +208,14 @@ async fn persist_single_chunk(
     idx: usize,
 ) -> Result<(), ProxyError> {
     let expected = download.expected_chunk_len(idx);
-    download.wait_for_bytes(idx, expected).await?;
+    let written = download.wait_for_bytes(idx, expected).await?;
+
+    // For unknown-size responses, chunks beyond the actual data will have
+    // zero bytes written once the stream completes. Bail before wait_for_hash
+    // which would hang forever on a chunk that never received data.
+    if written == 0 {
+        return Ok(());
+    }
 
     let hash = download.wait_for_hash(idx).await?;
 

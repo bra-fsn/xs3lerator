@@ -123,6 +123,10 @@ impl ChunkSlot {
 pub struct InFlightDownload {
     pub object_size: u64,
     pub chunk_size: u64,
+    /// True when the upstream response had no Content-Length (chunked/streaming).
+    /// The persist pipeline must wait for stream completion before it can know
+    /// the actual number of chunks.
+    pub unknown_size: bool,
     chunks: Vec<ChunkSlot>,
     chunk_queue: Mutex<VecDeque<usize>>,
     notify: Notify,
@@ -151,6 +155,14 @@ pub struct InFlightDownload {
 
 impl InFlightDownload {
     pub fn new(object_size: u64, chunk_size: u64) -> Self {
+        Self::create(object_size, chunk_size, false)
+    }
+
+    pub fn new_unknown_size(effective_size: u64, chunk_size: u64) -> Self {
+        Self::create(effective_size, chunk_size, true)
+    }
+
+    fn create(object_size: u64, chunk_size: u64, unknown_size: bool) -> Self {
         let num_chunks = if object_size == 0 {
             0
         } else {
@@ -161,6 +173,7 @@ impl InFlightDownload {
         Self {
             object_size,
             chunk_size,
+            unknown_size,
             chunks,
             chunk_queue: Mutex::new(queue),
             notify: Notify::new(),
@@ -297,6 +310,11 @@ impl InFlightDownload {
 
     pub fn mark_failed(&self) {
         self.failed.store(1, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Wake all tasks waiting on any condition (bytes, hash, s3_complete, etc.).
+    pub fn wake_waiters(&self) {
         self.notify.notify_waiters();
     }
 

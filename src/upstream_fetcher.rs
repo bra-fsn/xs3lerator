@@ -386,6 +386,11 @@ async fn start_parallel_upstream_download(
                 dl.mark_failed();
             }
         }
+        // Wait for the persist pipeline to finish writing the manifest
+        // before removing from the download manager. This ensures POST
+        // manifest-alias requests can still find the in-flight entry
+        // and wait on s3_upload_complete.
+        dl.wait_for_s3_complete().await;
         downloads.remove(&ck);
     });
 
@@ -795,7 +800,11 @@ async fn start_sequential_download(
         .unwrap_or(config.chunk_size * MAX_UNKNOWN_SIZE_CHUNKS);
     let chunk_size = config.chunk_size;
 
-    let download = Arc::new(InFlightDownload::new(effective_size, chunk_size));
+    let download = Arc::new(if is_unknown_size {
+        InFlightDownload::new_unknown_size(effective_size, chunk_size)
+    } else {
+        InFlightDownload::new(effective_size, chunk_size)
+    });
     let (download, is_new) = downloads.get_or_create(cache_key, || download);
     if !is_new {
         return Ok(UpstreamResult {
@@ -947,6 +956,9 @@ async fn start_sequential_download(
             }
         }
 
+        // Wait for the persist pipeline to finish writing the manifest
+        // before removing from the download manager.
+        dl.wait_for_s3_complete().await;
         downloads.remove(&ck);
     });
 
