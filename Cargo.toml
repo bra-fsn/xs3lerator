@@ -1,6 +1,6 @@
 [package]
 name = "xs3lerator"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "High-performance HTTP caching proxy with content-addressed storage on mount-s3"
 license = "MIT"
