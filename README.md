@@ -146,9 +146,7 @@ OPTION                             ENV VAR                            DEFAULT
 --debug-trace <PATH>               XS3_DEBUG_TRACE                    (none)
 --data-prefix <PREFIX>             XS3_DATA_PREFIX                    data/
 --elasticsearch-url <URL>          XS3_ELASTICSEARCH_URL              (none)
---elasticsearch-manifest-index     XS3_ELASTICSEARCH_MANIFEST_INDEX   xs3_manifests
---elasticsearch-replicas <N>       XS3_ELASTICSEARCH_REPLICAS         1
---elasticsearch-shards <N>         XS3_ELASTICSEARCH_SHARDS           9
+--elasticsearch-manifest-index     XS3_ELASTICSEARCH_INDEX            passsage_meta
 --passthrough                      XS3_PASSTHROUGH                    false
 ```
 

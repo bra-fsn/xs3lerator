@@ -34,7 +34,7 @@ from test_server import TestServer, generate_payload  # noqa: F401 (re-export)
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8888")
 LOCALSTACK_ENDPOINT = os.environ.get("LOCALSTACK_ENDPOINT", "http://localhost:4566")
 ELASTICSEARCH_URL = os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200")
-ES_MANIFEST_INDEX = os.environ.get("XS3_ELASTICSEARCH_MANIFEST_INDEX", "xs3_manifests")
+ES_MANIFEST_INDEX = "passsage_meta"
 TEST_SERVER_BIND_HOST = os.environ.get("TEST_SERVER_BIND_HOST", "0.0.0.0")
 TEST_SERVER_HOST = os.environ.get("TEST_SERVER_HOST", "host.docker.internal")
 TEST_BUCKET = "xs3lerator-test"

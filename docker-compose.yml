@@ -83,9 +83,6 @@ services:
       - XS3_DATA_DIR=/mnt/shared/bucket
       - XS3_HTTP_CONCURRENCY=4
       - XS3_ELASTICSEARCH_URL=http://elasticsearch:9200
-      - XS3_ELASTICSEARCH_MANIFEST_INDEX=xs3_manifests
-      - XS3_ELASTICSEARCH_REPLICAS=0
-      - XS3_ELASTICSEARCH_SHARDS=1
     volumes:
       - type: bind
         source: ./.data
