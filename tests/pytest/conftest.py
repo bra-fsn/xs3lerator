@@ -13,6 +13,7 @@ Environment variables:
                            (default: host.docker.internal)
 """
 
+import base64
 import hashlib
 import os
 import socket
