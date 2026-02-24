@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -64,8 +64,6 @@ pub struct ChunkSlot {
     pub readers_done: AtomicBool,
     /// SHA-256 hash of the chunk content (set after chunk is fully downloaded).
     hash: Mutex<Option<[u8; 32]>>,
-    /// Path to the chunk in the local cache (set when chunk cache is enabled).
-    cache_path: Mutex<Option<PathBuf>>,
 }
 
 impl ChunkSlot {
@@ -76,7 +74,6 @@ impl ChunkSlot {
             uploaded_to_s3: AtomicBool::new(false),
             readers_done: AtomicBool::new(false),
             hash: Mutex::new(None),
-            cache_path: Mutex::new(None),
         }
     }
 
@@ -116,10 +113,6 @@ impl ChunkSlot {
 
     pub fn get_hash(&self) -> Option<[u8; 32]> {
         *self.hash.lock()
-    }
-
-    pub fn get_cache_path(&self) -> Option<PathBuf> {
-        self.cache_path.lock().clone()
     }
 }
 
@@ -266,17 +259,6 @@ impl InFlightDownload {
         self.actual_total_bytes.load(Ordering::Acquire)
     }
 
-    /// Mark all chunks as not needing S3 upload (cache-hit path).
-    /// This allows `try_release` to free chunk files as soon as the
-    /// consumer finishes reading them, and enables eager release in
-    /// `notify_consumed`.
-    pub fn mark_no_upload_needed(&self) {
-        self.eager_release.store(true, Ordering::Release);
-        for chunk in &self.chunks {
-            chunk.uploaded_to_s3.store(true, Ordering::Release);
-        }
-    }
-
     pub fn mark_failed(&self) {
         self.failed.store(1, Ordering::Release);
         self.notify.notify_waiters();
@@ -310,23 +292,6 @@ impl InFlightDownload {
         }
         self.consumer_notify.notify_waiters();
     }
-
-    /// Block until `chunk_idx` is within the prefetch window.
-    /// Workers call this before starting each chunk download to avoid
-    /// racing too far ahead of the client and blowing out the page cache.
-    pub async fn wait_for_consumer_window(&self, chunk_idx: usize, window: usize) {
-        loop {
-            if self.is_cancelled() || self.has_failed() {
-                return;
-            }
-            let consumed = self.consumed_count.load(Ordering::Acquire);
-            if chunk_idx < consumed + window {
-                return;
-            }
-            self.consumer_notify.notified().await;
-        }
-    }
-
     /// Move chunks overlapping `[byte_start, byte_end_inclusive]` to the
     /// front of the download queue so they are fetched first.
     pub fn prioritize_range(&self, byte_start: u64, byte_end_inclusive: u64) {
