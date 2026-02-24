@@ -32,6 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Create shared data directory
+        run: mkdir -p .data
+
       - name: Start all services
         run: docker compose up -d --build --wait
         timeout-minutes: 10

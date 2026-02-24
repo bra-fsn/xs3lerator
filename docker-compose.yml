@@ -43,7 +43,11 @@ services:
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
     volumes:
       - ./docker/mount-s3-entrypoint.sh:/entrypoint.sh:ro
-      - xs3-data:/data:rshared
+      - type: bind
+        source: ./.data
+        target: /data
+        bind:
+          propagation: rshared
     environment:
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
@@ -80,7 +84,11 @@ services:
       - XS3_ELASTICSEARCH_REPLICAS=0
       - XS3_ELASTICSEARCH_SHARDS=1
     volumes:
-      - xs3-data:/data:rshared
+      - type: bind
+        source: ./.data
+        target: /data
+        bind:
+          propagation: rshared
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -93,4 +101,3 @@ services:
 
 volumes:
   localstack-data:
-  xs3-data:
