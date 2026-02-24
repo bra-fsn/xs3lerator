@@ -236,7 +236,7 @@ mod tests {
         let p = hash_to_chunk_path(&hash, "data/");
         assert_eq!(
             p.to_str().unwrap(),
-            "data/a/b/a/b/abababababababababababababababababababababababababababababababababab"
+            "data/a/b/a/b/abababababababababababababababababababababababababababababababab"
         );
     }
 }
