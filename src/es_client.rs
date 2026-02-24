@@ -17,6 +17,7 @@ pub struct EsClient {
 struct UpdateBody {
     doc: ManifestDoc,
     doc_as_upsert: bool,
+    retry_on_conflict: u32,
 }
 
 #[derive(Serialize)]
@@ -109,6 +110,7 @@ impl EsClient {
         let body = UpdateBody {
             doc: ManifestDoc { manifest_b64: b64 },
             doc_as_upsert: true,
+            retry_on_conflict: 3,
         };
         let url = self.update_url(key);
 
