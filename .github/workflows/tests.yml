@@ -32,13 +32,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build xs3lerator image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          dockerfile: Dockerfile
+          load: true
+          tags: xs3lerator_xs3lerator:latest
+          cache-from: type=gha,scope=compose
+          cache-to: type=gha,scope=compose,mode=max
+          platforms: linux/amd64
+
+      - name: Build mount-s3 image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker
+          file: Dockerfile.mount-s3
+          load: true
+          tags: xs3lerator_mount-s3:latest
+          cache-from: type=gha,scope=compose-mount-s3
+          cache-to: type=gha,scope=compose-mount-s3,mode=max
+          platforms: linux/amd64
+
       - name: Create shared data directory
         run: mkdir -p .data
 
       - name: Start all services
         env:
           RUST_LOG: "debug"
-        run: docker compose up -d --build --wait
+        run: docker compose up -d --wait
         timeout-minutes: 10
 
       - name: Set up Python
