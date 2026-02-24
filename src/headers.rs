@@ -17,6 +17,9 @@ pub struct ContractHeaders {
     /// When true, skip cache read and go directly to upstream even when a
     /// cache key is provided.  The downloaded data is still persisted to cache.
     pub cache_skip: bool,
+    /// Pre-supplied manifest (base64) from passsage, allowing xs3lerator to
+    /// skip the ES lookup on cache hits.
+    pub manifest_b64: Option<String>,
 }
 
 const HEADER_CACHE_KEY: &str = "x-xs3lerator-cache-key";
@@ -24,6 +27,7 @@ const HEADER_CACHE_SKIP: &str = "x-xs3lerator-cache-skip";
 const HEADER_OBJECT_SIZE: &str = "x-xs3lerator-object-size";
 const HEADER_TLS_SKIP_VERIFY: &str = "x-xs3lerator-tls-skip-verify";
 const HEADER_FOLLOW_REDIRECTS: &str = "x-xs3lerator-follow-redirects";
+const HEADER_MANIFEST: &str = "x-xs3lerator-manifest";
 
 /// Contract header prefix — all headers with this prefix are stripped before
 /// forwarding to the upstream server.
@@ -67,12 +71,19 @@ pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    let manifest_b64 = headers
+        .get(HEADER_MANIFEST)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+
     ContractHeaders {
         cache_key,
         cache_skip,
         object_size,
         tls_skip_verify,
         follow_redirects,
+        manifest_b64,
     }
 }
 
@@ -195,6 +206,7 @@ mod tests {
         assert!(c.object_size.is_none());
         assert!(!c.tls_skip_verify);
         assert!(!c.follow_redirects);
+        assert!(c.manifest_b64.is_none());
     }
 
     #[test]

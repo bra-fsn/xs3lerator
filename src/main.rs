@@ -53,13 +53,10 @@ async fn main() -> anyhow::Result<()> {
         None
     } else if let Some(ref es_url) = config.elasticsearch_url {
         let client = es_client::EsClient::new(es_url, &config.elasticsearch_manifest_index);
-        client
-            .create_index_if_not_exists(config.elasticsearch_shards, config.elasticsearch_replicas)
-            .await?;
         info!(
             url = es_url,
             index = config.elasticsearch_manifest_index,
-            "Elasticsearch manifest storage initialized"
+            "Elasticsearch client initialized (index managed by passsage)"
         );
         Some(Arc::new(client))
     } else {

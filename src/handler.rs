@@ -177,12 +177,24 @@ pub async fn handle_get(
 
     let cache_key_str = cache_key.as_deref().unwrap();
 
+    // If passsage supplied the manifest in the header, try to use it directly
+    // to skip the ES lookup entirely.
+    let header_manifest = contract.manifest_b64.as_deref().and_then(|b64| {
+        match crate::es_client::decode_manifest_b64(b64) {
+            Ok(m) => Some(Arc::new(m)),
+            Err(e) => {
+                debug!(cache_key = cache_key_str, error = %e, "header manifest decode failed, will fetch from ES");
+                None
+            }
+        }
+    });
+
     // Try to serve from cache first
     match handle_cache_hit(
         &state,
-        &contract,
         cache_key_str,
         client_range_header.as_deref(),
+        header_manifest,
     )
     .await
     {
@@ -214,11 +226,14 @@ pub async fn handle_get(
 /// posix_fadvise prefetching.
 async fn handle_cache_hit(
     state: &AppState,
-    _contract: &headers::ContractHeaders,
     cache_key: &str,
     client_range: Option<&str>,
+    pre_manifest: Option<Arc<Manifest>>,
 ) -> ProxyResult<Response> {
-    let manifest = fetch_manifest(state, cache_key).await?;
+    let manifest = match pre_manifest {
+        Some(m) => m,
+        None => fetch_manifest(state, cache_key).await?,
+    };
     let object_size = manifest.total_size;
 
     let client_byte_range = parse_range_header(client_range, object_size)?;

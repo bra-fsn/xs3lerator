@@ -1,7 +1,7 @@
 use base64::Engine;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::error::ProxyError;
 use crate::manifest::Manifest;
@@ -11,6 +11,12 @@ pub struct EsClient {
     http: Client,
     base_url: String,
     index: String,
+}
+
+#[derive(Serialize)]
+struct UpdateBody {
+    doc: ManifestDoc,
+    doc_as_upsert: bool,
 }
 
 #[derive(Serialize)]
@@ -28,39 +34,7 @@ struct EsGetResponse {
 
 #[derive(Deserialize)]
 struct ManifestDocSource {
-    manifest_b64: String,
-}
-
-#[derive(Serialize)]
-struct IndexSettings {
-    settings: IndexSettingsInner,
-    mappings: IndexMappings,
-}
-
-#[derive(Serialize)]
-struct IndexSettingsInner {
-    number_of_shards: u32,
-    number_of_replicas: u32,
-    refresh_interval: String,
-}
-
-#[derive(Serialize)]
-struct IndexMappings {
-    dynamic: bool,
-    properties: IndexProperties,
-}
-
-#[derive(Serialize)]
-struct IndexProperties {
-    manifest_b64: ManifestFieldMapping,
-}
-
-#[derive(Serialize)]
-struct ManifestFieldMapping {
-    #[serde(rename = "type")]
-    field_type: String,
-    index: bool,
-    doc_values: bool,
+    manifest_b64: Option<String>,
 }
 
 impl EsClient {
@@ -80,6 +54,11 @@ impl EsClient {
     fn doc_url(&self, key: &str) -> String {
         let encoded = percent_encode_id(key);
         format!("{}/{}/_doc/{}", self.base_url, self.index, encoded)
+    }
+
+    fn update_url(&self, key: &str) -> String {
+        let encoded = percent_encode_id(key);
+        format!("{}/{}/_update/{}", self.base_url, self.index, encoded)
     }
 
     pub async fn get_manifest(&self, key: &str) -> Result<Option<Manifest>, ProxyError> {
@@ -115,24 +94,29 @@ impl EsClient {
             ._source
             .ok_or_else(|| ProxyError::Internal("ES doc missing _source".into()))?;
 
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(&source.manifest_b64)
-            .map_err(|e| ProxyError::Internal(format!("base64 decode manifest: {e}")))?;
+        let b64 = match source.manifest_b64 {
+            Some(v) if !v.is_empty() => v,
+            _ => return Ok(None),
+        };
 
-        let manifest = Manifest::deserialize(&data)?;
-        Ok(Some(manifest))
+        decode_manifest_b64(&b64).map(Some)
     }
 
+    /// Upsert the manifest_b64 field via POST _update with doc_as_upsert,
+    /// preserving any other fields in the document written by passsage.
     pub async fn put_manifest(&self, key: &str, manifest_bytes: Vec<u8>) -> Result<(), ProxyError> {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&manifest_bytes);
-        let doc = ManifestDoc { manifest_b64: b64 };
-        let url = self.doc_url(key);
+        let body = UpdateBody {
+            doc: ManifestDoc { manifest_b64: b64 },
+            doc_as_upsert: true,
+        };
+        let url = self.update_url(key);
 
         let resp = self
             .http
-            .put(&url)
+            .post(&url)
             .header("Content-Type", "application/json")
-            .json(&doc)
+            .json(&body)
             .send()
             .await
             .map_err(|e| ProxyError::Internal(format!("ES put_manifest: {e}")))?;
@@ -148,55 +132,14 @@ impl EsClient {
         debug!(key, "manifest written to ES");
         Ok(())
     }
+}
 
-    pub async fn create_index_if_not_exists(
-        &self,
-        shards: u32,
-        replicas: u32,
-    ) -> Result<(), ProxyError> {
-        let url = format!("{}/{}", self.base_url, self.index);
-        let body = IndexSettings {
-            settings: IndexSettingsInner {
-                number_of_shards: shards,
-                number_of_replicas: replicas,
-                refresh_interval: "60s".to_string(),
-            },
-            mappings: IndexMappings {
-                dynamic: false,
-                properties: IndexProperties {
-                    manifest_b64: ManifestFieldMapping {
-                        field_type: "keyword".to_string(),
-                        index: false,
-                        doc_values: false,
-                    },
-                },
-            },
-        };
-
-        let resp = self
-            .http
-            .put(&url)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProxyError::Internal(format!("ES create index: {e}")))?;
-
-        if resp.status().is_success() {
-            info!(index = %self.index, "ES index created");
-        } else {
-            let body_text = resp.text().await.unwrap_or_default();
-            if body_text.contains("resource_already_exists_exception") {
-                debug!(index = %self.index, "ES index already exists");
-            } else {
-                return Err(ProxyError::Internal(format!(
-                    "ES create index failed: {body_text}"
-                )));
-            }
-        }
-
-        Ok(())
-    }
+/// Decode a base64 manifest string into a Manifest struct.
+pub fn decode_manifest_b64(b64: &str) -> Result<Manifest, ProxyError> {
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| ProxyError::Internal(format!("base64 decode manifest: {e}")))?;
+    Manifest::deserialize(&data)
 }
 
 fn percent_encode_id(id: &str) -> String {
@@ -229,10 +172,34 @@ mod tests {
 
     #[test]
     fn test_doc_url() {
-        let client = EsClient::new("http://localhost:9200", "xs3_manifests");
+        let client = EsClient::new("http://localhost:9200", "passsage_meta");
         assert_eq!(
-            client.doc_url("my-bucket/https/host/hash123"),
-            "http://localhost:9200/xs3_manifests/_doc/my-bucket%2Fhttps%2Fhost%2Fhash123"
+            client.doc_url("https/host/hash123"),
+            "http://localhost:9200/passsage_meta/_doc/https%2Fhost%2Fhash123"
         );
+    }
+
+    #[test]
+    fn test_update_url() {
+        let client = EsClient::new("http://localhost:9200", "passsage_meta");
+        assert_eq!(
+            client.update_url("https/host/abc123"),
+            "http://localhost:9200/passsage_meta/_update/https%2Fhost%2Fabc123"
+        );
+    }
+
+    #[test]
+    fn test_decode_manifest_b64_roundtrip() {
+        let manifest = Manifest {
+            chunk_size: 8_388_608,
+            total_size: 20_000_000,
+            hashes: vec![[0xab; 32], [0xcd; 32]],
+        };
+        let bytes = manifest.serialize();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let decoded = decode_manifest_b64(&b64).unwrap();
+        assert_eq!(decoded.chunk_size, manifest.chunk_size);
+        assert_eq!(decoded.total_size, manifest.total_size);
+        assert_eq!(decoded.hashes.len(), manifest.hashes.len());
     }
 }

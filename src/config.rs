@@ -70,17 +70,9 @@ pub struct CliArgs {
     #[arg(long, env = "XS3_ELASTICSEARCH_URL")]
     pub elasticsearch_url: Option<String>,
 
-    /// Elasticsearch index name for manifests.
-    #[arg(long, env = "XS3_ELASTICSEARCH_MANIFEST_INDEX", default_value = "xs3_manifests")]
+    /// Elasticsearch index name.
+    #[arg(long, env = "XS3_ELASTICSEARCH_INDEX", default_value = "passsage_meta")]
     pub elasticsearch_manifest_index: String,
-
-    /// Number of Elasticsearch index replicas.
-    #[arg(long, env = "XS3_ELASTICSEARCH_REPLICAS", default_value_t = 1)]
-    pub elasticsearch_replicas: u32,
-
-    /// Number of Elasticsearch index shards.
-    #[arg(long, env = "XS3_ELASTICSEARCH_SHARDS", default_value_t = 9)]
-    pub elasticsearch_shards: u32,
 
     /// Passthrough-only mode: disable all caching infrastructure.
     /// No Elasticsearch, no data directory, no S3 writes.
@@ -101,8 +93,6 @@ pub struct AppConfig {
     pub data_prefix: String,
     pub elasticsearch_url: Option<String>,
     pub elasticsearch_manifest_index: String,
-    pub elasticsearch_replicas: u32,
-    pub elasticsearch_shards: u32,
     pub passthrough: bool,
 }
 
@@ -152,8 +142,6 @@ impl TryFrom<CliArgs> for AppConfig {
             data_prefix: args.data_prefix,
             elasticsearch_url: args.elasticsearch_url,
             elasticsearch_manifest_index: args.elasticsearch_manifest_index,
-            elasticsearch_replicas: args.elasticsearch_replicas,
-            elasticsearch_shards: args.elasticsearch_shards,
             passthrough: args.passthrough,
         })
     }
