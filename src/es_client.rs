@@ -202,4 +202,21 @@ mod tests {
         assert_eq!(decoded.total_size, manifest.total_size);
         assert_eq!(decoded.hashes.len(), manifest.hashes.len());
     }
+
+    #[test]
+    fn update_body_has_no_retry_on_conflict() {
+        let body = UpdateBody {
+            doc: ManifestDoc {
+                manifest_b64: "dGVzdA==".to_string(),
+            },
+            doc_as_upsert: true,
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("retry_on_conflict"),
+            "retry_on_conflict must be a query parameter, not in the JSON body"
+        );
+        assert_eq!(json["doc_as_upsert"], true);
+        assert_eq!(json["doc"]["manifest_b64"], "dGVzdA==");
+    }
 }
