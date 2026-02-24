@@ -1,7 +1,8 @@
 # xs3lerator
 
-High-performance Rust HTTP caching proxy with parallel chunked downloads,
-content-addressed S3 storage, and per-chunk temporary file buffering.
+High-performance Rust HTTP download accelerator and caching proxy with
+parallel chunked downloads, content-addressed S3 storage, and per-chunk
+temporary file buffering.
 Designed as the data-plane companion to [Passsage](https://github.com/bra-fsn/passsage), handling all
 GET request fetching and S3 content caching.
 
@@ -13,8 +14,12 @@ GET request fetching and S3 content caching.
 - **HTTP/1.1 and HTTP/2** downstream (cleartext, no TLS).
 - **GET-only proxy** — all other methods return `405 Method Not Allowed`
   (except `POST` for manifest alias creation).
-- **Dual-mode operation**: serves from S3 cache on hit, fetches from upstream
-  on miss (or when instructed to skip cache).
+- **Dual-mode operation**:
+  - **Caching mode** (default): serves from cache on hit, fetches from upstream
+    on miss.  Requires Elasticsearch and a data directory.
+  - **Passthrough mode** (`--passthrough`): pure download accelerator.  No
+    Elasticsearch, no data directory, no S3 writes.  Just parallel chunked
+    downloads from arbitrary HTTP(S) upstreams.
 - **Parallel multipart downloads** from both S3 and generic HTTP(S) upstreams
   using configurable concurrency and chunk sizes.
 - **Adaptive parallelism**: starts a full GET to upstream (no HEAD first),
@@ -23,8 +28,8 @@ GET request fetching and S3 content caching.
 - **Content-addressed S3 storage**: chunks are stored by SHA-256 hash
   with `If-None-Match: *` deduplication. A manifest file maps each
   cached object to its ordered list of chunk hashes.
-- **Manifest alias**: `POST /{bucket}/{key}` with
-  `X-Xs3lerator-Link-Manifest: {source_key}` copies a manifest under a
+- **Manifest alias**: `POST` with `X-Xs3lerator-Link-Manifest-Source` and
+  `X-Xs3lerator-Link-Manifest-Target` headers copies a manifest under a
   new key without re-uploading data — used by Passsage for Vary support.
 - **Stream-while-downloading**: downstream clients receive data as chunks
   arrive — no need to wait for the full object.
@@ -66,13 +71,19 @@ caching policies; xs3lerator handles data transfer.
 
 ### Request Flow
 
-**Cache hit** (Passsage signals `X-Xs3lerator-Cache-Skip` absent/false):
-1. xs3lerator fetches the object from S3 using parallel range-GETs.
-2. Streams the requested range to Passsage/client.
+**Passthrough (no `X-Xs3lerator-Cache-Key` header, or `--passthrough` mode)**:
+1. xs3lerator fetches from the upstream URL (the request path).
+2. Streams the data to the client using parallel chunked downloads.
+3. No S3 interaction, no Elasticsearch, no persistence.
 
-**Cache miss** (Passsage signals `X-Xs3lerator-Cache-Skip: true`):
-1. xs3lerator fetches from the real upstream URL (passed in
-   `X-Xs3lerator-Upstream-Url`, base64-encoded).
+**Cache hit** (`X-Xs3lerator-Cache-Key` present, `X-Xs3lerator-Cache-Skip` absent/false):
+1. xs3lerator looks up the manifest in Elasticsearch by cache key.
+2. Fetches chunks from the data directory (mounted via S3/mount-s3).
+3. Streams the requested range to Passsage/client.
+4. On cache miss, falls back to upstream fetch.
+
+**Cache miss** (`X-Xs3lerator-Cache-Key` present, `X-Xs3lerator-Cache-Skip: true`):
+1. xs3lerator fetches from the upstream URL (the request path).
 2. Starts a full GET (no HEAD first — saving a full round-trip to upstream),
    sniffs response headers.
 3. If `Content-Length` + `Accept-Ranges: bytes`: converts to parallel download.
@@ -80,7 +91,7 @@ caching policies; xs3lerator handles data transfer.
 5. Streams the requested range to Passsage/client immediately.
 6. Simultaneously uploads chunks to S3 as content-addressed objects
    (SHA-256 keyed, deduplicated via `If-None-Match: *`), then writes a
-   manifest mapping the object key to its chunk hashes.
+   manifest mapping the cache key to its chunk hashes.
 
 **S3 fallback**: if a cache-hit S3 fetch fails (404, 5xx), xs3lerator
 automatically falls back to fetching from the upstream URL.
@@ -93,19 +104,30 @@ cargo build --release
 
 ## Run
 
+### Caching mode (with Passsage)
+
 ```bash
-./target/release/xs3lerator
+./target/release/xs3lerator --data-dir /mnt/s3 --elasticsearch-url http://localhost:9200
 ```
 
-xs3lerator is typically deployed alongside Passsage, which routes GET requests
-to it. It can also be used standalone:
+### Passthrough mode (standalone download accelerator)
 
 ```bash
-# -w0 is required: base64 wraps at 76 chars by default, which injects a
-# newline into the header value and causes a 400 Bad Request from hyper.
-curl -H "X-Xs3lerator-Upstream-Url: $(echo -n 'https://example.com/file.iso' | base64 -w0)" \
+./target/release/xs3lerator --passthrough
+```
+
+No data directory or Elasticsearch needed.
+
+### Example requests
+
+```bash
+# Caching mode: upstream URL in path, cache key in header
+curl -H "X-Xs3lerator-Cache-Key: https/example.com/abc123" \
      -H "X-Xs3lerator-Cache-Skip: true" \
-     http://localhost:8080/my-bucket/https/example.com/a/b/c/d/hash.iso
+     http://localhost:8080/https://example.com/file.iso
+
+# Passthrough mode: just the upstream URL in path, no cache key needed
+curl http://localhost:8080/https://example.com/file.iso
 ```
 
 ## CLI Reference
@@ -116,23 +138,18 @@ Every option is also settable via an environment variable.
 OPTION                             ENV VAR                            DEFAULT
 --bind-ip <IP>                     XS3_BIND_IP                        0.0.0.0
 --port <PORT>                      XS3_PORT                           8080
---region <REGION>                  XS3_REGION                         (SDK default)
---s3-endpoint-url <URL>            XS3_S3_ENDPOINT_URL                (none)
---s3-force-path-style              XS3_S3_FORCE_PATH_STYLE            false
---s3-concurrency <N>               XS3_S3_CONCURRENCY                 32
+--data-dir <PATH>                  XS3_DATA_DIR                       (required unless --passthrough)
 --http-concurrency <N>             XS3_HTTP_CONCURRENCY               8
---min-chunk-size <SIZE>            XS3_MIN_CHUNK_SIZE                 8MiB
+--chunk-size <SIZE>                XS3_CHUNK_SIZE                     8MiB
 --temp-dir <PATH>                  XS3_TEMP_DIR                       (system tmpdir)
 --upstream-tls-skip-verify         XS3_UPSTREAM_TLS_SKIP_VERIFY       false
 --debug-trace <PATH>               XS3_DEBUG_TRACE                    (none)
 --data-prefix <PREFIX>             XS3_DATA_PREFIX                    data/
---manifest-cache-size <N>          XS3_MANIFEST_CACHE_SIZE            10000
---chunk-cache-dir <PATH>           XS3_CHUNK_CACHE_DIR                (none)
---chunk-cache-max-size <SIZE>      XS3_CHUNK_CACHE_MAX_SIZE           100GiB
 --elasticsearch-url <URL>          XS3_ELASTICSEARCH_URL              (none)
 --elasticsearch-manifest-index     XS3_ELASTICSEARCH_MANIFEST_INDEX   xs3_manifests
 --elasticsearch-replicas <N>       XS3_ELASTICSEARCH_REPLICAS         1
 --elasticsearch-shards <N>         XS3_ELASTICSEARCH_SHARDS           9
+--passthrough                      XS3_PASSTHROUGH                    false
 ```
 
 Run `xs3lerator --help` to see the generated help with defaults.
@@ -141,34 +158,44 @@ Run `xs3lerator --help` to see the generated help with defaults.
 
 ### URL Scheme
 
-xs3lerator receives: `GET /<s3_bucket>/<s3_key>`
-
-The first path segment is the S3 bucket, the rest is the S3 key. Example:
+The upstream URL is passed directly in the request path:
 
 ```
-GET /proxy-cache/https/ftp.bme.hu/f/f/3/0/ff30f95e79ebe67232635722c7c31666ebac8d7f8fb6c5075b13c9e3.iso
+GET /<upstream_url>
 ```
 
-### Request Headers (passsage -> xs3lerator)
+Examples:
+
+```
+GET /https://example.com/file.iso
+GET /https://pypi.org/packages/numpy-1.0.tar.gz?hash=abc123
+```
+
+The cache key (if any) is passed in the `X-Xs3lerator-Cache-Key` header.
+When absent, xs3lerator operates as a pure download accelerator (no caching).
+
+### Request Headers (passsage → xs3lerator)
 
 Contract headers (stripped before forwarding upstream):
 
 | Header | Description |
 |--------|-------------|
-| `X-Xs3lerator-Upstream-Url` | Base64-encoded real upstream URL |
-| `X-Xs3lerator-Cache-Skip` | `"true"` = skip S3, go upstream + upload to S3. Absent/false = try S3 first. |
+| `X-Xs3lerator-Cache-Key` | Cache key for ES manifest / content-addressed storage. When absent, pure passthrough (download accelerator only). |
+| `X-Xs3lerator-Cache-Skip` | `"true"` = skip cache read, go upstream + persist to cache. Requires Cache-Key. |
 | `X-Xs3lerator-Object-Size` | Known file size (from metadata), for S3 range-GETs without HEAD |
 | `X-Xs3lerator-Tls-Skip-Verify` | `"true"` = skip TLS cert verification for this upstream request |
-| `X-Xs3lerator-Link-Manifest` | (POST only) S3 key of source manifest to copy |
+| `X-Xs3lerator-Follow-Redirects` | `"true"` = follow upstream redirects instead of passing them through |
+| `X-Xs3lerator-Link-Manifest-Source` | (POST only) Source cache key for manifest copy |
+| `X-Xs3lerator-Link-Manifest-Target` | (POST only) Target cache key for manifest copy |
 
 All other client headers pass through inline. xs3lerator strips contract
 headers, `Host`, `Range`, and hop-by-hop headers before forwarding upstream.
 
-### Response Headers (xs3lerator -> passsage)
+### Response Headers (xs3lerator → passsage)
 
 | Header | Description |
 |--------|-------------|
-| `X-Xs3lerator-Cache-Hit` | `"true"` if served from S3, `"false"` if fetched from upstream |
+| `X-Xs3lerator-Cache-Hit` | `"true"` if served from cache, `"false"` if fetched from upstream. Only present when a cache key was provided. |
 | `X-Xs3lerator-Full-Size` | Full object size in bytes (always present, even on range responses) |
 | `X-Xs3lerator-Degraded` | Present with value `"enospc"` when temp storage is exhausted |
 
@@ -177,8 +204,8 @@ the client.
 
 ### Supported Methods
 
-- `GET` — proxy fetch (cache hit or miss). Returns `405 Method Not Allowed`
-  with `Allow: GET, POST` for unsupported methods.
+- `GET` — proxy fetch (cache hit, cache miss, or passthrough). Returns
+  `405 Method Not Allowed` with `Allow: GET, POST` for unsupported methods.
 - `POST` — manifest alias creation (see Manifest Alias below).
 - Health check: `GET /healthz`.
 
@@ -242,23 +269,24 @@ buffering.
 
 ### Content-Addressed S3 Upload
 
-On cache miss, xs3lerator uploads the file to S3 as content-addressed chunks
-simultaneously with the download:
+On cache miss (when a cache key is provided), xs3lerator uploads the file
+to S3 as content-addressed chunks simultaneously with the download:
 
 1. Each chunk is hashed (SHA-256) and uploaded to `{data_prefix}{hash}` using
    `PutObject` with `If-None-Match: *` — if the chunk already exists, the
    upload is skipped (S3 returns `412 Precondition Failed`).
 2. Once all chunks are uploaded, a manifest is written to Elasticsearch
    (index configurable via `--elasticsearch-manifest-index`) containing the
-   ordered list of chunk hashes, keyed by `{bucket}/{key}`.
+   ordered list of chunk hashes, keyed by the cache key.
 3. Duplicate data across different objects is stored only once.
 
 ### Manifest Alias
 
-`POST /{bucket}/{target_key}` with `X-Xs3lerator-Link-Manifest: {source_key}`
-copies the manifest for `source_key` to `target_key` without re-uploading any
-data. If the source manifest doesn't exist yet (download still in flight),
-xs3lerator waits for it to complete. Returns `204 No Content` on success.
+`POST` with `X-Xs3lerator-Link-Manifest-Source: {source_key}` and
+`X-Xs3lerator-Link-Manifest-Target: {target_key}` copies the manifest for
+`source_key` to `target_key` without re-uploading any data. If the source
+manifest doesn't exist yet (download still in flight), xs3lerator waits
+for it to complete. Returns `204 No Content` on success.
 
 This is used by Passsage for Vary support — when the same upstream object
 is cached under a variant key, only a lightweight manifest copy is needed.

@@ -22,6 +22,7 @@ fn test_config() -> AppConfig {
         elasticsearch_manifest_index: "xs3_manifests".to_string(),
         elasticsearch_replicas: 0,
         elasticsearch_shards: 1,
+        passthrough: false,
     }
 }
 

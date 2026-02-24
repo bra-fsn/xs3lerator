@@ -54,45 +54,43 @@ pub async fn fetch_upstream(
     config: &AppConfig,
     contract: &ContractHeaders,
     client_headers: &axum::http::HeaderMap,
-    cache_key: &str,
+    upstream_url: &str,
+    cache_key: Option<&str>,
     client_range: Option<&str>,
     downloads: &DownloadManager,
     data_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
     es_client: Option<Arc<EsClient>>,
 ) -> Result<UpstreamResult, ProxyError> {
-    let upstream_url = contract
-        .upstream_url
-        .as_deref()
-        .ok_or_else(|| ProxyError::Internal("missing X-Xs3lerator-Upstream-Url".into()))?;
-
     // Check for an existing in-flight download for the same cache key.
     // This handles the deduplication case within a single instance.
     // When cache_skip is set the caller explicitly wants a fresh upstream
     // fetch (e.g. AlwaysUpstream / no-store), so bypass the dedup check.
-    if !contract.cache_skip {
-        let (existing, is_new) = downloads.get_or_create(cache_key, || {
-            // Placeholder — will be replaced below if we're the creator.
-            Arc::new(InFlightDownload::new(0, config.chunk_size))
-        });
-        if !is_new {
-            let full_size = existing.object_size;
-            return Ok(UpstreamResult {
-                download: existing,
-                content_type: None,
-                etag: None,
-                last_modified: None,
-                cache_control: None,
-                full_size: Some(full_size),
-                degraded_body: None,
-                redirect_status: None,
-                redirect_headers: None,
-                upstream_headers: None,
-                error_passthrough: None,
+    // When cache_key is None (passthrough), no dedup is possible.
+    if let Some(key) = cache_key {
+        if !contract.cache_skip {
+            let (existing, is_new) = downloads.get_or_create(key, || {
+                Arc::new(InFlightDownload::new(0, config.chunk_size))
             });
+            if !is_new {
+                let full_size = existing.object_size;
+                return Ok(UpstreamResult {
+                    download: existing,
+                    content_type: None,
+                    etag: None,
+                    last_modified: None,
+                    cache_control: None,
+                    full_size: Some(full_size),
+                    degraded_body: None,
+                    redirect_status: None,
+                    redirect_headers: None,
+                    upstream_headers: None,
+                    error_passthrough: None,
+                });
+            }
+            // We created a placeholder — remove it so we can insert the real one.
+            downloads.remove(key);
         }
-        // We created a placeholder — remove it so we can insert the real one.
-        downloads.remove(cache_key);
     }
 
     // Build the reqwest client
@@ -290,7 +288,7 @@ async fn start_parallel_upstream_download(
     upstream_headers: &axum::http::HeaderMap,
     initial_response: reqwest::Response,
     file_size: u64,
-    cache_key: &str,
+    cache_key: Option<&str>,
     downloads: &DownloadManager,
     data_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
@@ -305,26 +303,36 @@ async fn start_parallel_upstream_download(
     let plan = compute_chunk_plan(file_size, config.http_concurrency, config.chunk_size);
 
     let download = Arc::new(InFlightDownload::new(file_size, plan.chunk_size));
-    let (download, is_new) = downloads.get_or_create(cache_key, || download);
-    if !is_new {
-        return Ok(UpstreamResult {
-            download,
-            content_type,
-            etag,
-            last_modified,
-            cache_control,
-            full_size: Some(file_size),
-            degraded_body: None,
-            redirect_status: None,
-            redirect_headers: None,
-            upstream_headers: all_upstream_headers,
-            error_passthrough: None,
-        });
-    }
+
+    // When we have a cache key, register in the download manager for dedup.
+    // Otherwise just use the download directly with no dedup.
+    let download = if let Some(key) = cache_key {
+        let (download, is_new) = downloads.get_or_create(key, || download);
+        if !is_new {
+            return Ok(UpstreamResult {
+                download,
+                content_type,
+                etag,
+                last_modified,
+                cache_control,
+                full_size: Some(file_size),
+                degraded_body: None,
+                redirect_status: None,
+                redirect_headers: None,
+                upstream_headers: all_upstream_headers,
+                error_passthrough: None,
+            });
+        }
+        download
+    } else {
+        download
+    };
 
     // Probe temp dir for available space; if ENOSPC, degrade to direct passthrough
     if let Err(e) = create_temp_chunk_file(&config.temp_dir) {
-        downloads.remove(cache_key);
+        if let Some(key) = cache_key {
+            downloads.remove(key);
+        }
         if is_enospc(&e) {
             warn!("ENOSPC: degrading to direct passthrough (parallel)");
             return Ok(UpstreamResult {
@@ -351,14 +359,16 @@ async fn start_parallel_upstream_download(
         }
     }
 
-    // Spawn content-addressed chunk persistence to mounted filesystem
-    chunk_upload::spawn_chunk_persist(
-        data_dir.to_path_buf(),
-        config.data_prefix.clone(),
-        cache_key.to_string(),
-        download.clone(),
-        es_client,
-    );
+    // Spawn content-addressed chunk persistence to mounted filesystem (only when caching)
+    if let Some(key) = cache_key {
+        chunk_upload::spawn_chunk_persist(
+            data_dir.to_path_buf(),
+            config.data_prefix.clone(),
+            key.to_string(),
+            download.clone(),
+            es_client,
+        );
+    }
 
     let temp_dir = config.temp_dir.clone();
     let dl = download.clone();
@@ -366,7 +376,7 @@ async fn start_parallel_upstream_download(
     let url = upstream_url.to_string();
     let client = http_client.clone();
     let hdrs = upstream_headers.clone();
-    let ck = cache_key.to_string();
+    let ck = cache_key.map(str::to_owned);
     let dm_ptr = downloads as *const DownloadManager as usize;
     let http_concurrency = config.http_concurrency;
 
@@ -381,19 +391,17 @@ async fn start_parallel_upstream_download(
 
         match result {
             Ok(()) => {
-                debug!(key = ck, "upstream download complete");
+                debug!(cache_key = ?ck, "upstream download complete");
             }
             Err(e) => {
-                tracing::error!(key = ck, "upstream download failed: {e}");
+                tracing::error!(cache_key = ?ck, "upstream download failed: {e}");
                 dl.mark_failed();
             }
         }
-        // Wait for the persist pipeline to finish writing the manifest
-        // before removing from the download manager. This ensures POST
-        // manifest-alias requests can still find the in-flight entry
-        // and wait on s3_upload_complete.
-        dl.wait_for_s3_complete().await;
-        downloads.remove(&ck);
+        if let Some(ref key) = ck {
+            dl.wait_for_s3_complete().await;
+            downloads.remove(key);
+        }
     });
 
     Ok(UpstreamResult {
@@ -786,7 +794,7 @@ async fn start_sequential_download(
     config: &AppConfig,
     response: reqwest::Response,
     file_size: Option<u64>,
-    cache_key: &str,
+    cache_key: Option<&str>,
     downloads: &DownloadManager,
     data_dir: &std::path::Path,
     _trace: &Option<Arc<TraceWriter>>,
@@ -807,26 +815,34 @@ async fn start_sequential_download(
     } else {
         InFlightDownload::new(effective_size, chunk_size)
     });
-    let (download, is_new) = downloads.get_or_create(cache_key, || download);
-    if !is_new {
-        return Ok(UpstreamResult {
-            download,
-            content_type,
-            etag,
-            last_modified,
-            cache_control,
-            full_size: file_size,
-            degraded_body: None,
-            redirect_status: None,
-            redirect_headers: None,
-            upstream_headers: all_upstream_headers,
-            error_passthrough: None,
-        });
-    }
+
+    let download = if let Some(key) = cache_key {
+        let (download, is_new) = downloads.get_or_create(key, || download);
+        if !is_new {
+            return Ok(UpstreamResult {
+                download,
+                content_type,
+                etag,
+                last_modified,
+                cache_control,
+                full_size: file_size,
+                degraded_body: None,
+                redirect_status: None,
+                redirect_headers: None,
+                upstream_headers: all_upstream_headers,
+                error_passthrough: None,
+            });
+        }
+        download
+    } else {
+        download
+    };
 
     // Probe temp dir for available space; if ENOSPC, degrade to direct passthrough
     if let Err(e) = create_temp_chunk_file(&config.temp_dir) {
-        downloads.remove(cache_key);
+        if let Some(key) = cache_key {
+            downloads.remove(key);
+        }
         if is_enospc(&e) {
             warn!("ENOSPC: degrading to direct passthrough (sequential)");
             return Ok(UpstreamResult {
@@ -846,16 +862,16 @@ async fn start_sequential_download(
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
     }
 
-    // Spawn persist immediately for both known-size and unknown-size.
-    // For unknown-size the persist task will wait for stream completion
-    // before processing chunks.
-    chunk_upload::spawn_chunk_persist(
-        data_dir.to_path_buf(),
-        config.data_prefix.clone(),
-        cache_key.to_string(),
-        download.clone(),
-        es_client.clone(),
-    );
+    // Spawn persist only when caching
+    if let Some(key) = cache_key {
+        chunk_upload::spawn_chunk_persist(
+            data_dir.to_path_buf(),
+            config.data_prefix.clone(),
+            key.to_string(),
+            download.clone(),
+            es_client.clone(),
+        );
+    }
 
     if !is_unknown_size {
         for idx in 0..download.chunk_count() {
@@ -866,7 +882,7 @@ async fn start_sequential_download(
     }
 
     let dl = download.clone();
-    let ck = cache_key.to_string();
+    let ck = cache_key.map(str::to_owned);
     let dm_ptr = downloads as *const DownloadManager as usize;
     let temp_dir = config.temp_dir.clone();
 
@@ -891,7 +907,7 @@ async fn start_sequential_download(
                             match create_temp_chunk_file(&temp_dir) {
                                 Ok(f) => dl.chunk(chunk_idx).set_file(Arc::new(f)),
                                 Err(e) => {
-                                    warn!(key = ck, "temp file creation failed: {e}");
+                                    warn!(cache_key = ?ck, "temp file creation failed: {e}");
                                     dl.mark_failed();
                                     break 'outer;
                                 }
@@ -910,7 +926,7 @@ async fn start_sequential_download(
                             }
                             let slice = &data[piece_offset..piece_offset + to_write];
                             if let Err(e) = pwrite_all(&file, chunk_offset, slice) {
-                                warn!(key = ck, "sequential write error: {e}");
+                                warn!(cache_key = ?ck, "sequential write error: {e}");
                                 dl.mark_failed();
                                 break 'outer;
                             }
@@ -930,7 +946,7 @@ async fn start_sequential_download(
                     }
                 }
                 Err(e) => {
-                    warn!(key = ck, "sequential stream error: {e}");
+                    warn!(cache_key = ?ck, "sequential stream error: {e}");
                     dl.mark_failed();
                     break;
                 }
@@ -958,10 +974,10 @@ async fn start_sequential_download(
             }
         }
 
-        // Wait for the persist pipeline to finish writing the manifest
-        // before removing from the download manager.
-        dl.wait_for_s3_complete().await;
-        downloads.remove(&ck);
+        if let Some(ref key) = ck {
+            dl.wait_for_s3_complete().await;
+            downloads.remove(key);
+        }
     });
 
     Ok(UpstreamResult {

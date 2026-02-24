@@ -13,7 +13,6 @@ Environment variables:
                            (default: host.docker.internal)
 """
 
-import base64
 import hashlib
 import os
 import socket
@@ -57,10 +56,6 @@ def _wait_for_url(url: str, timeout: float = 30.0, interval: float = 0.5):
             last_err = e
             time.sleep(interval)
     raise RuntimeError(f"URL {url} not reachable after {timeout}s: {last_err}")
-
-
-def encode_upstream_url(url: str) -> str:
-    return base64.b64encode(url.encode()).decode()
 
 
 # ---------------------------------------------------------------------------
@@ -210,10 +205,13 @@ def proxy_get(proxy, test_server_external_url):
     """Helper to make a GET to xs3lerator with proper contract headers.
 
     Usage:
-        resp = proxy_get("my-key", "/data/1024", cache_skip=True)
+        resp = proxy_get("my-cache-key", "/data/1024", cache_skip=True)
+
+    The upstream URL (test_server + upstream_path) is placed in the request
+    path.  The cache key is sent in X-Xs3lerator-Cache-Key.
     """
     def _get(
-        s3_key: str,
+        cache_key: str,
         upstream_path: str,
         *,
         cache_skip: bool = False,
@@ -224,7 +222,7 @@ def proxy_get(proxy, test_server_external_url):
     ):
         upstream_url = f"{test_server_external_url}{upstream_path}"
         headers = {
-            "X-Xs3lerator-Upstream-Url": encode_upstream_url(upstream_url),
+            "X-Xs3lerator-Cache-Key": cache_key,
         }
         if cache_skip:
             headers["X-Xs3lerator-Cache-Skip"] = "true"
@@ -235,7 +233,7 @@ def proxy_get(proxy, test_server_external_url):
         if extra_headers:
             headers.update(extra_headers)
         return requests.get(
-            f"{proxy}/{s3_key}",
+            f"{proxy}/{upstream_url}",
             headers=headers,
             timeout=timeout,
         )

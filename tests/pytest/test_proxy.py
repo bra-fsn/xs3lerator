@@ -49,7 +49,7 @@ class TestBasic:
         assert r.status_code == 200
 
     def test_method_not_allowed_post_without_header(self, proxy):
-        """POST without X-Xs3lerator-Link-Manifest header returns 500."""
+        """POST without X-Xs3lerator-Link-Manifest-Source header returns 500."""
         r = requests.post(f"{proxy}/any-key", timeout=5)
         assert r.status_code == 500
 
@@ -421,7 +421,7 @@ class TestManifestAlias:
     def test_manifest_alias_creates_copy(
         self, proxy, proxy_get, unique_key, elasticsearch_url,
     ):
-        """POST with X-Xs3lerator-Link-Manifest creates an alias manifest in ES."""
+        """POST with manifest link headers creates an alias manifest in ES."""
         r = proxy_get(unique_key, f"/data/{SMALL}", cache_skip=True)
         assert r.status_code == 200
         source_cache_key = unique_key
@@ -429,8 +429,11 @@ class TestManifestAlias:
 
         alias_key = f"{unique_key}-alias"
         resp = requests.post(
-            f"{proxy}/{alias_key}",
-            headers={"X-Xs3lerator-Link-Manifest": unique_key},
+            f"{proxy}/manifest-alias",
+            headers={
+                "X-Xs3lerator-Link-Manifest-Source": unique_key,
+                "X-Xs3lerator-Link-Manifest-Target": alias_key,
+            },
             timeout=30,
         )
         assert resp.status_code == 204
@@ -455,8 +458,11 @@ class TestManifestAlias:
 
         alias_key = f"{unique_key}-alias2"
         resp = requests.post(
-            f"{proxy}/{alias_key}",
-            headers={"X-Xs3lerator-Link-Manifest": unique_key},
+            f"{proxy}/manifest-alias",
+            headers={
+                "X-Xs3lerator-Link-Manifest-Source": unique_key,
+                "X-Xs3lerator-Link-Manifest-Target": alias_key,
+            },
             timeout=30,
         )
         assert resp.status_code == 204

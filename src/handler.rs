@@ -20,7 +20,7 @@ use crate::download::{InFlightDownload, DownloadManager};
 use crate::error::{ProxyError, ProxyResult};
 use crate::es_client::EsClient;
 use crate::headers::{
-    self, parse_key, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
+    self, parse_upstream_url, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
 };
 use crate::manifest::{Manifest, hash_to_chunk_path};
 use crate::range::{parse_range_header, ByteRange};
@@ -62,24 +62,32 @@ pub async fn method_not_allowed() -> impl IntoResponse {
     )
 }
 
-/// POST handler for manifest alias: `POST /{target_key}`
-/// with `X-Xs3lerator-Link-Manifest: {source_key}`.
+/// POST handler for manifest alias.
+///
+/// Headers:
+///   - `X-Xs3lerator-Link-Manifest-Source`: source cache key
+///   - `X-Xs3lerator-Link-Manifest-Target`: target cache key
+///
 /// Race-free Vary support: waits for in-flight download then copies manifest.
 pub async fn handle_post(
     State(state): State<AppState>,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
-    let path = req.uri().path().to_string();
     let headers = req.headers().clone();
 
-    let target_key = parse_key(&path)
-        .ok_or_else(|| ProxyError::Internal("invalid path: expected /<key>".into()))?;
-
     let source_key = headers
-        .get("x-xs3lerator-link-manifest")
+        .get("x-xs3lerator-link-manifest-source")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| {
-            ProxyError::Internal("missing X-Xs3lerator-Link-Manifest header".into())
+            ProxyError::Internal("missing X-Xs3lerator-Link-Manifest-Source header".into())
+        })?
+        .to_string();
+
+    let target_key = headers
+        .get("x-xs3lerator-link-manifest-target")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            ProxyError::Internal("missing X-Xs3lerator-Link-Manifest-Target header".into())
         })?
         .to_string();
 
@@ -89,7 +97,6 @@ pub async fn handle_post(
         "manifest alias request"
     );
 
-    // Wait for any in-flight download of the source key to complete its persist
     {
         let active = state.downloads.get_inflight(&source_key);
         if let Some(inflight) = active {
@@ -101,10 +108,8 @@ pub async fn handle_post(
         }
     }
 
-    // Read source manifest from ES
     let manifest = fetch_manifest(&state, &source_key).await?;
 
-    // Write manifest under target key to ES
     let manifest_bytes = manifest.serialize();
     if let Some(ref es) = state.es_client {
         es.put_manifest(&target_key, manifest_bytes).await?;
@@ -120,16 +125,19 @@ pub async fn handle_post(
     Ok(resp)
 }
 
-/// Main GET handler: `GET /<key...>`
+/// Main GET handler: `GET /<upstream_url>`
+///
+/// The upstream URL is extracted from the request path+query.
+/// The optional cache key comes from the `X-Xs3lerator-Cache-Key` header.
 pub async fn handle_get(
     State(state): State<AppState>,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
-    let path = req.uri().path().to_string();
+    let uri = req.uri().clone();
     let headers = req.headers().clone();
 
-    let key = parse_key(&path)
-        .ok_or_else(|| ProxyError::Internal("invalid path: expected /<key>".into()))?;
+    let upstream_url = parse_upstream_url(&uri)
+        .ok_or_else(|| ProxyError::Internal("invalid path: expected /<upstream_url>".into()))?;
 
     let contract = parse_contract_headers(&headers);
     let client_range_header = headers
@@ -137,37 +145,54 @@ pub async fn handle_get(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
+    let cache_key = if state.config.passthrough {
+        None
+    } else {
+        contract.cache_key.clone()
+    };
+
+    let log_key = cache_key.as_deref().unwrap_or(&upstream_url);
+
     trace_log(&state.trace, || json!({
         "event": "request",
-        "key": key,
+        "upstream_url": upstream_url,
+        "cache_key": cache_key,
         "cache_skip": contract.cache_skip,
         "object_size": contract.object_size,
     }));
 
-    if contract.cache_skip {
+    // No cache key → pure passthrough (download accelerator only)
+    if cache_key.is_none() || contract.cache_skip {
         return handle_upstream_path(
             &state,
             &contract,
             &headers,
-            &key,
+            &upstream_url,
+            cache_key.as_deref(),
             client_range_header.as_deref(),
         )
-        .await;
+        .await
+        .map(|resp| { log_access("GET", log_key, &resp); resp });
     }
+
+    let cache_key_str = cache_key.as_deref().unwrap();
 
     // Try to serve from cache first
     match handle_cache_hit(
         &state,
         &contract,
-        &key,
+        cache_key_str,
         client_range_header.as_deref(),
     )
     .await
     {
-        Ok(resp) => Ok(resp),
+        Ok(resp) => {
+            log_access("GET", log_key, &resp);
+            Ok(resp)
+        }
         Err(e) => {
             debug!(
-                key = key.as_str(),
+                cache_key = cache_key_str,
                 error = %e,
                 "cache fetch failed, falling back to upstream"
             );
@@ -175,10 +200,12 @@ pub async fn handle_get(
                 &state,
                 &contract,
                 &headers,
-                &key,
+                &upstream_url,
+                cache_key.as_deref(),
                 client_range_header.as_deref(),
             )
             .await
+            .map(|resp| { log_access("GET", log_key, &resp); resp })
         }
     }
 }
@@ -188,10 +215,10 @@ pub async fn handle_get(
 async fn handle_cache_hit(
     state: &AppState,
     _contract: &headers::ContractHeaders,
-    key: &str,
+    cache_key: &str,
     client_range: Option<&str>,
 ) -> ProxyResult<Response> {
-    let manifest = fetch_manifest(state, key).await?;
+    let manifest = fetch_manifest(state, cache_key).await?;
     let object_size = manifest.total_size;
 
     let client_byte_range = parse_range_header(client_range, object_size)?;
@@ -203,7 +230,6 @@ async fn handle_cache_hit(
     let chunk_range = manifest.chunks_for_range(serve_start, serve_end);
     let data_prefix = &state.config.data_prefix;
 
-    // Open all needed chunk files and issue posix_fadvise WILLNEED
     let mut chunk_files: Vec<(usize, Arc<std::fs::File>, u64)> = Vec::new();
     for idx in chunk_range.clone() {
         let hash = &manifest.hashes[idx];
@@ -220,7 +246,6 @@ async fn handle_cache_hit(
         chunk_files.push((idx, Arc::new(file), chunk_len));
     }
 
-    // Issue WILLNEED advice on all chunk files to trigger mount-s3 prefetch
     for (_, file, chunk_len) in &chunk_files {
         let _ = posix_fadvise(
             file.as_raw_fd(),
@@ -273,7 +298,6 @@ async fn handle_cache_hit(
         .map_err(|e| ProxyError::Internal(format!("build response: {e}")))?;
 
     *response.headers_mut() = resp_headers;
-    log_access("GET", key, &response);
     Ok(response)
 }
 
@@ -385,19 +409,21 @@ fn merge_upstream_headers(
     }
 }
 
-/// Serve from upstream (cache miss or fallback).
+/// Serve from upstream (cache miss, passthrough, or fallback).
 async fn handle_upstream_path(
     state: &AppState,
     contract: &headers::ContractHeaders,
     client_headers: &HeaderMap,
-    key: &str,
+    upstream_url: &str,
+    cache_key: Option<&str>,
     client_range: Option<&str>,
 ) -> ProxyResult<Response> {
     let result = upstream_fetcher::fetch_upstream(
         &state.config,
         contract,
         client_headers,
-        key,
+        upstream_url,
+        cache_key,
         client_range,
         &state.downloads,
         &state.data_dir,
@@ -414,14 +440,15 @@ async fn handle_upstream_path(
         if let Some(ref rh) = result.redirect_headers {
             merge_upstream_headers(rh, &mut resp_headers);
         }
-        resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+        if cache_key.is_some() {
+            resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+        }
         let resp = Response::builder()
             .status(status)
             .body(Body::empty())
             .map_err(|e| ProxyError::Internal(format!("build redirect response: {e}")))?;
         let mut resp = resp;
         *resp.headers_mut() = resp_headers;
-        log_access("GET", key, &resp);
         return Ok(resp);
     }
 
@@ -433,7 +460,9 @@ async fn handle_upstream_path(
         if let Some(ref uh) = result.upstream_headers {
             merge_upstream_headers(uh, &mut resp_headers);
         }
-        resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+        if cache_key.is_some() {
+            resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+        }
 
         let stream = error_response
             .bytes_stream()
@@ -444,22 +473,19 @@ async fn handle_upstream_path(
             .body(body)
             .map_err(|e| ProxyError::Internal(format!("build error response: {e}")))?;
         *resp.headers_mut() = resp_headers;
-        log_access("GET", key, &resp);
         return Ok(resp);
     }
 
     // ENOSPC degradation
     if let Some(direct_response) = result.degraded_body {
-        let resp = build_passthrough_response(
+        return build_passthrough_response(
             direct_response,
             result.full_size,
             result.content_type,
             result.etag,
             result.last_modified,
             result.cache_control,
-        )?;
-        log_access("GET", key, &resp);
-        return Ok(resp);
+        );
     }
 
     // Unknown-size (chunked upstream)
@@ -468,7 +494,9 @@ async fn handle_upstream_path(
         if let Some(ref uh) = result.upstream_headers {
             merge_upstream_headers(uh, &mut resp_headers);
         }
-        resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+        if cache_key.is_some() {
+            resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+        }
 
         let stream = make_unknown_size_stream(result.download);
         let body = Body::from_stream(stream);
@@ -477,7 +505,6 @@ async fn handle_upstream_path(
             .body(body)
             .map_err(|e| ProxyError::Internal(format!("build chunked response: {e}")))?;
         *resp.headers_mut() = resp_headers;
-        log_access("GET", key, &resp);
         return Ok(resp);
     }
 
@@ -492,7 +519,9 @@ async fn handle_upstream_path(
     if let Some(ref uh) = result.upstream_headers {
         merge_upstream_headers(uh, &mut resp_headers);
     }
-    resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+    if cache_key.is_some() {
+        resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
+    }
     if full_size > 0 {
         resp_headers.insert(
             RESP_FULL_SIZE,
@@ -501,16 +530,14 @@ async fn handle_upstream_path(
     }
 
     let download_start = client_byte_range.as_ref().map_or(0, |r| r.start);
-    let resp = build_streaming_response(
+    build_streaming_response(
         result.download,
         full_size,
         client_byte_range,
         resp_headers,
         false,
         download_start,
-    )?;
-    log_access("GET", key, &resp);
-    Ok(resp)
+    )
 }
 
 /// RAII guard that cancels an in-flight download when dropped.

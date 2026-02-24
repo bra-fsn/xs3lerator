@@ -1,14 +1,11 @@
 use axum::http::HeaderMap;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 
 /// Parsed contract headers from a client request.
 #[derive(Debug, Clone)]
 pub struct ContractHeaders {
-    /// Base64-decoded real upstream URL.
-    pub upstream_url: Option<String>,
-    /// When true, skip S3 cache read and go directly to upstream.
-    pub cache_skip: bool,
+    /// Cache key for ES manifest / content-addressed storage.
+    /// When absent, xs3lerator operates as a pure download accelerator.
+    pub cache_key: Option<String>,
     /// Known object size (from passsage metadata), for S3 range-GETs without HEAD.
     pub object_size: Option<u64>,
     /// Skip TLS certificate verification for this upstream request.
@@ -17,9 +14,12 @@ pub struct ContractHeaders {
     /// response to the caller.  Default false — redirects are returned as-is
     /// so the caller (passsage) can cache them independently per RFC 9111.
     pub follow_redirects: bool,
+    /// When true, skip cache read and go directly to upstream even when a
+    /// cache key is provided.  The downloaded data is still persisted to cache.
+    pub cache_skip: bool,
 }
 
-const HEADER_UPSTREAM_URL: &str = "x-xs3lerator-upstream-url";
+const HEADER_CACHE_KEY: &str = "x-xs3lerator-cache-key";
 const HEADER_CACHE_SKIP: &str = "x-xs3lerator-cache-skip";
 const HEADER_OBJECT_SIZE: &str = "x-xs3lerator-object-size";
 const HEADER_TLS_SKIP_VERIFY: &str = "x-xs3lerator-tls-skip-verify";
@@ -29,7 +29,7 @@ const HEADER_FOLLOW_REDIRECTS: &str = "x-xs3lerator-follow-redirects";
 /// forwarding to the upstream server.
 pub const CONTRACT_PREFIX: &str = "x-xs3lerator-";
 
-/// Response header: whether data was served from S3 cache.
+/// Response header: whether data was served from cache.
 pub const RESP_CACHE_HIT: &str = "x-xs3lerator-cache-hit";
 /// Response header: full object size in bytes.
 pub const RESP_FULL_SIZE: &str = "x-xs3lerator-full-size";
@@ -38,11 +38,11 @@ pub const RESP_DEGRADED: &str = "x-xs3lerator-degraded";
 
 /// Parse contract headers from an incoming request.
 pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
-    let upstream_url = headers
-        .get(HEADER_UPSTREAM_URL)
+    let cache_key = headers
+        .get(HEADER_CACHE_KEY)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| BASE64.decode(v).ok())
-        .and_then(|bytes| String::from_utf8(bytes).ok());
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
 
     let cache_skip = headers
         .get(HEADER_CACHE_SKIP)
@@ -68,7 +68,7 @@ pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
         .unwrap_or(false);
 
     ContractHeaders {
-        upstream_url,
+        cache_key,
         cache_skip,
         object_size,
         tls_skip_verify,
@@ -112,44 +112,59 @@ pub fn filter_upstream_headers(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
-/// Parse the cache key from the URL path.
+/// Extract the upstream URL from the request URI.
 ///
-/// Path format: `/<key...>`
-/// Returns the key (everything after the leading `/`), or None if empty.
-pub fn parse_key(path: &str) -> Option<String> {
-    let key = path.trim_start_matches('/');
-    if key.is_empty() {
+/// The upstream URL is encoded in the path+query of the incoming request:
+/// `GET /https://example.com/path?q=1` → upstream URL is `https://example.com/path?q=1`
+///
+/// Returns None if the path is empty or just `/`.
+pub fn parse_upstream_url(uri: &axum::http::Uri) -> Option<String> {
+    let pq = uri.path_and_query()?;
+    let raw = pq.as_str().strip_prefix('/')?;
+    if raw.is_empty() {
         return None;
     }
-    Some(key.to_string())
+    Some(raw.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderValue, Uri};
 
     #[test]
-    fn parse_key_normal() {
-        let k = parse_key("/https/host/a/b/c/hash.iso").unwrap();
-        assert_eq!(k, "https/host/a/b/c/hash.iso");
+    fn parse_upstream_url_normal() {
+        let uri: Uri = "/https://example.com/file.iso".parse().unwrap();
+        assert_eq!(
+            parse_upstream_url(&uri).unwrap(),
+            "https://example.com/file.iso"
+        );
     }
 
     #[test]
-    fn parse_key_empty() {
-        assert!(parse_key("/").is_none());
-        assert!(parse_key("").is_none());
+    fn parse_upstream_url_with_query() {
+        let uri: Uri = "/https://example.com/file?token=abc&v=1".parse().unwrap();
+        assert_eq!(
+            parse_upstream_url(&uri).unwrap(),
+            "https://example.com/file?token=abc&v=1"
+        );
+    }
+
+    #[test]
+    fn parse_upstream_url_empty() {
+        let uri: Uri = "/".parse().unwrap();
+        assert!(parse_upstream_url(&uri).is_none());
     }
 
     #[test]
     fn filter_strips_contract_headers() {
         let mut h = HeaderMap::new();
-        h.insert("x-xs3lerator-cache-skip", HeaderValue::from_static("true"));
+        h.insert("x-xs3lerator-cache-key", HeaderValue::from_static("key1"));
         h.insert("accept", HeaderValue::from_static("*/*"));
         h.insert("host", HeaderValue::from_static("example.com"));
         h.insert("range", HeaderValue::from_static("bytes=0-100"));
         let filtered = filter_upstream_headers(&h);
-        assert!(filtered.get("x-xs3lerator-cache-skip").is_none());
+        assert!(filtered.get("x-xs3lerator-cache-key").is_none());
         assert!(filtered.get("host").is_none());
         assert!(filtered.get("range").is_none());
         assert_eq!(filtered.get("accept").unwrap(), "*/*");
@@ -158,14 +173,13 @@ mod tests {
     #[test]
     fn parse_contract_headers_full() {
         let mut h = HeaderMap::new();
-        let url = BASE64.encode("https://example.com/file.iso");
-        h.insert(HEADER_UPSTREAM_URL, url.parse().unwrap());
+        h.insert(HEADER_CACHE_KEY, HeaderValue::from_static("https/host/abc123"));
         h.insert(HEADER_CACHE_SKIP, HeaderValue::from_static("true"));
         h.insert(HEADER_OBJECT_SIZE, HeaderValue::from_static("12345"));
         h.insert(HEADER_TLS_SKIP_VERIFY, HeaderValue::from_static("true"));
         h.insert(HEADER_FOLLOW_REDIRECTS, HeaderValue::from_static("true"));
         let c = parse_contract_headers(&h);
-        assert_eq!(c.upstream_url.as_deref(), Some("https://example.com/file.iso"));
+        assert_eq!(c.cache_key.as_deref(), Some("https/host/abc123"));
         assert!(c.cache_skip);
         assert_eq!(c.object_size, Some(12345));
         assert!(c.tls_skip_verify);
@@ -176,10 +190,18 @@ mod tests {
     fn parse_contract_headers_absent() {
         let h = HeaderMap::new();
         let c = parse_contract_headers(&h);
-        assert!(c.upstream_url.is_none());
+        assert!(c.cache_key.is_none());
         assert!(!c.cache_skip);
         assert!(c.object_size.is_none());
         assert!(!c.tls_skip_verify);
         assert!(!c.follow_redirects);
+    }
+
+    #[test]
+    fn parse_contract_headers_no_cache_key_is_passthrough() {
+        let mut h = HeaderMap::new();
+        h.insert(HEADER_TLS_SKIP_VERIFY, HeaderValue::from_static("true"));
+        let c = parse_contract_headers(&h);
+        assert!(c.cache_key.is_none());
     }
 }

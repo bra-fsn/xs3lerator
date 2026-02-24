@@ -5,8 +5,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 
 use xs3lerator::config::AppConfig;
 use xs3lerator::download::DownloadManager;
@@ -29,6 +27,7 @@ fn test_config() -> AppConfig {
         elasticsearch_manifest_index: "xs3_manifests".to_string(),
         elasticsearch_replicas: 0,
         elasticsearch_shards: 1,
+        passthrough: false,
     }
 }
 
@@ -151,10 +150,9 @@ async fn proxy_get(
     upstream_url: &str,
     follow_redirects: bool,
 ) -> reqwest::Response {
-    let upstream_b64 = BASE64.encode(upstream_url);
     let mut req = client
-        .get(format!("{xs3_base}/test-key"))
-        .header("X-Xs3lerator-Upstream-Url", &upstream_b64)
+        .get(format!("{xs3_base}/{upstream_url}"))
+        .header("X-Xs3lerator-Cache-Key", "test-key")
         .header("X-Xs3lerator-Cache-Skip", "true");
     if follow_redirects {
         req = req.header("X-Xs3lerator-Follow-Redirects", "true");

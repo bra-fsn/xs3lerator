@@ -49,7 +49,9 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(TraceWriter::new(Box::new(file)))
     });
 
-    let es_client = if let Some(ref es_url) = config.elasticsearch_url {
+    let es_client = if config.passthrough {
+        None
+    } else if let Some(ref es_url) = config.elasticsearch_url {
         let client = es_client::EsClient::new(es_url, &config.elasticsearch_manifest_index);
         client
             .create_index_if_not_exists(config.elasticsearch_shards, config.elasticsearch_replicas)
@@ -81,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         chunk_size = config.chunk_size,
         data_dir = %config.data_dir.display(),
         temp_dir = %config.temp_dir.display(),
+        passthrough = config.passthrough,
         "configuration loaded"
     );
 
