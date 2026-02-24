@@ -31,6 +31,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    info!(
+        version = concat!(env!("CARGO_PKG_VERSION"), "-", env!("GIT_SHA")),
+        "starting xs3lerator"
+    );
+
     let args = CliArgs::parse();
     let debug_trace = args.debug_trace.clone();
     let config = AppConfig::try_from(args)?;
