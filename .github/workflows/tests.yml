@@ -50,7 +50,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ./docker
-          file: Dockerfile.mount-s3
+          file: docker/Dockerfile.mount-s3
           load: true
           tags: xs3lerator_mount-s3:latest
           cache-from: type=gha,scope=compose-mount-s3
