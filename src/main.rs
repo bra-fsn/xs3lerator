@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!(
-        version = concat!(env!("CARGO_PKG_VERSION"), "-", env!("GIT_SHA")),
+        version = concat!(env!("CARGO_PKG_VERSION"), env!("GIT_SHA")),
         "starting xs3lerator"
     );
 

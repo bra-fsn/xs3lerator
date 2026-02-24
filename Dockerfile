@@ -47,6 +47,8 @@ RUN case "$TARGETARCH" in \
 COPY . .
 RUN touch src/main.rs src/lib.rs
 
+ARG GITHUB_SHA
+
 RUN case "$TARGETARCH" in \
       amd64) TARGET=x86_64-unknown-linux-musl ;; \
       arm64) TARGET=aarch64-unknown-linux-musl ;; \
