@@ -5,6 +5,7 @@ pub mod error;
 pub mod es_client;
 pub mod handler;
 pub mod headers;
+pub mod http_pool;
 pub mod manifest;
 pub mod planner;
 pub mod range;

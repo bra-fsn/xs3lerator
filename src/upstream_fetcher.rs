@@ -16,6 +16,7 @@ use crate::download::{
 use crate::error::ProxyError;
 use crate::es_client::EsClient;
 use crate::headers::{filter_upstream_headers, ContractHeaders};
+use crate::http_pool::HttpClientPool;
 use crate::planner::compute_chunk_plan;
 use crate::range::parse_range_header;
 use crate::trace::{trace_log, TraceWriter};
@@ -61,6 +62,7 @@ pub async fn fetch_upstream(
     data_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
     es_client: Option<Arc<EsClient>>,
+    http_pool: &HttpClientPool,
 ) -> Result<UpstreamResult, ProxyError> {
     // Check for an existing in-flight download for the same cache key.
     // This handles the deduplication case within a single instance.
@@ -93,22 +95,11 @@ pub async fn fetch_upstream(
         }
     }
 
-    // Build the reqwest client
+    // Get a pooled reqwest client (connections are reused across requests)
     let skip_tls = config.upstream_tls_skip_verify || contract.tls_skip_verify;
-    let redirect_policy = if contract.follow_redirects {
-        reqwest::redirect::Policy::default()
-    } else {
-        reqwest::redirect::Policy::none()
-    };
-    let http_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(skip_tls)
-        .redirect(redirect_policy)
-        .no_gzip()
-        .no_deflate()
-        .no_brotli()
-        .no_zstd()
-        .build()
-        .map_err(|e| ProxyError::Internal(format!("build http client: {e}")))?;
+    let http_client = http_pool
+        .get(skip_tls, contract.follow_redirects)
+        .map_err(|e| ProxyError::Internal(format!("get http client: {e}")))?;
 
     // Build filtered headers for the upstream request
     let upstream_headers = filter_upstream_headers(client_headers);

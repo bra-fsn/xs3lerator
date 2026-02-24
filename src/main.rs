@@ -11,6 +11,7 @@ mod error;
 mod es_client;
 mod handler;
 mod headers;
+mod http_pool;
 mod manifest;
 mod planner;
 mod range;
@@ -71,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         downloads: Arc::new(download::DownloadManager::default()),
         trace: trace_writer,
         es_client,
+        http_pool: Arc::new(http_pool::HttpClientPool::new()),
     };
 
     let addr = SocketAddr::from((config.bind_ip, config.port));

@@ -45,6 +45,7 @@ fn make_state() -> AppState {
         downloads: Arc::new(DownloadManager::default()),
         trace: None,
         es_client: None,
+        http_pool: Arc::new(xs3lerator::http_pool::HttpClientPool::new()),
     }
 }
 

@@ -22,6 +22,7 @@ use crate::es_client::EsClient;
 use crate::headers::{
     self, parse_upstream_url, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
 };
+use crate::http_pool::HttpClientPool;
 use crate::manifest::{Manifest, hash_to_chunk_path};
 use crate::range::{parse_range_header, ByteRange};
 use crate::trace::{trace_log, TraceWriter};
@@ -46,6 +47,7 @@ pub struct AppState {
     pub downloads: Arc<DownloadManager>,
     pub trace: Option<Arc<TraceWriter>>,
     pub es_client: Option<Arc<EsClient>>,
+    pub http_pool: Arc<HttpClientPool>,
 }
 
 /// Health check endpoint: `GET /healthz`
@@ -444,6 +446,7 @@ async fn handle_upstream_path(
         &state.data_dir,
         &state.trace,
         state.es_client.clone(),
+        &state.http_pool,
     )
     .await?;
 
