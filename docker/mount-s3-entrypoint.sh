@@ -22,5 +22,9 @@ exec mount-s3 \
     --allow-delete \
     --allow-other \
     --force-path-style \
+    --uid "${MOUNT_UID:-0}" \
+    --gid "${MOUNT_GID:-0}" \
+    --dir-mode 0755 \
+    --file-mode 0644 \
     -f \
     "${BUCKET}" "${MOUNTPOINT}"

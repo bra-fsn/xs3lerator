@@ -57,6 +57,8 @@ services:
       - MOUNT_S3_BUCKET=xs3lerator-test
       - MOUNT_S3_MOUNTPOINT=/mnt/shared/bucket
       - MOUNT_S3_ENDPOINT=http://localstack:4566
+      - MOUNT_UID=65534
+      - MOUNT_GID=65534
     depends_on:
       localstack:
         condition: service_healthy
