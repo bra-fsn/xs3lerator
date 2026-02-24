@@ -7,7 +7,6 @@ use clap::Parser;
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_HTTP_CONCURRENCY: usize = 8;
 const DEFAULT_CHUNK_SIZE: &str = "8MiB";
-const DEFAULT_PREFETCH_WINDOW: usize = 16;
 const DEFAULT_OPEN_PARALLELISM: usize = 8;
 
 /// High-performance HTTP download accelerator and caching proxy with
@@ -82,16 +81,9 @@ pub struct CliArgs {
     #[arg(long, env = "XS3_PASSTHROUGH", default_value_t = false)]
     pub passthrough: bool,
 
-    /// How many chunk files to buffer ahead of the streaming cursor when
-    /// serving from cache.  Each slot holds an open file handle with
-    /// fadvise(WILLNEED) already issued, so the page-cache is warm by
-    /// the time the reader reaches that chunk.
-    #[arg(long, env = "XS3_PREFETCH_WINDOW", default_value_t = DEFAULT_PREFETCH_WINDOW)]
-    pub prefetch_window: usize,
-
-    /// Maximum concurrent open() + fadvise() calls in the prefetch pipeline.
-    /// On FUSE/mount-s3, each open() triggers an S3 HeadObject (~30 ms),
-    /// so parallelism here directly reduces the per-chunk latency.
+    /// Maximum concurrent open() + preread calls in the prefetch pipeline.
+    /// On FUSE/mount-s3, each open()+read(1 byte) triggers an S3 GetObject,
+    /// so parallelism here directly reduces cold-cache latency.
     #[arg(long, env = "XS3_OPEN_PARALLELISM", default_value_t = DEFAULT_OPEN_PARALLELISM)]
     pub open_parallelism: usize,
 }
@@ -109,7 +101,6 @@ pub struct AppConfig {
     pub elasticsearch_url: Option<String>,
     pub elasticsearch_manifest_index: String,
     pub passthrough: bool,
-    pub prefetch_window: usize,
     pub open_parallelism: usize,
 }
 
@@ -160,7 +151,6 @@ impl TryFrom<CliArgs> for AppConfig {
             elasticsearch_url: args.elasticsearch_url,
             elasticsearch_manifest_index: args.elasticsearch_manifest_index,
             passthrough: args.passthrough,
-            prefetch_window: args.prefetch_window,
             open_parallelism: args.open_parallelism,
         })
     }

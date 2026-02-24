@@ -26,7 +26,6 @@ fn test_config() -> AppConfig {
         elasticsearch_url: None,
         elasticsearch_manifest_index: "passsage_meta".to_string(),
         passthrough: false,
-        prefetch_window: 16,
         open_parallelism: 8,
     }
 }
