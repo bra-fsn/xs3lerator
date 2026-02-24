@@ -6,7 +6,7 @@ use futures::StreamExt;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, TRANSFER_ENCODING};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::chunk_upload;
 use crate::config::AppConfig;
@@ -133,7 +133,7 @@ pub async fn fetch_upstream(
     let status = response.status();
     if status.is_redirection() && !contract.follow_redirects {
         let redirect_headers = response.headers().clone();
-        info!(
+        debug!(
             status = status.as_u16(),
             location = redirect_headers.get("location").and_then(|v| v.to_str().ok()).unwrap_or(""),
             "upstream returned redirect, passing through to client"
@@ -261,7 +261,7 @@ pub async fn fetch_upstream(
     }
 
     // Chunked / unknown size — buffer through sequential download
-    info!("upstream response is chunked/unknown size, using sequential download");
+    debug!("upstream response is chunked/unknown size, using sequential download");
     start_sequential_download(
         config,
         response,
@@ -379,7 +379,7 @@ async fn start_parallel_upstream_download(
 
         match result {
             Ok(()) => {
-                info!(key = ck, "upstream download complete");
+                debug!(key = ck, "upstream download complete");
             }
             Err(e) => {
                 tracing::error!(key = ck, "upstream download failed: {e}");
@@ -508,7 +508,7 @@ async fn run_adaptive_upstream(
                         "seq_chunk": seq_chunk,
                         "effective_stop": effective_stop,
                     }));
-                    info!(
+                    debug!(
                         seq_chunk,
                         effective_stop,
                         probe_chunk = probe_idx,
@@ -602,7 +602,7 @@ async fn run_adaptive_upstream(
                         "probe_chunk": probe_target,
                         "status": resp.status().as_u16(),
                     }));
-                    info!(
+                    debug!(
                         status = resp.status().as_u16(),
                         "range probe rejected, continuing sequential"
                     );

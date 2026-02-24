@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::download::InFlightDownload;
 use crate::error::ProxyError;
@@ -126,7 +126,7 @@ async fn run_chunk_persist(
         return Ok(());
     }
 
-    info!(key, num_chunks, "starting content-addressed chunk persist");
+    debug!(key, num_chunks, "starting content-addressed chunk persist");
 
     let mut handles = Vec::with_capacity(num_chunks);
     for idx in 0..num_chunks {
@@ -184,7 +184,7 @@ async fn run_chunk_persist(
             }
             download.s3_upload_complete.store(true, Ordering::Release);
             download.wake_waiters();
-            info!(key, "manifest written");
+            debug!(key, "manifest written");
         }
     }
 

@@ -36,6 +36,8 @@ jobs:
         run: mkdir -p .data
 
       - name: Start all services
+        env:
+          RUST_LOG: "debug"
         run: docker compose up -d --build --wait
         timeout-minutes: 10
 

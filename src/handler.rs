@@ -12,7 +12,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use nix::fcntl::{posix_fadvise, PosixFadviseAdvice};
 use serde_json::json;
-use tracing::info;
+use axum::http::header::CONTENT_LENGTH;
+use tracing::{debug, info};
 
 use crate::config::AppConfig;
 use crate::download::{InFlightDownload, DownloadManager};
@@ -25,6 +26,17 @@ use crate::manifest::{Manifest, hash_to_chunk_path};
 use crate::range::{parse_range_header, ByteRange};
 use crate::trace::{trace_log, TraceWriter};
 use crate::upstream_fetcher;
+
+/// Log a single access-log style line when a response is sent.
+fn log_access(method: &str, key: &str, response: &Response) {
+    let status = response.status().as_u16();
+    let size = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    info!(method, key, status, size, "access");
+}
 
 /// Shared application state.
 #[derive(Clone)]
@@ -71,7 +83,7 @@ pub async fn handle_post(
         })?
         .to_string();
 
-    info!(
+    debug!(
         source = source_key,
         target = target_key,
         "manifest alias request"
@@ -81,7 +93,7 @@ pub async fn handle_post(
     {
         let active = state.downloads.get_inflight(&source_key);
         if let Some(inflight) = active {
-            info!(
+            debug!(
                 source = source_key,
                 "waiting for in-flight download to complete manifest write"
             );
@@ -98,12 +110,14 @@ pub async fn handle_post(
         es.put_manifest(&target_key, manifest_bytes).await?;
     }
 
-    info!(target = target_key, "manifest alias created");
+    debug!(target = target_key, "manifest alias created");
 
-    Ok(Response::builder()
+    let resp = Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
-        .unwrap())
+        .unwrap();
+    log_access("POST", &target_key, &resp);
+    Ok(resp)
 }
 
 /// Main GET handler: `GET /<key...>`
@@ -152,7 +166,7 @@ pub async fn handle_get(
     {
         Ok(resp) => Ok(resp),
         Err(e) => {
-            info!(
+            debug!(
                 key = key.as_str(),
                 error = %e,
                 "cache fetch failed, falling back to upstream"
@@ -259,6 +273,7 @@ async fn handle_cache_hit(
         .map_err(|e| ProxyError::Internal(format!("build response: {e}")))?;
 
     *response.headers_mut() = resp_headers;
+    log_access("GET", key, &response);
     Ok(response)
 }
 
@@ -406,6 +421,7 @@ async fn handle_upstream_path(
             .map_err(|e| ProxyError::Internal(format!("build redirect response: {e}")))?;
         let mut resp = resp;
         *resp.headers_mut() = resp_headers;
+        log_access("GET", key, &resp);
         return Ok(resp);
     }
 
@@ -428,19 +444,22 @@ async fn handle_upstream_path(
             .body(body)
             .map_err(|e| ProxyError::Internal(format!("build error response: {e}")))?;
         *resp.headers_mut() = resp_headers;
+        log_access("GET", key, &resp);
         return Ok(resp);
     }
 
     // ENOSPC degradation
     if let Some(direct_response) = result.degraded_body {
-        return build_passthrough_response(
+        let resp = build_passthrough_response(
             direct_response,
             result.full_size,
             result.content_type,
             result.etag,
             result.last_modified,
             result.cache_control,
-        );
+        )?;
+        log_access("GET", key, &resp);
+        return Ok(resp);
     }
 
     // Unknown-size (chunked upstream)
@@ -458,6 +477,7 @@ async fn handle_upstream_path(
             .body(body)
             .map_err(|e| ProxyError::Internal(format!("build chunked response: {e}")))?;
         *resp.headers_mut() = resp_headers;
+        log_access("GET", key, &resp);
         return Ok(resp);
     }
 
@@ -481,14 +501,16 @@ async fn handle_upstream_path(
     }
 
     let download_start = client_byte_range.as_ref().map_or(0, |r| r.start);
-    build_streaming_response(
+    let resp = build_streaming_response(
         result.download,
         full_size,
         client_byte_range,
         resp_headers,
         false,
         download_start,
-    )
+    )?;
+    log_access("GET", key, &resp);
+    Ok(resp)
 }
 
 /// RAII guard that cancels an in-flight download when dropped.
