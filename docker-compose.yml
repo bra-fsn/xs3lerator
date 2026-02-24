@@ -38,6 +38,8 @@ services:
       dockerfile: Dockerfile.mount-s3
     cap_add:
       - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
     devices:
       - /dev/fuse
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
