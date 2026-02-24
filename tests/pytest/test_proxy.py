@@ -109,6 +109,19 @@ class TestCacheMiss:
             "Manifest should contain at least one chunk hash"
         )
 
+        # Verify the actual chunk data landed in S3 (through mount-s3).
+        # The manifest was only written after chunks were persisted + sync'd,
+        # so by this point they should be visible via the S3 API.
+        import struct
+        num_chunks = struct.unpack_from("<I", manifest_data, 22)[0]
+        for i in range(num_chunks):
+            chunk_hash = manifest_data[26 + i * 32 : 26 + (i + 1) * 32]
+            h = chunk_hash.hex()
+            s3_key = f"data/{h[0]}/{h[1]}/{h[2]}/{h[3]}/{h}"
+            obj = s3_client.get_object(Bucket=test_bucket, Key=s3_key)
+            body = obj["Body"].read()
+            assert len(body) > 0, f"Chunk {i} ({s3_key}) is empty in S3"
+
 
 # ── Cache hit → S3 serve ─────────────────────────────────────────────────
 

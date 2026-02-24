@@ -35,13 +35,13 @@ pub fn persist_chunk(
 
     // Copy from source fd to target path using positional reads
     use std::os::unix::fs::FileExt;
-    let mut target_file = std::fs::OpenOptions::new()
+    let target_file = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(&target);
 
     match target_file {
-        Ok(ref mut out) => {
+        Ok(mut out) => {
             use std::io::Write;
             let mut offset = 0u64;
             let mut buf = vec![0u8; 256 * 1024];
@@ -55,6 +55,11 @@ pub fn persist_chunk(
                 })?;
                 offset += to_read as u64;
             }
+            // Explicit sync+close to catch FUSE flush errors (e.g. mount-s3
+            // checksum rejections) that would be silently swallowed by drop().
+            out.sync_all().map_err(|e| {
+                ProxyError::Internal(format!("sync chunk {}: {e}", target.display()))
+            })?;
             Ok(true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
