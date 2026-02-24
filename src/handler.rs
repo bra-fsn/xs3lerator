@@ -1,5 +1,4 @@
 use std::cmp::min;
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,7 +9,6 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
-use nix::fcntl::{posix_fadvise, PosixFadviseAdvice};
 use serde_json::json;
 use axum::http::header::CONTENT_LENGTH;
 use tracing::{debug, info, warn};
@@ -231,8 +229,9 @@ struct PreparedChunk {
     chunk_len: u64,
 }
 
-/// Serve from cache using a prefetch pipeline: a background task opens and
-/// warms chunk files in parallel while the stream task reads sequentially.
+/// Serve from cache using a prefetch pipeline: a background task opens chunk
+/// files in parallel, reading 1 byte to trigger mount-s3's internal prefetcher,
+/// while the stream task reads sequentially.
 async fn handle_cache_hit(
     state: &AppState,
     cache_key: &str,
@@ -293,12 +292,9 @@ async fn handle_cache_hit(
                 let full_path = dir.join(&rel_path);
                 let result = match std::fs::File::open(&full_path) {
                     Ok(f) => {
-                        let _ = posix_fadvise(
-                            f.as_raw_fd(),
-                            0,
-                            chunk_len as i64,
-                            PosixFadviseAdvice::POSIX_FADV_WILLNEED,
-                        );
+                        use std::os::unix::fs::FileExt;
+                        let mut warmup = [0u8; 1];
+                        let _ = f.read_exact_at(&mut warmup, 0);
                         Ok(PreparedChunk {
                             file: Arc::new(f),
                             chunk_len,
