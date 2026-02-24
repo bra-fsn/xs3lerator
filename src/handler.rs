@@ -254,10 +254,7 @@ async fn handle_cache_hit(
     let chunk_range = manifest.chunks_for_range(serve_start, serve_end);
     let data_prefix = state.config.data_prefix.clone();
     let data_dir = state.data_dir.clone();
-    let prefetch_window = state.config.prefetch_window;
     let open_parallelism = state.config.open_parallelism;
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<PreparedChunk>(prefetch_window);
 
     let chunks_meta: Vec<(usize, [u8; 32], u64)> = chunk_range.clone().map(|idx| {
         let hash = manifest.hashes[idx];
@@ -269,49 +266,52 @@ async fn handle_cache_hit(
         (idx, hash, chunk_len)
     }).collect();
 
+    let num_chunks = chunks_meta.len();
+    let mut receivers = Vec::with_capacity(num_chunks);
+    let mut senders: Vec<Option<tokio::sync::oneshot::Sender<Result<PreparedChunk, String>>>> =
+        Vec::with_capacity(num_chunks);
+    for _ in 0..num_chunks {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        senders.push(Some(tx));
+        receivers.push(rx);
+    }
+
     tokio::spawn(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(open_parallelism));
-        let mut join_handles = Vec::with_capacity(chunks_meta.len());
 
-        for (_idx, hash, chunk_len) in chunks_meta {
+        for (slot, (_idx, hash, chunk_len)) in chunks_meta.into_iter().enumerate() {
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => break,
             };
-            let tx = tx.clone();
+            let tx = senders[slot].take().unwrap();
             let dir = data_dir.clone();
             let prefix = data_prefix.clone();
 
-            let handle = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 let rel_path = hash_to_chunk_path(&hash, &prefix);
                 let full_path = dir.join(&rel_path);
-                let file = match std::fs::File::open(&full_path) {
-                    Ok(f) => f,
+                let result = match std::fs::File::open(&full_path) {
+                    Ok(f) => {
+                        let _ = posix_fadvise(
+                            f.as_raw_fd(),
+                            0,
+                            chunk_len as i64,
+                            PosixFadviseAdvice::POSIX_FADV_WILLNEED,
+                        );
+                        Ok(PreparedChunk {
+                            file: Arc::new(f),
+                            chunk_len,
+                        })
+                    }
                     Err(e) => {
                         warn!(path = %full_path.display(), error = %e, "prefetch open failed");
-                        drop(permit);
-                        return;
+                        Err(format!("chunk file {}: {e}", full_path.display()))
                     }
                 };
-
-                let _ = posix_fadvise(
-                    file.as_raw_fd(),
-                    0,
-                    chunk_len as i64,
-                    PosixFadviseAdvice::POSIX_FADV_WILLNEED,
-                );
-
-                let _ = tx.blocking_send(PreparedChunk {
-                    file: Arc::new(file),
-                    chunk_len,
-                });
+                let _ = tx.send(result);
                 drop(permit);
             });
-            join_handles.push(handle);
-        }
-
-        for h in join_handles {
-            let _ = h.await;
         }
     });
 
@@ -350,7 +350,7 @@ async fn handle_cache_hit(
     );
     resp_headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
 
-    let stream = make_prefetch_stream(rx, offset_in_first_chunk, serve_len);
+    let stream = make_prefetch_stream(receivers, offset_in_first_chunk, serve_len);
     let body = Body::from_stream(stream);
     let mut response = Response::builder()
         .status(status)
@@ -361,9 +361,9 @@ async fn handle_cache_hit(
     Ok(response)
 }
 
-/// Stream data from chunk files received through the prefetch channel.
+/// Stream data from chunk files received through ordered oneshot channels.
 fn make_prefetch_stream(
-    mut rx: tokio::sync::mpsc::Receiver<PreparedChunk>,
+    receivers: Vec<tokio::sync::oneshot::Receiver<Result<PreparedChunk, String>>>,
     offset_in_first_chunk: u64,
     read_len: u64,
 ) -> impl futures::Stream<Item = Result<Bytes, ProxyError>> {
@@ -375,7 +375,10 @@ fn make_prefetch_stream(
         let mut remaining = read_len;
         let mut first = true;
 
-        while let Some(chunk) = rx.recv().await {
+        for rx in receivers {
+            let chunk = rx.await
+                .map_err(|_| ProxyError::Internal("prefetch task dropped".into()))?
+                .map_err(|e| ProxyError::NotFound(e))?;
             let start_offset = if first {
                 first = false;
                 offset_in_first_chunk
