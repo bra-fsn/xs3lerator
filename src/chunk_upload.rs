@@ -106,8 +106,9 @@ async fn run_chunk_persist(
 ) -> Result<(), ProxyError> {
     // For unknown-size (chunked) responses the persist task is spawned
     // immediately but must wait until the stream finishes to know the
-    // actual number of chunks.
-    if !download.is_stream_complete() {
+    // actual number of chunks. Known-size downloads (object_size > 0) have
+    // their chunk count fixed at creation, so no wait is needed.
+    if download.object_size == 0 && !download.is_stream_complete() {
         download.wait_for_stream_complete().await;
     }
 
