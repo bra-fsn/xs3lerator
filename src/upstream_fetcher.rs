@@ -17,7 +17,7 @@ use crate::error::ProxyError;
 use crate::es_client::EsClient;
 use crate::headers::{filter_upstream_headers, ContractHeaders};
 use crate::http_pool::HttpClientPool;
-use crate::planner::compute_chunk_plan;
+use crate::planner::{compute_chunk_plan, ConcurrencyRamp};
 use crate::range::parse_range_header;
 use crate::trace::{trace_log, TraceWriter};
 
@@ -539,14 +539,15 @@ async fn run_adaptive_upstream(
                     }
 
                     // Persistent workers: each loops pulling the *next* chunk in order
-                    // from a shared atomic cursor.  This guarantees near-sequential
-                    // completion and enables reqwest connection reuse between chunks.
+                    // from a shared atomic cursor.  Workers check the ConcurrencyRamp
+                    // before starting each chunk so the pool grows gradually.
                     if !parallel_chunks.is_empty() {
                         let num_workers = max_concurrency.min(parallel_chunks.len());
                         let cursor = Arc::new(AtomicUsize::new(0));
                         let chunks = Arc::new(parallel_chunks);
+                        let ramp = Arc::new(ConcurrencyRamp::new(max_concurrency));
 
-                        for _ in 0..num_workers {
+                        for worker_id in 0..num_workers {
                             let cursor = cursor.clone();
                             let chunks = chunks.clone();
                             let client = http_client.clone();
@@ -554,10 +555,30 @@ async fn run_adaptive_upstream(
                             let hdrs = upstream_headers.clone();
                             let dl_ptr3 = download as *const InFlightDownload as usize;
                             let trace_c = trace.clone();
+                            let ramp = ramp.clone();
 
                             parallel_handles.push(tokio::spawn(async move {
                                 let download = unsafe { &*(dl_ptr3 as *const InFlightDownload) };
                                 loop {
+                                    // Ramp gate: workers beyond the current active
+                                    // level yield until the ramp admits them.
+                                    if worker_id >= ramp.active_workers() {
+                                        tokio::task::yield_now().await;
+                                        if worker_id >= ramp.active_workers() {
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_millis(50),
+                                            ).await;
+                                            if worker_id >= ramp.active_workers() {
+                                                // Still not admitted — check if ramp
+                                                // is frozen (will never grow further).
+                                                if ramp.is_frozen() {
+                                                    break;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+
                                     let pos = cursor.fetch_add(1, Ordering::Relaxed);
                                     if pos >= chunks.len() { break; }
                                     let idx = chunks[pos];
@@ -577,20 +598,36 @@ async fn run_adaptive_upstream(
                                         }
                                     }
                                     req = req.header("Range", format!("bytes={start}-{end}"));
-                                    let response = req.send().await.map_err(|e| {
-                                        ProxyError::Upstream(format!("range chunk {idx}: {e}"))
-                                    })?;
-                                    if !response.status().is_success()
-                                        && response.status().as_u16() != 206
-                                    {
-                                        return Err(ProxyError::Upstream(format!(
-                                            "range chunk {idx} returned {}",
-                                            response.status()
-                                        )));
+                                    let response = req.send().await;
+                                    match response {
+                                        Ok(resp) if resp.status().is_success()
+                                            || resp.status().as_u16() == 206 =>
+                                        {
+                                            match download_chunk_from_stream(
+                                                resp, &chunk_file, download,
+                                                idx, expected, &trace_c,
+                                            ).await {
+                                                Ok(()) => ramp.record_chunk(expected),
+                                                Err(e) => {
+                                                    ramp.record_error();
+                                                    return Err(e);
+                                                }
+                                            }
+                                        }
+                                        Ok(resp) => {
+                                            ramp.record_error();
+                                            return Err(ProxyError::Upstream(format!(
+                                                "range chunk {idx} returned {}",
+                                                resp.status()
+                                            )));
+                                        }
+                                        Err(e) => {
+                                            ramp.record_error();
+                                            return Err(ProxyError::Upstream(
+                                                format!("range chunk {idx}: {e}")
+                                            ));
+                                        }
                                     }
-                                    download_chunk_from_stream(
-                                        response, &chunk_file, download, idx, expected, &trace_c,
-                                    ).await?;
                                 }
                                 Ok(())
                             }));

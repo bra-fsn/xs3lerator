@@ -1,4 +1,8 @@
 use std::cmp::{max, min};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
+
+use parking_lot::Mutex;
 
 /// Computed download strategy for an object.
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +70,187 @@ pub fn expected_chunk_len(idx: usize, chunk_size: u64, object_size: u64) -> u64 
     let start = idx as u64 * chunk_size;
     let end = min(start + chunk_size, object_size);
     end - start
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive concurrency ramp-up controller
+// ---------------------------------------------------------------------------
+//
+// Research across 77 Debian mirrors + HuggingFace showed five server archetypes:
+//
+//  1. Linear scalers   (annexia, mirhosting)  — 13→218 MiB/s at 16x
+//  2. Moderate scalers  (ethz, kaist)          — sweet spot 8-16 streams
+//  3. Diminishing       (keystealth, steadfast) — fast 1-stream, <2x gain
+//  4. Regressors        (byfly, osuosl)         — slower with parallel (<1x)
+//  5. Error-cliff       (HuggingFace @64)       — hard connection cap
+//
+// The ramp starts at INITIAL_WORKERS, measures aggregate throughput over
+// RAMP_WINDOW completed chunks, and doubles workers when throughput
+// improved by ≥ SCALE_UP_THRESHOLD (50%).  It freezes when:
+//   - throughput gain drops below the threshold (diminishing returns), or
+//   - error rate exceeds ERROR_CEILING (10%), or
+//   - max_concurrency is reached.
+//
+// The controller is lock-free on the hot path (worker reads) and uses a
+// Mutex only for the infrequent ramp-up decision (once per doubling).
+
+const INITIAL_WORKERS: usize = 4;
+const RAMP_WINDOW: usize = 4;
+const SCALE_UP_THRESHOLD: f64 = 0.50;
+const ERROR_CEILING: f64 = 0.10;
+
+/// Per-level throughput snapshot taken when enough chunks complete.
+#[derive(Debug, Clone, Copy)]
+struct RampSample {
+    #[allow(dead_code)]
+    concurrency: usize,
+    bytes_per_sec: f64,
+}
+
+/// Adaptive concurrency controller for upstream HTTP downloads.
+///
+/// Workers call [`active_workers`] to check whether they should run.
+/// The download loop calls [`record_chunk`] after each chunk completes
+/// and [`record_error`] on failures; the controller internally decides
+/// when to double the worker count.
+pub struct ConcurrencyRamp {
+    max_concurrency: usize,
+    active: AtomicUsize,
+    frozen: AtomicUsize, // 0 = not frozen, >0 = frozen at this level
+
+    // Throughput tracking for the current ramp level
+    level_bytes: AtomicU64,
+    level_chunks: AtomicUsize,
+    level_errors: AtomicUsize,
+    level_start: Mutex<Instant>,
+    samples: Mutex<Vec<RampSample>>,
+}
+
+impl ConcurrencyRamp {
+    pub fn new(max_concurrency: usize) -> Self {
+        let initial = INITIAL_WORKERS.min(max_concurrency).max(1);
+        Self {
+            max_concurrency,
+            active: AtomicUsize::new(initial),
+            frozen: AtomicUsize::new(0),
+            level_bytes: AtomicU64::new(0),
+            level_chunks: AtomicUsize::new(0),
+            level_errors: AtomicUsize::new(0),
+            level_start: Mutex::new(Instant::now()),
+            samples: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Current number of workers that should be running.
+    pub fn active_workers(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Record a successfully completed chunk of `bytes` length.
+    /// Internally triggers a ramp-up evaluation when enough chunks
+    /// have completed at the current level.
+    pub fn record_chunk(&self, bytes: u64) {
+        self.level_bytes.fetch_add(bytes, Ordering::Relaxed);
+        let chunks = self.level_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if self.frozen.load(Ordering::Relaxed) > 0 {
+            return;
+        }
+        if chunks >= RAMP_WINDOW {
+            self.evaluate_ramp();
+        }
+    }
+
+    /// Record a failed chunk (connection error, non-2xx, timeout).
+    pub fn record_error(&self) {
+        self.level_errors.fetch_add(1, Ordering::Relaxed);
+
+        // Check error rate immediately — don't wait for the window.
+        let errors = self.level_errors.load(Ordering::Relaxed);
+        let chunks = self.level_chunks.load(Ordering::Relaxed);
+        let total = chunks + errors;
+        if total >= 2 && errors as f64 / total as f64 > ERROR_CEILING {
+            self.freeze();
+        }
+    }
+
+    fn evaluate_ramp(&self) {
+        let mut samples = self.samples.lock();
+        let current = self.active.load(Ordering::Acquire);
+
+        let bytes = self.level_bytes.swap(0, Ordering::Relaxed);
+        let _chunks = self.level_chunks.swap(0, Ordering::Relaxed);
+        let errors = self.level_errors.swap(0, Ordering::Relaxed);
+
+        let elapsed = {
+            let mut start = self.level_start.lock();
+            let e = start.elapsed();
+            *start = Instant::now();
+            e
+        };
+
+        let secs = elapsed.as_secs_f64();
+        if secs < 0.001 {
+            return;
+        }
+
+        let total_attempts = _chunks + errors;
+        if total_attempts > 0 && errors as f64 / total_attempts as f64 > ERROR_CEILING {
+            self.frozen.store(current, Ordering::Release);
+            return;
+        }
+
+        let bps = bytes as f64 / secs;
+        samples.push(RampSample {
+            concurrency: current,
+            bytes_per_sec: bps,
+        });
+
+        if current >= self.max_concurrency {
+            self.frozen.store(current, Ordering::Release);
+            return;
+        }
+
+        // Compare to previous level's throughput
+        if samples.len() >= 2 {
+            let prev = samples[samples.len() - 2].bytes_per_sec;
+            if prev > 0.0 {
+                let gain = (bps - prev) / prev;
+                if gain < SCALE_UP_THRESHOLD {
+                    // Throughput plateau — keep current level
+                    self.frozen.store(current, Ordering::Release);
+                    return;
+                }
+            }
+        }
+
+        // Scale up: double workers (capped at max)
+        let next = (current * 2).min(self.max_concurrency);
+        self.active.store(next, Ordering::Release);
+    }
+
+    fn freeze(&self) {
+        let current = self.active.load(Ordering::Acquire);
+        // Roll back to previous level if we have one
+        let prev = (current / 2).max(INITIAL_WORKERS).max(1);
+        self.active.store(prev, Ordering::Release);
+        self.frozen.store(prev, Ordering::Release);
+    }
+
+    /// True when the controller has settled on a final concurrency level.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire) > 0
+    }
+
+    /// Summary of throughput samples collected during ramp-up.
+    #[allow(dead_code)]
+    pub fn samples(&self) -> Vec<(usize, f64)> {
+        self.samples
+            .lock()
+            .iter()
+            .map(|s| (s.concurrency, s.bytes_per_sec))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -186,5 +371,92 @@ mod tests {
         let last_idx = (size.div_ceil(chunk) - 1) as usize;
         assert_eq!(expected_chunk_len(0, chunk, size), chunk);
         assert_eq!(expected_chunk_len(last_idx, chunk, size), 1 << 20);
+    }
+
+    #[test]
+    fn ramp_starts_at_initial_workers() {
+        let ramp = ConcurrencyRamp::new(32);
+        assert_eq!(ramp.active_workers(), INITIAL_WORKERS);
+        assert!(!ramp.is_frozen());
+    }
+
+    #[test]
+    fn ramp_initial_capped_at_max() {
+        let ramp = ConcurrencyRamp::new(2);
+        assert_eq!(ramp.active_workers(), 2);
+    }
+
+    #[test]
+    fn ramp_scales_up_on_good_throughput() {
+        let ramp = ConcurrencyRamp::new(32);
+        assert_eq!(ramp.active_workers(), 4);
+
+        // First window: 4 chunks at ~100 MB/s baseline
+        for _ in 0..RAMP_WINDOW {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            ramp.record_chunk(8 << 20);
+        }
+        // First sample recorded; no previous to compare → scales up
+        assert_eq!(ramp.active_workers(), 8);
+
+        // Second window: 4 chunks at much higher throughput → keeps scaling
+        for _ in 0..RAMP_WINDOW {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            ramp.record_chunk(16 << 20);
+        }
+        assert_eq!(ramp.active_workers(), 16);
+    }
+
+    #[test]
+    fn ramp_freezes_on_plateau() {
+        let ramp = ConcurrencyRamp::new(64);
+
+        // First window
+        for _ in 0..RAMP_WINDOW {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            ramp.record_chunk(8 << 20);
+        }
+        assert_eq!(ramp.active_workers(), 8); // scaled up
+
+        // Second window: same throughput → gain < 50% → freeze
+        for _ in 0..RAMP_WINDOW {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            ramp.record_chunk(8 << 20);
+        }
+        assert!(ramp.is_frozen());
+        assert_eq!(ramp.active_workers(), 8);
+    }
+
+    #[test]
+    fn ramp_freezes_on_errors() {
+        let ramp = ConcurrencyRamp::new(32);
+
+        // Trigger enough errors to exceed the 10% ceiling
+        ramp.record_chunk(8 << 20);
+        ramp.record_error();
+        ramp.record_error();
+        // 1 chunk + 2 errors = 33% error rate → freeze & rollback
+        assert!(ramp.is_frozen());
+        assert!(ramp.active_workers() <= INITIAL_WORKERS);
+    }
+
+    #[test]
+    fn ramp_freezes_at_max() {
+        let ramp = ConcurrencyRamp::new(8);
+
+        // Window 1: scale 4→8
+        for _ in 0..RAMP_WINDOW {
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            ramp.record_chunk(8 << 20);
+        }
+        assert_eq!(ramp.active_workers(), 8);
+
+        // Window 2: at max → frozen
+        for _ in 0..RAMP_WINDOW {
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            ramp.record_chunk(16 << 20);
+        }
+        assert!(ramp.is_frozen());
+        assert_eq!(ramp.active_workers(), 8);
     }
 }
