@@ -105,12 +105,14 @@ async fn non_get_returns_405() {
         .unwrap();
     assert_eq!(resp.status(), 405);
 
+    // HEAD is now a supported method (passthrough to upstream),
+    // but "test-key" is not a valid upstream URL so it returns 502.
     let resp = client
         .head(format!("{base}/test-key"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 405);
+    assert_eq!(resp.status(), 502);
 }
 
 #[tokio::test]

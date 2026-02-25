@@ -53,13 +53,61 @@ pub async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Method-not-allowed handler for non-GET/POST methods.
+/// Method-not-allowed handler for non-GET/HEAD/POST methods.
 pub async fn method_not_allowed() -> impl IntoResponse {
     (
         StatusCode::METHOD_NOT_ALLOWED,
-        [(axum::http::header::ALLOW, "GET, POST")],
-        "only GET and POST are supported",
+        [(axum::http::header::ALLOW, "GET, HEAD, POST")],
+        "only GET, HEAD, and POST are supported",
     )
+}
+
+/// HEAD handler: pure passthrough to upstream, returns headers only.
+///
+/// No caching, no ES updates, no body — just forwards the HEAD to the
+/// upstream URL and returns the response headers.  This lets callers
+/// (e.g. passsage) benefit from xs3lerator's HTTP connection pool.
+pub async fn handle_head(
+    State(state): State<AppState>,
+    req: Request<Body>,
+) -> Result<Response, ProxyError> {
+    let uri = req.uri().clone();
+    let headers = req.headers().clone();
+
+    let upstream_url = parse_upstream_url(&uri)
+        .ok_or_else(|| ProxyError::Internal("invalid path: expected /<upstream_url>".into()))?;
+
+    let contract = parse_contract_headers(&headers);
+    let skip_tls = state.config.upstream_tls_skip_verify || contract.tls_skip_verify;
+    let http_client = state.http_pool
+        .get(skip_tls, contract.follow_redirects)
+        .map_err(|e| ProxyError::Internal(format!("get http client: {e}")))?;
+
+    let upstream_headers = headers::filter_upstream_headers(&headers);
+    let mut req_builder = http_client.head(&upstream_url);
+    for (name, value) in upstream_headers.iter() {
+        if let Ok(v) = value.to_str() {
+            req_builder = req_builder.header(name.as_str(), v);
+        }
+    }
+
+    let response = req_builder.send().await.map_err(|e| {
+        ProxyError::Upstream(format!("upstream HEAD failed: {e}"))
+    })?;
+
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut resp_headers = HeaderMap::new();
+    merge_upstream_headers(response.headers(), &mut resp_headers);
+
+    let resp = Response::builder()
+        .status(status)
+        .body(Body::empty())
+        .map_err(|e| ProxyError::Internal(format!("build HEAD response: {e}")))?;
+    let mut resp = resp;
+    *resp.headers_mut() = resp_headers;
+    log_access("HEAD", &upstream_url, &resp);
+    Ok(resp)
 }
 
 /// POST handler for manifest alias.

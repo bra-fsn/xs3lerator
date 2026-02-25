@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use tower_http::trace::TraceLayer;
-use crate::handler::{handle_get, handle_post, healthz, method_not_allowed, AppState};
+use crate::handler::{handle_get, handle_head, handle_post, healthz, method_not_allowed, AppState};
 
 static TXN_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -22,6 +22,10 @@ async fn catch_all(
 ) -> Response {
     match *req.method() {
         Method::GET => match handle_get(State(state), req).await {
+            Ok(resp) => resp,
+            Err(err) => err.into_response(),
+        },
+        Method::HEAD => match handle_head(State(state), req).await {
             Ok(resp) => resp,
             Err(err) => err.into_response(),
         },
