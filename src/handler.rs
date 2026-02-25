@@ -222,16 +222,14 @@ pub async fn handle_get(
     }
 }
 
-/// Chunk file handle ready for streaming, opened and fadvise'd by the
-/// prefetch pipeline.
+/// Chunk data pre-read by the parallel prefetch pipeline.
 struct PreparedChunk {
-    file: Arc<std::fs::File>,
-    chunk_len: u64,
+    data: Bytes,
 }
 
-/// Serve from cache using a prefetch pipeline: a background task opens chunk
-/// files in parallel, reading 1 byte to trigger mount-s3's internal prefetcher,
-/// while the stream task reads sequentially.
+/// Serve from cache using a parallel read pipeline: a background task reads
+/// entire chunks from mount-s3 concurrently (each triggering an independent
+/// S3 GetObject stream), then the response streams the pre-read data in order.
 async fn handle_cache_hit(
     state: &AppState,
     cache_key: &str,
@@ -275,6 +273,11 @@ async fn handle_cache_hit(
         receivers.push(rx);
     }
 
+    // Parallel chunk reader: reads entire chunks from mount-s3 concurrently.
+    // Each spawn_blocking does sequential 256 KiB reads through the chunk file,
+    // which mount-s3's per-file-handle prefetcher recognises as sequential I/O
+    // and accelerates with a growing read window (1.1 MiB → 2 GiB).
+    // With open_parallelism=8, we get 8 independent S3 GetObject streams.
     tokio::spawn(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(open_parallelism));
 
@@ -290,22 +293,36 @@ async fn handle_cache_hit(
             tokio::task::spawn_blocking(move || {
                 let rel_path = hash_to_chunk_path(&hash, &prefix);
                 let full_path = dir.join(&rel_path);
-                let result = match std::fs::File::open(&full_path) {
+                match std::fs::File::open(&full_path) {
                     Ok(f) => {
                         use std::os::unix::fs::FileExt;
-                        let mut warmup = [0u8; 1];
-                        let _ = f.read_exact_at(&mut warmup, 0);
-                        Ok(PreparedChunk {
-                            file: Arc::new(f),
-                            chunk_len,
-                        })
+                        let len = chunk_len as usize;
+                        let mut buf = vec![0u8; len];
+                        let mut pos = 0usize;
+                        while pos < len {
+                            let piece = min(len - pos, 256 * 1024);
+                            if let Err(e) = f.read_exact_at(
+                                &mut buf[pos..pos + piece],
+                                pos as u64,
+                            ) {
+                                let _ = tx.send(Err(format!(
+                                    "chunk file {} read at {pos}: {e}",
+                                    full_path.display()
+                                )));
+                                drop(permit);
+                                return;
+                            }
+                            pos += piece;
+                        }
+                        let _ = tx.send(Ok(PreparedChunk {
+                            data: Bytes::from(buf),
+                        }));
                     }
                     Err(e) => {
                         warn!(path = %full_path.display(), error = %e, "prefetch open failed");
-                        Err(format!("chunk file {}: {e}", full_path.display()))
+                        let _ = tx.send(Err(format!("chunk file {}: {e}", full_path.display())));
                     }
                 };
-                let _ = tx.send(result);
                 drop(permit);
             });
         }
@@ -357,7 +374,7 @@ async fn handle_cache_hit(
     Ok(response)
 }
 
-/// Stream data from chunk files received through ordered oneshot channels.
+/// Stream pre-read chunk data received through ordered oneshot channels.
 fn make_prefetch_stream(
     receivers: Vec<tokio::sync::oneshot::Receiver<Result<PreparedChunk, String>>>,
     offset_in_first_chunk: u64,
@@ -377,36 +394,22 @@ fn make_prefetch_stream(
                 .map_err(|e| ProxyError::NotFound(e))?;
             let start_offset = if first {
                 first = false;
-                offset_in_first_chunk
+                offset_in_first_chunk as usize
             } else {
                 0
             };
 
-            let readable_in_chunk = chunk.chunk_len - start_offset;
-            let to_read_from_chunk = min(readable_in_chunk, remaining);
+            let chunk_data_len = chunk.data.len();
+            let readable = chunk_data_len - start_offset;
+            let to_yield = min(readable as u64, remaining) as usize;
             let mut pos = start_offset;
-            let mut left = to_read_from_chunk;
+            let end = start_offset + to_yield;
 
-            while left > 0 {
-                let buf_size = min(left, 256 * 1024) as usize;
-                let file_clone = chunk.file.clone();
-                let offset = pos;
-
-                let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
-                    use std::os::unix::fs::FileExt;
-                    let mut buf = vec![0u8; buf_size];
-                    file_clone.read_exact_at(&mut buf, offset)?;
-                    Ok(Bytes::from(buf))
-                })
-                .await
-                .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?
-                .map_err(|e| ProxyError::Internal(format!("pread: {e}")))?;
-
-                let n = data.len() as u64;
-                pos += n;
-                left -= n;
-                remaining -= n;
-                yield data;
+            while pos < end {
+                let piece = min(end - pos, 256 * 1024);
+                yield chunk.data.slice(pos..pos + piece);
+                remaining -= piece as u64;
+                pos += piece;
             }
 
             if remaining == 0 {
