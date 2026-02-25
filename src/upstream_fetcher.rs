@@ -777,7 +777,7 @@ async fn download_chunk_from_stream(
 }
 
 /// Upper bound on the number of chunks allocated for unknown-size (chunked)
-/// responses.  With 8 MiB chunks this supports responses up to 16 GiB.
+/// responses.  With 32 MiB chunks this supports responses up to 64 GiB.
 const MAX_UNKNOWN_SIZE_CHUNKS: u64 = 2048;
 
 #[allow(clippy::too_many_arguments)]

@@ -6,7 +6,7 @@ use clap::Parser;
 
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_HTTP_CONCURRENCY: usize = 8;
-const DEFAULT_CHUNK_SIZE: &str = "8MiB";
+const DEFAULT_CHUNK_SIZE: &str = "32MiB";
 const DEFAULT_OPEN_PARALLELISM: usize = 8;
 
 /// High-performance HTTP download accelerator and caching proxy with
@@ -179,7 +179,7 @@ mod tests {
         let args = CliArgs::parse_from(["xs3lerator", "--data-dir", dir.to_str().unwrap()]);
         let config = AppConfig::try_from(args).unwrap();
         assert_eq!(config.http_concurrency, 8);
-        assert_eq!(config.chunk_size, 8_388_608);
+        assert_eq!(config.chunk_size, 33_554_432);
         assert!(!config.upstream_tls_skip_verify);
         assert!(!config.passthrough);
     }
