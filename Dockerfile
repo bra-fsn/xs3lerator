@@ -57,11 +57,12 @@ RUN case "$TARGETARCH" in \
     cp /app/target/"$TARGET"/release/xs3lerator /xs3lerator
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
-# distroless/static has CA certs and tzdata — no shell, no libc.
-FROM gcr.io/distroless/static-debian12:nonroot
+# Ubuntu base so the image has a shell for debugging (e.g. docker run -it --entrypoint /bin/bash ...).
+# Binary is static (musl), so no runtime libc dependency.
+FROM ubuntu:24.04
 
 COPY --from=builder /xs3lerator /usr/local/bin/xs3lerator
 
 EXPOSE 8080
 
-ENTRYPOINT ["xs3lerator"]
+ENTRYPOINT ["/usr/local/bin/xs3lerator"]
