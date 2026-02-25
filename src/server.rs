@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Method, Request};
@@ -5,8 +7,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use tower_http::trace::TraceLayer;
-
 use crate::handler::{handle_get, handle_post, healthz, method_not_allowed, AppState};
+
+static TXN_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+fn next_txn_id() -> String {
+    let id = TXN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{id:06x}")
+}
 
 async fn catch_all(
     State(state): State<AppState>,
@@ -29,6 +37,16 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .fallback(catch_all)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
+                let txn = next_txn_id();
+                tracing::debug_span!(
+                    "request",
+                    txn = %txn,
+                    method = %request.method(),
+                    uri = %request.uri(),
+                )
+            }),
+        )
         .with_state(state)
 }
