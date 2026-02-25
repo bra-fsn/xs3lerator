@@ -34,7 +34,7 @@ ARG TARGETARCH
 # Copy only manifests + stub source so this layer is invalidated only when
 # dependencies change. The compiled deps stay in /app/target/ within the layer.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs
+RUN mkdir -p src bench && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs && echo 'fn main() {}' > bench/bench_read.rs
 
 RUN case "$TARGETARCH" in \
       amd64) TARGET=x86_64-unknown-linux-musl ;; \
@@ -45,7 +45,7 @@ RUN case "$TARGETARCH" in \
 
 # ── Full build ───────────────────────────────────────────────────────────────
 COPY . .
-RUN touch src/main.rs src/lib.rs
+RUN touch src/main.rs src/lib.rs bench/bench_read.rs
 
 ARG GITHUB_SHA
 
@@ -54,13 +54,15 @@ RUN case "$TARGETARCH" in \
       arm64) TARGET=aarch64-unknown-linux-musl ;; \
     esac && \
     cargo build --release --target "$TARGET" && \
-    cp /app/target/"$TARGET"/release/xs3lerator /xs3lerator
+    cp /app/target/"$TARGET"/release/xs3lerator /xs3lerator && \
+    cp /app/target/"$TARGET"/release/bench-read /bench-read
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 # distroless/static has CA certs and tzdata — no shell, no libc.
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=builder /xs3lerator /usr/local/bin/xs3lerator
+COPY --from=builder /bench-read /usr/local/bin/bench-read
 
 EXPOSE 8080
 

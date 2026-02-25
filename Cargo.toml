@@ -9,6 +9,10 @@ license = "MIT"
 name = "xs3lerator"
 path = "src/main.rs"
 
+[[bin]]
+name = "bench-read"
+path = "bench/bench_read.rs"
+
 [dependencies]
 anyhow = "1"
 async-stream = "0.3"
