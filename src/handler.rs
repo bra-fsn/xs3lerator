@@ -225,6 +225,9 @@ pub async fn handle_get(
 /// Chunk data pre-read by the parallel prefetch pipeline.
 struct PreparedChunk {
     data: Bytes,
+    open_ms: u64,
+    first_read_ms: u64,
+    total_read_ms: u64,
 }
 
 /// Serve from cache using a parallel read pipeline: a background task reads
@@ -264,6 +267,15 @@ async fn handle_cache_hit(
     }).collect();
 
     let num_chunks = chunks_meta.len();
+    debug!(
+        cache_key,
+        num_chunks,
+        object_size,
+        open_parallelism,
+        "cache_hit: starting parallel chunk read"
+    );
+    let pipeline_start = std::time::Instant::now();
+
     let mut receivers = Vec::with_capacity(num_chunks);
     let mut senders: Vec<Option<tokio::sync::oneshot::Sender<Result<PreparedChunk, String>>>> =
         Vec::with_capacity(num_chunks);
@@ -282,10 +294,15 @@ async fn handle_cache_hit(
         let semaphore = Arc::new(tokio::sync::Semaphore::new(open_parallelism));
 
         for (slot, (_idx, hash, chunk_len)) in chunks_meta.into_iter().enumerate() {
+            let sem_wait_start = std::time::Instant::now();
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => break,
             };
+            let sem_wait_ms = sem_wait_start.elapsed().as_millis() as u64;
+            if sem_wait_ms > 0 {
+                debug!(slot, sem_wait_ms, "chunk: semaphore wait");
+            }
             let tx = senders[slot].take().unwrap();
             let dir = data_dir.clone();
             let prefix = data_prefix.clone();
@@ -293,12 +310,17 @@ async fn handle_cache_hit(
             tokio::task::spawn_blocking(move || {
                 let rel_path = hash_to_chunk_path(&hash, &prefix);
                 let full_path = dir.join(&rel_path);
+
+                let open_start = std::time::Instant::now();
                 match std::fs::File::open(&full_path) {
                     Ok(f) => {
+                        let open_ms = open_start.elapsed().as_millis() as u64;
                         use std::os::unix::fs::FileExt;
                         let len = chunk_len as usize;
                         let mut buf = vec![0u8; len];
                         let mut pos = 0usize;
+                        let read_start = std::time::Instant::now();
+                        let mut first_read_ms = 0u64;
                         while pos < len {
                             let piece = min(len - pos, 256 * 1024);
                             if let Err(e) = f.read_exact_at(
@@ -312,10 +334,31 @@ async fn handle_cache_hit(
                                 drop(permit);
                                 return;
                             }
+                            if pos == 0 {
+                                first_read_ms = read_start.elapsed().as_millis() as u64;
+                            }
                             pos += piece;
                         }
+                        let total_read_ms = read_start.elapsed().as_millis() as u64;
+                        let throughput_mbps = if total_read_ms > 0 {
+                            (len as u64) / 1024 / total_read_ms
+                        } else {
+                            0
+                        };
+                        debug!(
+                            slot,
+                            open_ms,
+                            first_read_ms,
+                            total_read_ms,
+                            throughput_mbps,
+                            chunk_len,
+                            "chunk: read complete"
+                        );
                         let _ = tx.send(Ok(PreparedChunk {
                             data: Bytes::from(buf),
+                            open_ms,
+                            first_read_ms,
+                            total_read_ms,
                         }));
                     }
                     Err(e) => {
@@ -363,7 +406,13 @@ async fn handle_cache_hit(
     );
     resp_headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
 
-    let stream = make_prefetch_stream(receivers, offset_in_first_chunk, serve_len);
+    let stream = make_prefetch_stream(
+        receivers,
+        offset_in_first_chunk,
+        serve_len,
+        pipeline_start,
+        cache_key.to_string(),
+    );
     let body = Body::from_stream(stream);
     let mut response = Response::builder()
         .status(status)
@@ -379,19 +428,43 @@ fn make_prefetch_stream(
     receivers: Vec<tokio::sync::oneshot::Receiver<Result<PreparedChunk, String>>>,
     offset_in_first_chunk: u64,
     read_len: u64,
+    pipeline_start: std::time::Instant,
+    cache_key: String,
 ) -> impl futures::Stream<Item = Result<Bytes, ProxyError>> {
     try_stream! {
         if read_len == 0 {
             return;
         }
 
+        let num_chunks = receivers.len();
         let mut remaining = read_len;
         let mut first = true;
+        let mut total_stall_ms: u64 = 0;
+        let mut max_stall_ms: u64 = 0;
+        let mut max_stall_slot: usize = 0;
 
-        for rx in receivers {
+        for (stream_idx, rx) in receivers.into_iter().enumerate() {
+            let wait_start = std::time::Instant::now();
             let chunk = rx.await
                 .map_err(|_| ProxyError::Internal("prefetch task dropped".into()))?
                 .map_err(|e| ProxyError::NotFound(e))?;
+            let stall_ms = wait_start.elapsed().as_millis() as u64;
+            total_stall_ms += stall_ms;
+            if stall_ms > max_stall_ms {
+                max_stall_ms = stall_ms;
+                max_stall_slot = stream_idx;
+            }
+            if stall_ms > 5 {
+                debug!(
+                    stream_idx,
+                    stall_ms,
+                    chunk_open_ms = chunk.open_ms,
+                    chunk_first_read_ms = chunk.first_read_ms,
+                    chunk_total_read_ms = chunk.total_read_ms,
+                    pipeline_elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
+                    "stream: waited for chunk"
+                );
+            }
             let start_offset = if first {
                 first = false;
                 offset_in_first_chunk as usize
@@ -416,6 +489,25 @@ fn make_prefetch_stream(
                 break;
             }
         }
+
+        let total_ms = pipeline_start.elapsed().as_millis() as u64;
+        let served_bytes = read_len - remaining;
+        let throughput_mbps = if total_ms > 0 {
+            served_bytes / 1024 / total_ms
+        } else {
+            0
+        };
+        debug!(
+            cache_key = cache_key.as_str(),
+            num_chunks,
+            total_ms,
+            total_stall_ms,
+            max_stall_ms,
+            max_stall_slot,
+            served_bytes,
+            throughput_mbps,
+            "stream: transfer complete"
+        );
     }
 }
 
