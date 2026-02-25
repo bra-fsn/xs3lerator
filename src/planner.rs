@@ -98,6 +98,7 @@ const INITIAL_WORKERS: usize = 4;
 const RAMP_WINDOW: usize = 4;
 const SCALE_UP_THRESHOLD: f64 = 0.50;
 const ERROR_CEILING: f64 = 0.10;
+const TIME_TRIGGER_SECS: f64 = 5.0;
 
 /// Per-level throughput snapshot taken when enough chunks complete.
 #[derive(Debug, Clone, Copy)]
@@ -240,6 +241,40 @@ impl ConcurrencyRamp {
     /// True when the controller has settled on a final concurrency level.
     pub fn is_frozen(&self) -> bool {
         self.frozen.load(Ordering::Acquire) > 0
+    }
+
+    /// Time-based ramp trigger: call periodically (e.g. from worker sleep
+    /// loops).  If TIME_TRIGGER_SECS have elapsed at the current level and
+    /// no chunk has completed yet, evaluates ramp-up based on bytes
+    /// downloaded so far.  This prevents stalling on slow upstreams where
+    /// a single chunk takes minutes.
+    pub fn check_time_trigger(&self) {
+        if self.frozen.load(Ordering::Relaxed) > 0 {
+            return;
+        }
+        if self.level_chunks.load(Ordering::Relaxed) > 0 {
+            return; // chunk-based evaluation will handle it
+        }
+        let elapsed_secs = self.level_start.lock().elapsed().as_secs_f64();
+        if elapsed_secs < TIME_TRIGGER_SECS {
+            return;
+        }
+        let bytes = self.level_bytes.load(Ordering::Relaxed);
+        if bytes == 0 {
+            // Nothing downloaded yet — still ramp up; more connections might
+            // help even if the first ones haven't produced data yet (slow
+            // TLS handshake, etc.).
+            let current = self.active.load(Ordering::Acquire);
+            if current < self.max_concurrency {
+                let next = (current * 2).min(self.max_concurrency);
+                self.active.store(next, Ordering::Release);
+                *self.level_start.lock() = Instant::now();
+            }
+            return;
+        }
+        // We have partial data but no completed chunk — evaluate as if
+        // this were a completed window so the ramp can grow.
+        self.evaluate_ramp();
     }
 
     /// Summary of throughput samples collected during ramp-up.
@@ -458,5 +493,55 @@ mod tests {
         }
         assert!(ramp.is_frozen());
         assert_eq!(ramp.active_workers(), 8);
+    }
+
+    #[test]
+    fn time_trigger_ramps_with_no_completed_chunks() {
+        let ramp = ConcurrencyRamp::new(32);
+        assert_eq!(ramp.active_workers(), 4);
+
+        // Simulate slow upstream: no chunks complete, but 5+ seconds pass
+        *ramp.level_start.lock() = Instant::now() - std::time::Duration::from_secs(6);
+        ramp.check_time_trigger();
+        assert_eq!(ramp.active_workers(), 8);
+
+        // Another 5 seconds, still no chunks → ramp again
+        *ramp.level_start.lock() = Instant::now() - std::time::Duration::from_secs(6);
+        ramp.check_time_trigger();
+        assert_eq!(ramp.active_workers(), 16);
+    }
+
+    #[test]
+    fn time_trigger_noop_if_chunks_completing() {
+        let ramp = ConcurrencyRamp::new(32);
+        ramp.record_chunk(8 << 20); // chunk completed → time trigger defers
+
+        *ramp.level_start.lock() = Instant::now() - std::time::Duration::from_secs(6);
+        ramp.check_time_trigger();
+        // Should stay at 4 because chunk-based path will handle ramp
+        assert_eq!(ramp.active_workers(), 4);
+    }
+
+    #[test]
+    fn time_trigger_noop_before_deadline() {
+        let ramp = ConcurrencyRamp::new(32);
+        // Only 1 second elapsed, below TIME_TRIGGER_SECS
+        ramp.check_time_trigger();
+        assert_eq!(ramp.active_workers(), 4);
+    }
+
+    #[test]
+    fn time_trigger_respects_frozen() {
+        let ramp = ConcurrencyRamp::new(32);
+        // Force freeze via errors
+        ramp.record_chunk(8 << 20);
+        ramp.record_error();
+        ramp.record_error();
+        assert!(ramp.is_frozen());
+        let frozen_level = ramp.active_workers();
+
+        *ramp.level_start.lock() = Instant::now() - std::time::Duration::from_secs(10);
+        ramp.check_time_trigger();
+        assert_eq!(ramp.active_workers(), frozen_level);
     }
 }

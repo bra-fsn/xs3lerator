@@ -464,12 +464,12 @@ async fn run_adaptive_upstream(
     let mut parallel_handles: Vec<tokio::task::JoinHandle<Result<(), ProxyError>>> = Vec::new();
 
     if !remaining.is_empty() {
-        // Compute the sequential runway: let sequential handle the next
-        // max_concurrency chunks at full single-connection speed so the
-        // client gets smooth, uninterrupted data delivery while parallel
-        // workers establish connections for chunks further ahead.
+        // Minimal runway: sequential only keeps the chunk it is currently
+        // streaming.  Parallel workers take over from the next chunk onward.
+        // For slow upstreams the time-based ramp in ConcurrencyRamp will
+        // detect sluggish progress and scale up workers within seconds.
         let seq_chunk_now = active_sequential_chunk(download);
-        let runway = max_concurrency;
+        let runway = 1usize;
         let estimated_stop = (seq_chunk_now + runway)
             .min(download.chunk_count().saturating_sub(1));
 
@@ -495,8 +495,6 @@ async fn run_adaptive_upstream(
 
             match probe_resp {
                 Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => {
-                    // Re-compute runway now that the probe round-trip is done
-                    // (sequential has progressed further).
                     let seq_chunk = active_sequential_chunk(download);
                     let effective_stop = (seq_chunk + runway)
                         .min(download.chunk_count().saturating_sub(1));
@@ -568,9 +566,8 @@ async fn run_adaptive_upstream(
                                             tokio::time::sleep(
                                                 std::time::Duration::from_millis(50),
                                             ).await;
+                                            ramp.check_time_trigger();
                                             if worker_id >= ramp.active_workers() {
-                                                // Still not admitted — check if ramp
-                                                // is frozen (will never grow further).
                                                 if ramp.is_frozen() {
                                                     break;
                                                 }
