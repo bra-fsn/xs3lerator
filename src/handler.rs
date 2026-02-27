@@ -21,7 +21,7 @@ use crate::headers::{
     self, parse_upstream_url, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
 };
 use crate::http_pool::HttpClientPool;
-use crate::manifest::{Manifest, hash_to_chunk_path};
+use crate::manifest::{Manifest, id_to_chunk_path};
 use crate::range::{parse_range_header, ByteRange};
 use crate::trace::{trace_log, TraceWriter};
 use crate::upstream_fetcher;
@@ -304,14 +304,14 @@ async fn handle_cache_hit(
     let data_dir = state.data_dir.clone();
     let open_parallelism = state.config.open_parallelism;
 
-    let chunks_meta: Vec<(usize, [u8; 32], u64)> = chunk_range.clone().map(|idx| {
-        let hash = manifest.hashes[idx];
+    let chunks_meta: Vec<(usize, [u8; 16], u64)> = chunk_range.clone().map(|idx| {
+        let id = manifest.chunk_ids[idx];
         let chunk_len = if idx == manifest.num_chunks() - 1 {
             manifest.total_size - (idx as u64 * manifest.chunk_size)
         } else {
             manifest.chunk_size
         };
-        (idx, hash, chunk_len)
+        (idx, id, chunk_len)
     }).collect();
 
     let num_chunks = chunks_meta.len();
@@ -341,7 +341,7 @@ async fn handle_cache_hit(
     tokio::spawn(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(open_parallelism));
 
-        for (slot, (_idx, hash, chunk_len)) in chunks_meta.into_iter().enumerate() {
+        for (slot, (_idx, id, chunk_len)) in chunks_meta.into_iter().enumerate() {
             let sem_wait_start = std::time::Instant::now();
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
@@ -356,7 +356,7 @@ async fn handle_cache_hit(
             let prefix = data_prefix.clone();
 
             tokio::task::spawn_blocking(move || {
-                let rel_path = hash_to_chunk_path(&hash, &prefix);
+                let rel_path = id_to_chunk_path(&id, &prefix);
                 let full_path = dir.join(&rel_path);
 
                 let open_start = std::time::Instant::now();
@@ -740,6 +740,8 @@ async fn handle_upstream_path(
         resp_headers,
         false,
         download_start,
+        Some(state.data_dir.clone()),
+        Some(state.config.data_prefix.clone()),
     )
 }
 
@@ -760,6 +762,8 @@ fn build_streaming_response(
     mut extra_headers: HeaderMap,
     cancel_on_drop: bool,
     download_start: u64,
+    data_dir: Option<PathBuf>,
+    data_prefix: Option<String>,
 ) -> ProxyResult<Response> {
     let (serve_start, serve_end, status) = match client_range {
         Some(ref r) => (r.start, r.end_inclusive, StatusCode::PARTIAL_CONTENT),
@@ -784,7 +788,7 @@ fn build_streaming_response(
     );
     extra_headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
 
-    let stream = make_download_stream(download, download_start, serve_len, cancel_on_drop);
+    let stream = make_download_stream(download, download_start, serve_len, cancel_on_drop, data_dir, data_prefix);
     let body = Body::from_stream(stream);
     let mut response = Response::builder()
         .status(status)
@@ -856,6 +860,8 @@ fn make_download_stream(
     download_start: u64,
     read_len: u64,
     cancel_on_drop: bool,
+    data_dir: Option<PathBuf>,
+    data_prefix: Option<String>,
 ) -> impl futures::Stream<Item = Result<Bytes, ProxyError>> {
     try_stream! {
         let _cancel_guard = if cancel_on_drop {
@@ -893,24 +899,70 @@ fn make_download_stream(
             let remaining = read_end - pos + 1;
             let to_read = min(chunk_remaining, remaining).min(256 * 1024);
 
-            download.wait_for_bytes(chunk_idx, chunk_offset + to_read).await?;
+            // Multi-tier serve: try temp file first, then S3 fallback
+            if let Some(file) = download.chunk(chunk_idx).get_file() {
+                // Temp file available — wait for bytes and pread
+                download.wait_for_bytes(chunk_idx, chunk_offset + to_read).await?;
 
-            let file = download.chunk(chunk_idx).get_file()
-                .ok_or_else(|| ProxyError::Internal("chunk released before read".into()))?;
+                let buf_len = to_read as usize;
+                let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
+                    use std::os::unix::fs::FileExt;
+                    let mut buf = vec![0u8; buf_len];
+                    file.read_exact_at(&mut buf, chunk_offset)?;
+                    Ok(Bytes::from(buf))
+                })
+                .await
+                .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?
+                .map_err(|e| ProxyError::Internal(format!("pread: {e}")))?;
 
-            let buf_len = to_read as usize;
-            let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
-                use std::os::unix::fs::FileExt;
-                let mut buf = vec![0u8; buf_len];
-                file.read_exact_at(&mut buf, chunk_offset)?;
-                Ok(Bytes::from(buf))
-            })
-            .await
-            .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?
-            .map_err(|e| ProxyError::Internal(format!("pread: {e}")))?;
+                pos += data.len() as u64;
+                yield data;
+            } else if download.chunk(chunk_idx).s3_committed.load(std::sync::atomic::Ordering::Acquire) {
+                // Temp released but S3 committed — read from mountpoint-s3
+                let id = *download.chunk_id(chunk_idx);
+                let dir = data_dir.clone().ok_or_else(|| {
+                    ProxyError::Internal("no data_dir for S3 fallback".into())
+                })?;
+                let prefix = data_prefix.clone().unwrap_or_default();
+                let offset = chunk_offset;
+                let buf_len = to_read as usize;
 
-            pos += data.len() as u64;
-            yield data;
+                let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
+                    use std::os::unix::fs::FileExt;
+                    let rel_path = id_to_chunk_path(&id, &prefix);
+                    let full_path = dir.join(&rel_path);
+                    let f = std::fs::File::open(&full_path)?;
+                    let mut buf = vec![0u8; buf_len];
+                    f.read_exact_at(&mut buf, offset)?;
+                    Ok(Bytes::from(buf))
+                })
+                .await
+                .map_err(|e| ProxyError::Internal(format!("s3 read task: {e}")))?
+                .map_err(|e| ProxyError::Internal(format!("s3 pread: {e}")))?;
+
+                pos += data.len() as u64;
+                yield data;
+            } else {
+                // Chunk not yet downloaded — wait for bytes, then read from temp
+                download.wait_for_bytes(chunk_idx, chunk_offset + to_read).await?;
+
+                let file = download.chunk(chunk_idx).get_file()
+                    .ok_or_else(|| ProxyError::Internal("chunk released before read".into()))?;
+
+                let buf_len = to_read as usize;
+                let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
+                    use std::os::unix::fs::FileExt;
+                    let mut buf = vec![0u8; buf_len];
+                    file.read_exact_at(&mut buf, chunk_offset)?;
+                    Ok(Bytes::from(buf))
+                })
+                .await
+                .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?
+                .map_err(|e| ProxyError::Internal(format!("pread: {e}")))?;
+
+                pos += data.len() as u64;
+                yield data;
+            }
         }
 
         if let Some(last) = prev_chunk {

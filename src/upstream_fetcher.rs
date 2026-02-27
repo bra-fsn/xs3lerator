@@ -5,18 +5,19 @@ use std::time::Instant;
 use futures::StreamExt;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, TRANSFER_ENCODING};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use crate::chunk_upload;
 use crate::config::AppConfig;
 use crate::download::{
-    create_temp_chunk_file, is_enospc, pwrite_all, DownloadManager, InFlightDownload,
+    create_temp_chunk_file, generate_chunk_ids, is_enospc, pwrite_all,
+    DownloadManager, InFlightDownload,
 };
 use crate::error::ProxyError;
 use crate::es_client::EsClient;
+use crate::finalize;
 use crate::headers::{filter_upstream_headers, ContractHeaders};
 use crate::http_pool::HttpClientPool;
+use crate::manifest::id_to_chunk_path;
 use crate::planner::{compute_chunk_plan, ConcurrencyRamp};
 use crate::range::parse_range_header;
 use crate::trace::{trace_log, TraceWriter};
@@ -72,7 +73,7 @@ pub async fn fetch_upstream(
     if let Some(key) = cache_key {
         if !contract.cache_skip {
             let (existing, is_new) = downloads.get_or_create(key, || {
-                Arc::new(InFlightDownload::new(0, config.chunk_size))
+                Arc::new(InFlightDownload::new_placeholder(config.chunk_size))
             });
             if !is_new {
                 let full_size = existing.object_size;
@@ -130,7 +131,7 @@ pub async fn fetch_upstream(
             "upstream returned redirect, passing through to client"
         );
         return Ok(UpstreamResult {
-            download: Arc::new(InFlightDownload::new(0, config.chunk_size)),
+            download: Arc::new(InFlightDownload::new_placeholder(config.chunk_size)),
             content_type: None,
             etag: None,
             last_modified: None,
@@ -148,7 +149,7 @@ pub async fn fetch_upstream(
         let status_code = status.as_u16();
         warn!(status = status_code, "upstream returned error, passing through");
         return Ok(UpstreamResult {
-            download: Arc::new(InFlightDownload::new(0, config.chunk_size)),
+            download: Arc::new(InFlightDownload::new_placeholder(config.chunk_size)),
             content_type: None,
             etag: None,
             last_modified: None,
@@ -293,7 +294,9 @@ async fn start_parallel_upstream_download(
 ) -> Result<UpstreamResult, ProxyError> {
     let plan = compute_chunk_plan(file_size, config.http_concurrency, config.chunk_size);
 
-    let download = Arc::new(InFlightDownload::new(file_size, plan.chunk_size));
+    let num_chunks = file_size.div_ceil(plan.chunk_size) as usize;
+    let chunk_ids = generate_chunk_ids(num_chunks);
+    let download = Arc::new(InFlightDownload::new(file_size, plan.chunk_size, chunk_ids));
 
     // When we have a cache key, register in the download manager for dedup.
     // Otherwise just use the download directly with no dedup.
@@ -327,7 +330,7 @@ async fn start_parallel_upstream_download(
         if is_enospc(&e) {
             warn!("ENOSPC: degrading to direct passthrough (parallel)");
             return Ok(UpstreamResult {
-                download: Arc::new(InFlightDownload::new(0, config.chunk_size)),
+                download: Arc::new(InFlightDownload::new_placeholder(config.chunk_size)),
                 content_type,
                 etag,
                 last_modified,
@@ -350,11 +353,8 @@ async fn start_parallel_upstream_download(
         }
     }
 
-    // Spawn content-addressed chunk persistence to mounted filesystem (only when caching)
     if let Some(key) = cache_key {
-        chunk_upload::spawn_chunk_persist(
-            data_dir.to_path_buf(),
-            config.data_prefix.clone(),
+        finalize::spawn_finalize(
             key.to_string(),
             download.clone(),
             es_client,
@@ -370,6 +370,9 @@ async fn start_parallel_upstream_download(
     let ck = cache_key.map(str::to_owned);
     let dm_ptr = downloads as *const DownloadManager as usize;
     let http_concurrency = config.http_concurrency;
+    let data_dir_clone = data_dir.to_path_buf();
+    let data_prefix_clone = config.data_prefix.clone();
+    let caching = cache_key.is_some();
 
     // Spawn the adaptive download workers
     tokio::spawn(async move {
@@ -377,6 +380,7 @@ async fn start_parallel_upstream_download(
         let result = run_adaptive_upstream(
             &temp_dir, &url, &client, &hdrs, initial_response,
             &dl, &trace_clone, http_concurrency,
+            &data_dir_clone, &data_prefix_clone, caching,
         )
         .await;
 
@@ -434,12 +438,36 @@ async fn run_adaptive_upstream(
     download: &InFlightDownload,
     trace: &Option<Arc<TraceWriter>>,
     max_concurrency: usize,
+    data_dir: &std::path::Path,
+    data_prefix: &str,
+    caching: bool,
 ) -> Result<(), ProxyError> {
-    // Pre-create temp files for all chunks so the sequential stream can use them.
+    // Pre-create temp files and open S3 destination files for all chunks.
     for idx in 0..download.chunk_count() {
         let file = create_temp_chunk_file(temp_dir)
             .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
         download.chunk(idx).set_file(Arc::new(file));
+
+        if caching {
+            let id = download.chunk_id(idx);
+            let rel_path = id_to_chunk_path(id, data_prefix);
+            let full_path = data_dir.join(&rel_path);
+            if let Some(parent) = full_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    ProxyError::Internal(format!("mkdir {}: {e}", parent.display()))
+                })?;
+            }
+            let s3_file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&full_path)
+                .map_err(|e| {
+                    ProxyError::Internal(format!("open S3 file {}: {e}", full_path.display()))
+                })?;
+            download.chunk(idx).set_s3_file(s3_file);
+            download.chunk(idx).increment_readers();
+        }
     }
 
     // stop_after controls how far the sequential stream progresses.
@@ -701,6 +729,17 @@ fn active_sequential_chunk(download: &InFlightDownload) -> usize {
     download.chunk_count().saturating_sub(1)
 }
 
+/// Finalize a chunk's S3 file: sync_all, close, and mark as committed.
+fn finalize_chunk_s3(download: &InFlightDownload, idx: usize) {
+    if let Some(s3_file) = download.chunk(idx).take_s3_file() {
+        if let Err(e) = s3_file.sync_all() {
+            warn!(chunk = idx, "S3 chunk sync_all failed: {e}");
+        }
+        drop(s3_file);
+        download.chunk(idx).s3_committed.store(true, Ordering::Release);
+    }
+}
+
 /// Stream a full-GET response body into sequential chunks, stopping after the
 /// chunk indicated by `stop_after`.  This is the "initial connection" stream
 /// that keeps running unless parallel workers take over.
@@ -712,7 +751,6 @@ async fn stream_response_into_chunks(
 ) -> Result<(), ProxyError> {
     let mut stream = response.bytes_stream();
     let mut global_offset = 0u64;
-    let mut hasher = Sha256::new();
 
     'outer: while let Some(piece) = stream.next().await {
         let data = piece.map_err(|e| ProxyError::Upstream(format!("sequential stream: {e}")))?;
@@ -749,14 +787,16 @@ async fn stream_response_into_chunks(
             pwrite_all(&file, chunk_offset, slice)
                 .map_err(|e| ProxyError::Internal(format!("pwrite chunk {chunk_idx}: {e}")))?;
 
-            hasher.update(slice);
+            // Tee-write to S3 file if present
+            download.chunk(chunk_idx).write_to_s3_file(slice)
+                .map_err(|e| ProxyError::Internal(format!("s3 write chunk {chunk_idx}: {e}")))?;
+
             piece_offset += to_write;
             global_offset += to_write as u64;
             download.record_written(chunk_idx, to_write as u64);
 
             if download.is_chunk_done(chunk_idx) {
-                let hash: [u8; 32] = hasher.finalize_reset().into();
-                download.chunk(chunk_idx).set_hash(hash);
+                finalize_chunk_s3(download, chunk_idx);
                 download.mark_chunk_done(chunk_idx);
                 trace_log(trace, || json!({
                     "event": "sequential_chunk_done",
@@ -780,7 +820,6 @@ async fn download_chunk_from_stream(
     let t0 = Instant::now();
     let mut stream = response.bytes_stream();
     let mut offset = 0u64;
-    let mut hasher = Sha256::new();
 
     while let Some(piece) = stream.next().await {
         let piece = piece.map_err(|e| ProxyError::Upstream(format!("stream chunk {idx}: {e}")))?;
@@ -791,13 +830,13 @@ async fn download_chunk_from_stream(
         let slice = &piece[..to_write];
         pwrite_all(file, offset, slice)
             .map_err(|e| ProxyError::Internal(format!("pwrite chunk {idx}: {e}")))?;
-        hasher.update(slice);
+        download.chunk(idx).write_to_s3_file(slice)
+            .map_err(|e| ProxyError::Internal(format!("s3 write chunk {idx}: {e}")))?;
         offset += to_write as u64;
         download.record_written(idx, to_write as u64);
     }
 
-    let hash: [u8; 32] = hasher.finalize().into();
-    download.chunk(idx).set_hash(hash);
+    finalize_chunk_s3(download, idx);
     download.mark_chunk_done(idx);
 
     trace_log(trace, || json!({
@@ -835,10 +874,17 @@ async fn start_sequential_download(
         .unwrap_or(config.chunk_size * MAX_UNKNOWN_SIZE_CHUNKS);
     let chunk_size = config.chunk_size;
 
-    let download = Arc::new(if is_unknown_size {
-        InFlightDownload::new_unknown_size(effective_size, chunk_size)
+    let num_chunks = if effective_size == 0 {
+        0
     } else {
-        InFlightDownload::new(effective_size, chunk_size)
+        effective_size.div_ceil(chunk_size) as usize
+    };
+    let chunk_ids = generate_chunk_ids(num_chunks);
+
+    let download = Arc::new(if is_unknown_size {
+        InFlightDownload::new_unknown_size(effective_size, chunk_size, chunk_ids)
+    } else {
+        InFlightDownload::new(effective_size, chunk_size, chunk_ids)
     });
 
     let download = if let Some(key) = cache_key {
@@ -871,7 +917,7 @@ async fn start_sequential_download(
         if is_enospc(&e) {
             warn!("ENOSPC: degrading to direct passthrough (sequential)");
             return Ok(UpstreamResult {
-                download: Arc::new(InFlightDownload::new(0, config.chunk_size)),
+                download: Arc::new(InFlightDownload::new_placeholder(config.chunk_size)),
                 content_type,
                 etag,
                 last_modified,
@@ -887,11 +933,9 @@ async fn start_sequential_download(
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
     }
 
-    // Spawn persist only when caching
+    // Spawn finalize only when caching
     if let Some(key) = cache_key {
-        chunk_upload::spawn_chunk_persist(
-            data_dir.to_path_buf(),
-            config.data_prefix.clone(),
+        finalize::spawn_finalize(
             key.to_string(),
             download.clone(),
             es_client.clone(),
@@ -910,12 +954,14 @@ async fn start_sequential_download(
     let ck = cache_key.map(str::to_owned);
     let dm_ptr = downloads as *const DownloadManager as usize;
     let temp_dir = config.temp_dir.clone();
+    let data_dir_clone = data_dir.to_path_buf();
+    let data_prefix_clone = config.data_prefix.clone();
+    let caching = cache_key.is_some();
 
     tokio::spawn(async move {
         let downloads = unsafe { &*(dm_ptr as *const DownloadManager) };
         let mut stream = response.bytes_stream();
         let mut global_offset = 0u64;
-        let mut hasher = Sha256::new();
 
         'outer: while let Some(piece) = stream.next().await {
             match piece {
@@ -937,6 +983,24 @@ async fn start_sequential_download(
                                     break 'outer;
                                 }
                             }
+                            // Lazy S3 file creation for unknown-size responses
+                            if caching {
+                                let id = dl.chunk_id(chunk_idx);
+                                let rel_path = id_to_chunk_path(id, &data_prefix_clone);
+                                let full_path = data_dir_clone.join(&rel_path);
+                                if let Some(parent) = full_path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                match std::fs::OpenOptions::new()
+                                    .create(true).truncate(true).write(true)
+                                    .open(&full_path)
+                                {
+                                    Ok(f) => dl.chunk(chunk_idx).set_s3_file(f),
+                                    Err(e) => {
+                                        warn!(cache_key = ?ck, "S3 file creation failed: {e}");
+                                    }
+                                }
+                            }
                         }
 
                         let chunk_offset = global_offset - chunk_idx as u64 * dl.chunk_size;
@@ -955,14 +1019,13 @@ async fn start_sequential_download(
                                 dl.mark_failed();
                                 break 'outer;
                             }
-                            hasher.update(slice);
+                            let _ = dl.chunk(chunk_idx).write_to_s3_file(slice);
                             piece_offset += to_write;
                             global_offset += to_write as u64;
                             dl.record_written(chunk_idx, to_write as u64);
 
                             if dl.is_chunk_done(chunk_idx) {
-                                let hash: [u8; 32] = hasher.finalize_reset().into();
-                                dl.chunk(chunk_idx).set_hash(hash);
+                                finalize_chunk_s3(&dl, chunk_idx);
                                 dl.mark_chunk_done(chunk_idx);
                             }
                         } else {
@@ -978,22 +1041,12 @@ async fn start_sequential_download(
             }
         }
 
-        // Finalize hash for any partial last chunk
-        let last_chunk_idx = if global_offset > 0 {
-            ((global_offset - 1) / dl.chunk_size) as usize
-        } else {
-            0
-        };
-        if global_offset > 0 && dl.chunk(last_chunk_idx).get_hash().is_none() {
-            let hash: [u8; 32] = hasher.finalize_reset().into();
-            dl.chunk(last_chunk_idx).set_hash(hash);
-        }
-
         if is_unknown_size {
             dl.mark_stream_complete(global_offset);
         } else {
             for idx in 0..dl.chunk_count() {
                 if !dl.is_chunk_done(idx) && !dl.has_failed() {
+                    finalize_chunk_s3(&dl, idx);
                     dl.mark_chunk_done(idx);
                 }
             }

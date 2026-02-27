@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::error::ProxyError;
+use crate::manifest::ID_LEN;
 use crate::planner;
 
 /// Minimum bytes between reader notifications.
@@ -54,27 +55,36 @@ impl DownloadManager {
 
 /// State for a single download chunk backed by its own temp file.
 pub struct ChunkSlot {
-    /// Open file descriptor.  `None` once the chunk has been released.
+    /// Open file descriptor for the anonymous temp file.
+    /// `None` once the chunk has been released.
     file: Mutex<Option<Arc<File>>>,
     /// Bytes written to this chunk's file so far (monotonically increasing).
     bytes_written: AtomicU64,
-    /// Set once the S3 upload for this chunk completes.
-    pub uploaded_to_s3: AtomicBool,
-    /// Set once all downstream readers have finished with this chunk.
-    pub readers_done: AtomicBool,
-    /// SHA-256 hash of the chunk content (set after chunk is fully downloaded).
-    hash: Mutex<Option<[u8; 32]>>,
+    /// UUIDv7 identifier for this chunk (immutable, set at construction).
+    id: [u8; ID_LEN],
+    /// Open file descriptor for the mountpoint-s3 write handle.
+    /// `None` before the S3 file is opened or after it's been closed.
+    s3_file: Mutex<Option<File>>,
+    /// Set once the S3 upload for this chunk completes (sync_all + close).
+    pub s3_committed: AtomicBool,
+    /// Number of active readers (including the download worker itself).
+    reader_count: AtomicUsize,
 }
 
 impl ChunkSlot {
-    fn new() -> Self {
+    fn new(id: [u8; ID_LEN]) -> Self {
         Self {
             file: Mutex::new(None),
             bytes_written: AtomicU64::new(0),
-            uploaded_to_s3: AtomicBool::new(false),
-            readers_done: AtomicBool::new(false),
-            hash: Mutex::new(None),
+            id,
+            s3_file: Mutex::new(None),
+            s3_committed: AtomicBool::new(false),
+            reader_count: AtomicUsize::new(0),
         }
+    }
+
+    pub fn id(&self) -> &[u8; ID_LEN] {
+        &self.id
     }
 
     /// Set the file handle for this chunk (called by the download worker
@@ -94,10 +104,11 @@ impl ChunkSlot {
         *self.file.lock() = None;
     }
 
-    /// Try to release this chunk if both consumers are done.
+    /// Try to release this chunk's temp file if all readers are done and
+    /// the chunk has been committed to S3.
     pub fn try_release(&self) {
-        if self.uploaded_to_s3.load(Ordering::Acquire)
-            && self.readers_done.load(Ordering::Acquire)
+        if self.s3_committed.load(Ordering::Acquire)
+            && self.reader_count.load(Ordering::Acquire) == 0
         {
             self.release_file();
         }
@@ -107,12 +118,38 @@ impl ChunkSlot {
         self.bytes_written.load(Ordering::Acquire)
     }
 
-    pub fn set_hash(&self, hash: [u8; 32]) {
-        *self.hash.lock() = Some(hash);
+    /// Set the mountpoint-s3 write handle for this chunk.
+    pub fn set_s3_file(&self, file: File) {
+        *self.s3_file.lock() = Some(file);
     }
 
-    pub fn get_hash(&self) -> Option<[u8; 32]> {
-        *self.hash.lock()
+    /// Take the mountpoint-s3 write handle (for sync_all + close).
+    pub fn take_s3_file(&self) -> Option<File> {
+        self.s3_file.lock().take()
+    }
+
+    /// Write data to the S3 file if present. Returns Ok(true) if written, Ok(false) if no S3 file.
+    pub fn write_to_s3_file(&self, data: &[u8]) -> std::io::Result<bool> {
+        use std::io::Write;
+        let mut guard = self.s3_file.lock();
+        if let Some(ref mut f) = *guard {
+            f.write_all(data)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn increment_readers(&self) {
+        self.reader_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn decrement_reader(&self) {
+        let prev = self.reader_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev > 0, "reader_count underflow");
+        if prev == 1 {
+            self.try_release();
+        }
     }
 }
 
@@ -132,7 +169,7 @@ pub struct InFlightDownload {
     notify: Notify,
     failed: AtomicU8,
     cancelled: AtomicBool,
-    /// Set when the S3 multipart upload is fully completed.
+    /// Set when the S3 manifest write is fully completed.
     pub s3_upload_complete: AtomicBool,
     /// Number of chunks the client has fully consumed (0 initially).
     /// Used by download workers to stay within a bounded prefetch window.
@@ -154,22 +191,23 @@ pub struct InFlightDownload {
 }
 
 impl InFlightDownload {
-    pub fn new(object_size: u64, chunk_size: u64) -> Self {
-        Self::create(object_size, chunk_size, false)
+    pub fn new(object_size: u64, chunk_size: u64, chunk_ids: Vec<[u8; ID_LEN]>) -> Self {
+        Self::create(object_size, chunk_size, false, chunk_ids)
     }
 
-    pub fn new_unknown_size(effective_size: u64, chunk_size: u64) -> Self {
-        Self::create(effective_size, chunk_size, true)
+    pub fn new_unknown_size(effective_size: u64, chunk_size: u64, chunk_ids: Vec<[u8; ID_LEN]>) -> Self {
+        Self::create(effective_size, chunk_size, true, chunk_ids)
     }
 
-    fn create(object_size: u64, chunk_size: u64, unknown_size: bool) -> Self {
-        let num_chunks = if object_size == 0 {
-            0
-        } else {
-            object_size.div_ceil(chunk_size) as usize
-        };
+    /// Create a zero-chunk placeholder (for redirects, errors, etc.)
+    pub fn new_placeholder(chunk_size: u64) -> Self {
+        Self::create(0, chunk_size, false, Vec::new())
+    }
+
+    fn create(object_size: u64, chunk_size: u64, unknown_size: bool, chunk_ids: Vec<[u8; ID_LEN]>) -> Self {
+        let num_chunks = chunk_ids.len();
         let queue: VecDeque<usize> = (0..num_chunks).collect();
-        let chunks = (0..num_chunks).map(|_| ChunkSlot::new()).collect();
+        let chunks = chunk_ids.into_iter().map(|id| ChunkSlot::new(id)).collect();
         Self {
             object_size,
             chunk_size,
@@ -194,6 +232,10 @@ impl InFlightDownload {
 
     pub fn chunk(&self, idx: usize) -> &ChunkSlot {
         &self.chunks[idx]
+    }
+
+    pub fn chunk_id(&self, idx: usize) -> &[u8; ID_LEN] {
+        self.chunks[idx].id()
     }
 
     pub fn expected_chunk_len(&self, idx: usize) -> u64 {
@@ -254,27 +296,6 @@ impl InFlightDownload {
         }
     }
 
-    /// Wait until the hash for chunk `idx` is available.
-    /// The hash is set by the download worker just before `mark_chunk_done`,
-    /// which fires `notify`.
-    pub async fn wait_for_hash(
-        &self,
-        idx: usize,
-    ) -> Result<[u8; 32], ProxyError> {
-        loop {
-            if let Some(h) = self.chunks[idx].get_hash() {
-                return Ok(h);
-            }
-            if self.has_failed() {
-                return Err(ProxyError::Upstream("upstream download failed".into()));
-            }
-            if self.is_cancelled() {
-                return Err(ProxyError::Internal("download cancelled".into()));
-            }
-            self.notify.notified().await;
-        }
-    }
-
     /// Mark the upstream stream as fully received.  Used for unknown-size
     /// (chunked) responses where `object_size` is an upper bound and the
     /// actual data may be smaller.  Wakes all `wait_for_bytes` waiters so
@@ -313,7 +334,7 @@ impl InFlightDownload {
         self.notify.notify_waiters();
     }
 
-    /// Wake all tasks waiting on any condition (bytes, hash, s3_complete, etc.).
+    /// Wake all tasks waiting on any condition (bytes, s3_complete, etc.).
     pub fn wake_waiters(&self) {
         self.notify.notify_waiters();
     }
@@ -333,16 +354,27 @@ impl InFlightDownload {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    /// Increment reader_count for all chunks in [start_idx, end_idx).
+    pub fn increment_readers(&self, start_idx: usize, end_idx: usize) {
+        for idx in start_idx..end_idx.min(self.chunks.len()) {
+            self.chunks[idx].increment_readers();
+        }
+    }
+
+    /// Decrement reader_count for a single chunk and try to release.
+    pub fn decrement_reader(&self, chunk_idx: usize) {
+        self.chunks[chunk_idx].decrement_reader();
+    }
+
     /// Called by the client stream when it finishes reading a chunk.
     /// Updates the consumer position and, when eager_release is enabled
     /// (cache-hit path), releases the chunk's file descriptor immediately.
     /// For cache-miss paths the file is kept alive for the S3 upload; it
-    /// will be released by the upload completion loop instead.
+    /// will be released by reader refcounting instead.
     pub fn notify_consumed(&self, chunk_idx: usize) {
         self.consumed_count.store(chunk_idx + 1, Ordering::Release);
-        self.chunks[chunk_idx].readers_done.store(true, Ordering::Release);
         if self.eager_release.load(Ordering::Acquire) {
-            self.chunks[chunk_idx].try_release();
+            self.chunks[chunk_idx].release_file();
         }
         self.consumer_notify.notify_waiters();
     }
@@ -453,13 +485,21 @@ pub fn pwrite_all(file: &File, offset: u64, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Generate `n` UUIDv7 identifiers for chunks.
+pub fn generate_chunk_ids(n: usize) -> Vec<[u8; ID_LEN]> {
+    (0..n)
+        .map(|_| *uuid::Uuid::now_v7().as_bytes())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn chunk_byte_ranges() {
-        let dl = InFlightDownload::new(5000, 1024);
+        let ids = generate_chunk_ids(5);
+        let dl = InFlightDownload::new(5000, 1024, ids);
         assert_eq!(dl.chunk_count(), 5);
         assert_eq!(dl.chunk_byte_range(0), (0, 1023));
         assert_eq!(dl.chunk_byte_range(4), (4096, 4999));
@@ -467,7 +507,8 @@ mod tests {
 
     #[test]
     fn prioritize_moves_chunks_to_front() {
-        let dl = InFlightDownload::new(10240, 1024);
+        let ids = generate_chunk_ids(10);
+        let dl = InFlightDownload::new(10240, 1024, ids);
         dl.prioritize_range(5120, 7167); // chunks 5,6
         let mut order = Vec::new();
         while let Some(idx) = dl.pop_chunk() {
@@ -480,14 +521,15 @@ mod tests {
 
     #[test]
     fn zero_size_download() {
-        let dl = InFlightDownload::new(0, 1024);
+        let dl = InFlightDownload::new(0, 1024, Vec::new());
         assert_eq!(dl.chunk_count(), 0);
         assert!(dl.pop_chunk().is_none());
     }
 
     #[test]
     fn record_written_tracks_progress() {
-        let dl = InFlightDownload::new(10000, 5000);
+        let ids = generate_chunk_ids(2);
+        let dl = InFlightDownload::new(10000, 5000, ids);
         assert_eq!(dl.chunk(0).bytes_written(), 0);
         assert!(!dl.is_chunk_done(0));
 

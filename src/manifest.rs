@@ -6,21 +6,21 @@ use crate::error::ProxyError;
 
 const MAGIC: [u8; 4] = *b"XS3M";
 const VERSION: u8 = 1;
-const HASH_ALGO_SHA256: u8 = 1;
+const ID_ALGO_UUID: u8 = 2;
 const HEADER_SIZE: usize = 26;
-const HASH_LEN: usize = 32;
+pub const ID_LEN: usize = 16;
 
-/// Binary manifest describing how an object is split into content-addressed chunks.
+/// Binary manifest describing how an object is split into UUID-identified chunks.
 #[derive(Clone)]
 pub struct Manifest {
     pub chunk_size: u64,
     pub total_size: u64,
-    pub hashes: Vec<[u8; HASH_LEN]>,
+    pub chunk_ids: Vec<[u8; ID_LEN]>,
 }
 
 impl Manifest {
     pub fn num_chunks(&self) -> usize {
-        self.hashes.len()
+        self.chunk_ids.len()
     }
 
     /// Compute the range of chunk indexes that overlap `[byte_start, byte_end]` (inclusive).
@@ -35,16 +35,16 @@ impl Manifest {
 
     /// Serialize to compact binary format.
     pub fn serialize(&self) -> Vec<u8> {
-        let num = self.hashes.len() as u32;
-        let mut buf = Vec::with_capacity(HEADER_SIZE + HASH_LEN * self.hashes.len());
+        let num = self.chunk_ids.len() as u32;
+        let mut buf = Vec::with_capacity(HEADER_SIZE + ID_LEN * self.chunk_ids.len());
         buf.extend_from_slice(&MAGIC);
         buf.push(VERSION);
-        buf.push(HASH_ALGO_SHA256);
+        buf.push(ID_ALGO_UUID);
         buf.extend_from_slice(&self.chunk_size.to_le_bytes());
         buf.extend_from_slice(&self.total_size.to_le_bytes());
         buf.extend_from_slice(&num.to_le_bytes());
-        for h in &self.hashes {
-            buf.extend_from_slice(h);
+        for id in &self.chunk_ids {
+            buf.extend_from_slice(id);
         }
         buf
     }
@@ -63,9 +63,9 @@ impl Manifest {
                 data[4]
             )));
         }
-        if data[5] != HASH_ALGO_SHA256 {
+        if data[5] != ID_ALGO_UUID {
             return Err(ProxyError::Internal(format!(
-                "manifest: unsupported hash algo {}",
+                "manifest: unsupported id algo {}",
                 data[5]
             )));
         }
@@ -73,7 +73,7 @@ impl Manifest {
         let total_size = u64::from_le_bytes(data[14..22].try_into().unwrap());
         let num_chunks = u32::from_le_bytes(data[22..26].try_into().unwrap()) as usize;
 
-        let expected_len = HEADER_SIZE + HASH_LEN * num_chunks;
+        let expected_len = HEADER_SIZE + ID_LEN * num_chunks;
         if data.len() < expected_len {
             return Err(ProxyError::Internal(format!(
                 "manifest: expected {} bytes, got {}",
@@ -82,18 +82,18 @@ impl Manifest {
             )));
         }
 
-        let mut hashes = Vec::with_capacity(num_chunks);
+        let mut chunk_ids = Vec::with_capacity(num_chunks);
         for i in 0..num_chunks {
-            let offset = HEADER_SIZE + i * HASH_LEN;
-            let mut h = [0u8; HASH_LEN];
-            h.copy_from_slice(&data[offset..offset + HASH_LEN]);
-            hashes.push(h);
+            let offset = HEADER_SIZE + i * ID_LEN;
+            let mut id = [0u8; ID_LEN];
+            id.copy_from_slice(&data[offset..offset + ID_LEN]);
+            chunk_ids.push(id);
         }
 
         Ok(Self {
             chunk_size,
             total_size,
-            hashes,
+            chunk_ids,
         })
     }
 }
@@ -103,15 +103,15 @@ impl fmt::Debug for Manifest {
         f.debug_struct("Manifest")
             .field("chunk_size", &self.chunk_size)
             .field("total_size", &self.total_size)
-            .field("num_chunks", &self.hashes.len())
+            .field("num_chunks", &self.chunk_ids.len())
             .finish()
     }
 }
 
-/// Derive the filesystem path for a content-addressed chunk relative to data_dir.
+/// Derive the filesystem path for a UUID-identified chunk relative to data_dir.
 /// Layout: `{prefix}{h[0]}/{h[1]}/{h[2]}/{h[3]}/{full_hex}`
-pub fn hash_to_chunk_path(hash: &[u8; HASH_LEN], prefix: &str) -> PathBuf {
-    let hex = hex_encode(hash);
+pub fn id_to_chunk_path(id: &[u8; ID_LEN], prefix: &str) -> PathBuf {
+    let hex = hex_encode(id);
     PathBuf::from(format!(
         "{}{}/{}/{}/{}/{}",
         prefix,
@@ -135,7 +135,7 @@ mod tests {
         Manifest {
             chunk_size: 8_388_608,
             total_size: 20_000_000,
-            hashes: vec![[0xab; 32], [0xcd; 32], [0xef; 32]],
+            chunk_ids: vec![[0xab; 16], [0xcd; 16], [0xef; 16]],
         }
     }
 
@@ -146,16 +146,16 @@ mod tests {
         let m2 = Manifest::deserialize(&bytes).unwrap();
         assert_eq!(m2.chunk_size, m.chunk_size);
         assert_eq!(m2.total_size, m.total_size);
-        assert_eq!(m2.hashes.len(), m.hashes.len());
-        assert_eq!(m2.hashes[0], m.hashes[0]);
-        assert_eq!(m2.hashes[2], m.hashes[2]);
+        assert_eq!(m2.chunk_ids.len(), m.chunk_ids.len());
+        assert_eq!(m2.chunk_ids[0], m.chunk_ids[0]);
+        assert_eq!(m2.chunk_ids[2], m.chunk_ids[2]);
     }
 
     #[test]
     fn manifest_size() {
         let m = sample_manifest();
         let bytes = m.serialize();
-        assert_eq!(bytes.len(), 26 + 32 * 3);
+        assert_eq!(bytes.len(), 26 + 16 * 3);
     }
 
     #[test]
@@ -168,7 +168,6 @@ mod tests {
     #[test]
     fn chunks_for_range_spanning() {
         let m = sample_manifest();
-        // bytes 8M..17M spans chunks 1 and 2
         let r = m.chunks_for_range(8_388_608, 17_000_000);
         assert_eq!(r, 1..3);
     }
@@ -186,12 +185,12 @@ mod tests {
     }
 
     #[test]
-    fn hash_to_chunk_path_format() {
-        let hash = [0xab; 32];
-        let p = hash_to_chunk_path(&hash, "data/");
-        assert_eq!(
-            p.to_str().unwrap(),
-            "data/a/b/a/b/abababababababababababababababababababababababababababababababab"
-        );
+    fn id_to_chunk_path_format() {
+        let id = [0xab; 16];
+        let p = id_to_chunk_path(&id, "data/");
+        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex.len(), 32);
+        let expected = format!("data/{}/{}/{}/{}/{}", &hex[0..1], &hex[1..2], &hex[2..3], &hex[3..4], hex);
+        assert_eq!(p.to_str().unwrap(), expected);
     }
 }

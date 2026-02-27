@@ -2338,6 +2338,7 @@ version = "1.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
 dependencies = [
+ "getrandom 0.4.1",
  "js-sys",
  "wasm-bindgen",
 ]
@@ -2850,6 +2851,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "parking_lot",
+ "rand 0.9.2",
  "reqwest",
  "serde",
  "serde_json",
@@ -2862,6 +2864,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

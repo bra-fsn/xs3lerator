@@ -1,8 +1,8 @@
-pub mod chunk_upload;
 pub mod config;
 pub mod download;
 pub mod error;
 pub mod es_client;
+pub mod finalize;
 pub mod handler;
 pub mod headers;
 pub mod http_pool;

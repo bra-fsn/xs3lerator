@@ -133,8 +133,7 @@ async fn get_without_upstream_url_returns_error() {
 #[tokio::test]
 async fn cache_hit_multi_chunk_prefetch_pipeline() {
     use base64::Engine;
-    use sha2::{Digest, Sha256};
-    use xs3lerator::manifest::{hash_to_chunk_path, Manifest};
+    use xs3lerator::manifest::{id_to_chunk_path, Manifest};
 
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().to_path_buf();
@@ -145,7 +144,7 @@ async fn cache_hit_multi_chunk_prefetch_pipeline() {
     let total_size = chunk_size * (num_chunks - 1) + last_chunk_len;
 
     let mut expected_bytes = Vec::new();
-    let mut hashes: Vec<[u8; 32]> = Vec::new();
+    let mut chunk_ids: Vec<[u8; 16]> = Vec::new();
     let prefix = "data/";
 
     for i in 0..num_chunks as u8 {
@@ -157,18 +156,18 @@ async fn cache_hit_multi_chunk_prefetch_pipeline() {
         let data: Vec<u8> = (0..len).map(|j| i.wrapping_add(j as u8)).collect();
         expected_bytes.extend_from_slice(&data);
 
-        let hash: [u8; 32] = Sha256::digest(&data).into();
-        let rel_path = hash_to_chunk_path(&hash, prefix);
+        let id: [u8; 16] = rand::random();
+        let rel_path = id_to_chunk_path(&id, prefix);
         let full_path = data_dir.join(&rel_path);
         std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
         std::fs::write(&full_path, &data).unwrap();
-        hashes.push(hash);
+        chunk_ids.push(id);
     }
 
     let manifest = Manifest {
         chunk_size,
         total_size,
-        hashes,
+        chunk_ids,
     };
     let manifest_b64 = base64::engine::general_purpose::STANDARD.encode(manifest.serialize());
 
@@ -214,8 +213,7 @@ async fn cache_hit_multi_chunk_prefetch_pipeline() {
 #[tokio::test]
 async fn cache_hit_range_request() {
     use base64::Engine;
-    use sha2::{Digest, Sha256};
-    use xs3lerator::manifest::{hash_to_chunk_path, Manifest};
+    use xs3lerator::manifest::{id_to_chunk_path, Manifest};
 
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().to_path_buf();
@@ -224,25 +222,25 @@ async fn cache_hit_range_request() {
     let total_size = chunk_size * 2;
 
     let mut all_bytes = Vec::new();
-    let mut hashes: Vec<[u8; 32]> = Vec::new();
+    let mut chunk_ids: Vec<[u8; 16]> = Vec::new();
     let prefix = "data/";
 
     for i in 0..2u8 {
         let data: Vec<u8> = (0..chunk_size as usize).map(|j| i.wrapping_add(j as u8)).collect();
         all_bytes.extend_from_slice(&data);
 
-        let hash: [u8; 32] = Sha256::digest(&data).into();
-        let rel_path = hash_to_chunk_path(&hash, prefix);
+        let id: [u8; 16] = rand::random();
+        let rel_path = id_to_chunk_path(&id, prefix);
         let full_path = data_dir.join(&rel_path);
         std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
         std::fs::write(&full_path, &data).unwrap();
-        hashes.push(hash);
+        chunk_ids.push(id);
     }
 
     let manifest = Manifest {
         chunk_size,
         total_size,
-        hashes,
+        chunk_ids,
     };
     let manifest_b64 = base64::engine::general_purpose::STANDARD.encode(manifest.serialize());
 

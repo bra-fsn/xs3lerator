@@ -193,14 +193,14 @@ mod tests {
         let manifest = Manifest {
             chunk_size: 8_388_608,
             total_size: 20_000_000,
-            hashes: vec![[0xab; 32], [0xcd; 32]],
+            chunk_ids: vec![[0xab; 16], [0xcd; 16]],
         };
         let bytes = manifest.serialize();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let decoded = decode_manifest_b64(&b64).unwrap();
         assert_eq!(decoded.chunk_size, manifest.chunk_size);
         assert_eq!(decoded.total_size, manifest.total_size);
-        assert_eq!(decoded.hashes.len(), manifest.hashes.len());
+        assert_eq!(decoded.chunk_ids.len(), manifest.chunk_ids.len());
     }
 
     #[test]

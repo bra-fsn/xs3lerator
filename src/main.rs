@@ -4,11 +4,11 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing::info;
 
-mod chunk_upload;
 mod config;
 mod download;
 mod error;
 mod es_client;
+mod finalize;
 mod handler;
 mod headers;
 mod http_pool;
