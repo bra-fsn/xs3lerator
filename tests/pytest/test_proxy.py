@@ -103,20 +103,21 @@ class TestCacheMiss:
         manifest_data = base64.b64decode(manifest_b64)
         assert manifest_data[:4] == b"XS3M", "Manifest should start with XS3M magic"
 
-        # Verify the manifest encodes at least one chunk hash (26-byte header
-        # followed by 32-byte SHA-256 hashes).
-        assert len(manifest_data) >= 26 + 32, (
-            "Manifest should contain at least one chunk hash"
+        # Verify the manifest encodes at least one chunk ID (26-byte header
+        # followed by 16-byte UUID IDs).
+        assert len(manifest_data) >= 26 + 16, (
+            "Manifest should contain at least one chunk ID"
         )
 
         # Verify the actual chunk data landed in S3 (through mount-s3).
         # The manifest was only written after chunks were persisted + sync'd,
         # so by this point they should be visible via the S3 API.
         import struct
+        assert manifest_data[5] == 2, "id_algo should be 2 (UUID)"
         num_chunks = struct.unpack_from("<I", manifest_data, 22)[0]
         for i in range(num_chunks):
-            chunk_hash = manifest_data[26 + i * 32 : 26 + (i + 1) * 32]
-            h = chunk_hash.hex()
+            chunk_id = manifest_data[26 + i * 16 : 26 + (i + 1) * 16]
+            h = chunk_id.hex()
             s3_key = f"data/{h[0]}/{h[1]}/{h[2]}/{h[3]}/{h}"
             obj = s3_client.get_object(Bucket=test_bucket, Key=s3_key)
             body = obj["Body"].read()
