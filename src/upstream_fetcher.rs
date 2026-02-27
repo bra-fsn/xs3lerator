@@ -967,6 +967,7 @@ async fn start_sequential_download(
                         ProxyError::Internal(format!("open S3 file {}: {e}", full_path.display()))
                     })?;
                 download.chunk(idx).set_s3_file(s3_file);
+                download.chunk(idx).increment_readers();
             }
         }
     }
