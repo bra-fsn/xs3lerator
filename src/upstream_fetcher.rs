@@ -943,10 +943,31 @@ async fn start_sequential_download(
     }
 
     if !is_unknown_size {
+        let caching_setup = cache_key.is_some();
         for idx in 0..download.chunk_count() {
             let chunk_file = create_temp_chunk_file(&config.temp_dir)
                 .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
             download.chunk(idx).set_file(Arc::new(chunk_file));
+
+            if caching_setup {
+                let id = download.chunk_id(idx);
+                let rel_path = id_to_chunk_path(id, &config.data_prefix);
+                let full_path = data_dir.join(&rel_path);
+                if let Some(parent) = full_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        ProxyError::Internal(format!("mkdir {}: {e}", parent.display()))
+                    })?;
+                }
+                let s3_file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&full_path)
+                    .map_err(|e| {
+                        ProxyError::Internal(format!("open S3 file {}: {e}", full_path.display()))
+                    })?;
+                download.chunk(idx).set_s3_file(s3_file);
+            }
         }
     }
 
