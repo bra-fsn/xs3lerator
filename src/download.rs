@@ -354,18 +354,6 @@ impl InFlightDownload {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    /// Increment reader_count for all chunks in [start_idx, end_idx).
-    pub fn increment_readers(&self, start_idx: usize, end_idx: usize) {
-        for idx in start_idx..end_idx.min(self.chunks.len()) {
-            self.chunks[idx].increment_readers();
-        }
-    }
-
-    /// Decrement reader_count for a single chunk and try to release.
-    pub fn decrement_reader(&self, chunk_idx: usize) {
-        self.chunks[chunk_idx].decrement_reader();
-    }
-
     /// Called by the client stream when it finishes reading a chunk.
     /// Updates the consumer position and, when eager_release is enabled
     /// (cache-hit path), releases the chunk's file descriptor immediately.

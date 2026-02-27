@@ -754,6 +754,37 @@ impl Drop for CancelGuard {
     }
 }
 
+/// RAII guard that decrements reader_count for all not-yet-consumed chunks
+/// when the client stream is dropped (normal completion or early disconnect).
+struct ReaderGuard {
+    download: Arc<InFlightDownload>,
+    live_chunks: Vec<usize>,
+}
+
+impl ReaderGuard {
+    fn new(download: Arc<InFlightDownload>, chunks: Vec<usize>) -> Self {
+        for &idx in &chunks {
+            download.chunk(idx).increment_readers();
+        }
+        Self { download, live_chunks: chunks }
+    }
+
+    fn consumed(&mut self, chunk_idx: usize) {
+        if let Some(pos) = self.live_chunks.iter().position(|&c| c == chunk_idx) {
+            self.live_chunks.swap_remove(pos);
+            self.download.chunk(chunk_idx).decrement_reader();
+        }
+    }
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        for &idx in &self.live_chunks {
+            self.download.chunk(idx).decrement_reader();
+        }
+    }
+}
+
 /// Build the HTTP response that streams data from in-flight chunk files.
 fn build_streaming_response(
     download: Arc<InFlightDownload>,
@@ -876,6 +907,13 @@ fn make_download_stream(
 
         let chunk_size = download.chunk_size;
         let read_end = download_start + read_len - 1;
+
+        let start_chunk = (download_start / chunk_size) as usize;
+        let end_chunk = (read_end / chunk_size) as usize;
+        let max_chunk = download.chunk_count().saturating_sub(1);
+        let chunk_range: Vec<usize> = (start_chunk..=end_chunk.min(max_chunk)).collect();
+        let mut reader_guard = ReaderGuard::new(download.clone(), chunk_range);
+
         let mut pos = download_start;
         let mut prev_chunk: Option<usize> = None;
 
@@ -888,6 +926,7 @@ fn make_download_stream(
             if let Some(prev) = prev_chunk {
                 if chunk_idx != prev {
                     download.notify_consumed(prev);
+                    reader_guard.consumed(prev);
                     prev_chunk = Some(chunk_idx);
                 }
             } else {
@@ -967,6 +1006,7 @@ fn make_download_stream(
 
         if let Some(last) = prev_chunk {
             download.notify_consumed(last);
+            reader_guard.consumed(last);
         }
     }
 }
@@ -979,6 +1019,7 @@ fn make_unknown_size_stream(
         let chunk_size = download.chunk_size;
         let mut pos = 0u64;
         let mut prev_chunk: Option<usize> = None;
+        let mut reader_guard = ReaderGuard::new(download.clone(), vec![]);
 
         loop {
             let chunk_idx = (pos / chunk_size) as usize;
@@ -989,9 +1030,14 @@ fn make_unknown_size_stream(
             if let Some(prev) = prev_chunk {
                 if chunk_idx != prev {
                     download.notify_consumed(prev);
+                    reader_guard.consumed(prev);
+                    download.chunk(chunk_idx).increment_readers();
+                    reader_guard.live_chunks.push(chunk_idx);
                     prev_chunk = Some(chunk_idx);
                 }
             } else {
+                download.chunk(chunk_idx).increment_readers();
+                reader_guard.live_chunks.push(chunk_idx);
                 prev_chunk = Some(chunk_idx);
             }
 
@@ -1031,6 +1077,7 @@ fn make_unknown_size_stream(
 
         if let Some(last) = prev_chunk {
             download.notify_consumed(last);
+            reader_guard.consumed(last);
         }
     }
 }
