@@ -406,10 +406,11 @@ fn make_cache_hit_stream(
             // Try local disk first
             let local_path = disk_cache.as_ref().and_then(|dc| dc.lookup(id));
 
+            let mut local_served = false;
             if let Some(path) = local_path {
-                // Local disk hit: read in 256 KiB pieces via spawn_blocking
                 let mut pos = start_offset;
                 let end = chunk_len.min(start_offset + remaining as usize);
+                let mut ok = true;
                 while pos < end {
                     let piece = min(end - pos, 256 * 1024);
                     let p = path.clone();
@@ -423,14 +424,29 @@ fn make_cache_hit_stream(
                         Ok(Bytes::from(buf))
                     })
                     .await
-                    .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?
-                    .map_err(|e| ProxyError::Internal(format!("local read: {e}")))?;
-
-                    remaining -= data.len() as u64;
-                    pos += data.len();
-                    yield data;
+                    .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?;
+                    match data {
+                        Ok(bytes) => {
+                            remaining -= bytes.len() as u64;
+                            pos += bytes.len();
+                            yield bytes;
+                        }
+                        Err(e) => {
+                            warn!(
+                                cache_key = cache_key.as_str(),
+                                chunk_id = crate::manifest::hex_encode_id(id),
+                                "local cache read failed, falling back to S3: {e}"
+                            );
+                            ok = false;
+                            break;
+                        }
+                    }
                 }
-            } else {
+                if ok {
+                    local_served = true;
+                }
+            }
+            if !local_served {
                 // Local miss: stream from S3 with tee to disk cache
                 let s3_ref = match s3.as_ref() {
                     Some(s) => s,
@@ -513,9 +529,8 @@ fn make_cache_hit_stream(
                     let piece = piece_result?;
                     let piece_len = piece.len();
 
-                    // Send to backfill writer (non-blocking, drop if full)
                     if let Some(ref tx) = backfill_tx {
-                        let _ = tx.try_send(piece.clone());
+                        let _ = tx.send(piece.clone()).await;
                     }
 
                     // Yield the client's slice
@@ -537,6 +552,19 @@ fn make_cache_hit_stream(
                         remaining -= to_yield as u64;
                     }
                     s3_offset += piece_len;
+
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+
+                // Drain any remaining S3 bytes into the backfill writer
+                if let Some(ref tx) = backfill_tx {
+                    while let Some(piece_result) = s3_stream.next().await {
+                        if let Ok(piece) = piece_result {
+                            let _ = tx.send(piece).await;
+                        }
+                    }
                 }
 
                 // Signal backfill writer to finish
