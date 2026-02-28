@@ -794,7 +794,7 @@ fn spawn_s3_shadow_writer(download: &Arc<InFlightDownload>, idx: usize) {
         }
         drop(s3_file);
         dl.chunk(idx).s3_committed.store(true, Ordering::Release);
-        dl.chunk(idx).decrement_reader();
+        dl.wake_waiters();
     });
 }
 
