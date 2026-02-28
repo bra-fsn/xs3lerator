@@ -458,22 +458,8 @@ async fn run_adaptive_upstream(
             let id = download.chunk_id(idx);
             let rel_path = id_to_chunk_path(id, data_prefix);
             let full_path = data_dir.join(&rel_path);
-            if let Some(parent) = full_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    ProxyError::Internal(format!("mkdir {}: {e}", parent.display()))
-                })?;
-            }
-            let s3_file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&full_path)
-                .map_err(|e| {
-                    ProxyError::Internal(format!("open S3 file {}: {e}", full_path.display()))
-                })?;
-            download.chunk(idx).set_s3_file(s3_file);
             download.chunk(idx).increment_readers();
-            spawn_s3_shadow_writer(&download, idx);
+            spawn_s3_shadow_writer(&download, idx, full_path);
         }
     }
 
@@ -740,17 +726,18 @@ fn active_sequential_chunk(download: &InFlightDownload) -> usize {
 /// All S3/filesystem I/O runs inside `spawn_blocking` so it cannot stall the
 /// tokio runtime — mountpoint-s3 writes and sync_all trigger real S3 PutObject
 /// calls that can take tens of milliseconds.
-fn spawn_s3_shadow_writer(download: &Arc<InFlightDownload>, idx: usize) {
-    let mut s3_file = match download.chunk(idx).take_s3_file() {
-        Some(f) => f,
-        None => return,
-    };
+///
+/// The S3 file is opened lazily inside the blocking task so that mountpoint-s3
+/// `create_dir_all` + `open` (which trigger real S3 API calls) never block the
+/// tokio runtime.
+fn spawn_s3_shadow_writer(
+    download: &Arc<InFlightDownload>,
+    idx: usize,
+    s3_chunk_path: std::path::PathBuf,
+) {
     let temp_file = match download.chunk(idx).get_file() {
         Some(f) => f,
-        None => {
-            download.chunk(idx).set_s3_file(s3_file);
-            return;
-        }
+        None => return,
     };
     let dl = download.clone();
     let expected = download.expected_chunk_len(idx);
@@ -760,6 +747,22 @@ fn spawn_s3_shadow_writer(download: &Arc<InFlightDownload>, idx: usize) {
         use std::os::unix::fs::FileExt;
 
         let shadow_t0 = std::time::Instant::now();
+
+        let mut s3_file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&s3_chunk_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(chunk = idx, "S3 file open failed: {e}");
+                dl.wake_waiters();
+                return;
+            }
+        };
+        let open_ms = shadow_t0.elapsed().as_secs_f64() * 1000.0;
+
         let mut offset: u64 = 0;
         let mut buf = vec![0u8; 256 * 1024];
 
@@ -811,6 +814,7 @@ fn spawn_s3_shadow_writer(download: &Arc<InFlightDownload>, idx: usize) {
         debug!(
             chunk = idx,
             bytes = offset,
+            open_ms = open_ms as u64,
             write_ms = write_ms as u64,
             sync_ms = sync_ms as u64,
             total_ms = (write_ms + sync_ms) as u64,
@@ -1015,7 +1019,7 @@ async fn start_sequential_download(
 
     if !is_unknown_size {
         let caching_setup = cache_key.is_some();
-        let s3_setup_t0 = std::time::Instant::now();
+        let setup_t0 = std::time::Instant::now();
         for idx in 0..download.chunk_count() {
             let chunk_file = create_temp_chunk_file(&config.temp_dir)
                 .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
@@ -1025,30 +1029,16 @@ async fn start_sequential_download(
                 let id = download.chunk_id(idx);
                 let rel_path = id_to_chunk_path(id, &config.data_prefix);
                 let full_path = data_dir.join(&rel_path);
-                if let Some(parent) = full_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        ProxyError::Internal(format!("mkdir {}: {e}", parent.display()))
-                    })?;
-                }
-                let s3_file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .open(&full_path)
-                    .map_err(|e| {
-                        ProxyError::Internal(format!("open S3 file {}: {e}", full_path.display()))
-                    })?;
-                download.chunk(idx).set_s3_file(s3_file);
                 download.chunk(idx).increment_readers();
-                spawn_s3_shadow_writer(&download, idx);
+                spawn_s3_shadow_writer(&download, idx, full_path);
             }
         }
         if caching_setup {
-            let s3_setup_ms = s3_setup_t0.elapsed().as_secs_f64() * 1000.0;
+            let setup_ms = setup_t0.elapsed().as_secs_f64() * 1000.0;
             debug!(
                 chunks = download.chunk_count(),
-                s3_setup_ms = s3_setup_ms as u64,
-                "S3 file setup complete"
+                setup_ms = setup_ms as u64,
+                "chunk setup complete"
             );
         }
     }
@@ -1085,27 +1075,12 @@ async fn start_sequential_download(
                                     break 'outer;
                                 }
                             }
-                            // Lazy S3 file creation for unknown-size responses
                             if caching {
                                 let id = dl.chunk_id(chunk_idx);
                                 let rel_path = id_to_chunk_path(id, &data_prefix_clone);
                                 let full_path = data_dir_clone.join(&rel_path);
-                                if let Some(parent) = full_path.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                match std::fs::OpenOptions::new()
-                                    .create(true).truncate(true).write(true)
-                                    .open(&full_path)
-                                {
-                                    Ok(f) => {
-                                        dl.chunk(chunk_idx).set_s3_file(f);
-                                        dl.chunk(chunk_idx).increment_readers();
-                                        spawn_s3_shadow_writer(&dl, chunk_idx);
-                                    }
-                                    Err(e) => {
-                                        warn!(cache_key = ?ck, "S3 file creation failed: {e}");
-                                    }
-                                }
+                                dl.chunk(chunk_idx).increment_readers();
+                                spawn_s3_shadow_writer(&dl, chunk_idx, full_path);
                             }
                         }
 

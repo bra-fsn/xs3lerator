@@ -62,9 +62,6 @@ pub struct ChunkSlot {
     bytes_written: AtomicU64,
     /// UUIDv4 identifier for this chunk (immutable, set at construction).
     id: [u8; ID_LEN],
-    /// Open file descriptor for the mountpoint-s3 write handle.
-    /// `None` before the S3 file is opened or after it's been closed.
-    s3_file: Mutex<Option<File>>,
     /// Set once the S3 upload for this chunk completes (sync_all + close).
     pub s3_committed: AtomicBool,
     /// Number of active readers (including the download worker itself).
@@ -77,7 +74,6 @@ impl ChunkSlot {
             file: Mutex::new(None),
             bytes_written: AtomicU64::new(0),
             id,
-            s3_file: Mutex::new(None),
             s3_committed: AtomicBool::new(false),
             reader_count: AtomicUsize::new(0),
         }
@@ -119,15 +115,6 @@ impl ChunkSlot {
     }
 
     /// Set the mountpoint-s3 write handle for this chunk.
-    pub fn set_s3_file(&self, file: File) {
-        *self.s3_file.lock() = Some(file);
-    }
-
-    /// Take the mountpoint-s3 write handle (for sync_all + close).
-    pub fn take_s3_file(&self) -> Option<File> {
-        self.s3_file.lock().take()
-    }
-
     pub fn increment_readers(&self) {
         self.reader_count.fetch_add(1, Ordering::AcqRel);
     }
