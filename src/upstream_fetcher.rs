@@ -435,7 +435,7 @@ async fn run_adaptive_upstream(
     http_client: &reqwest::Client,
     upstream_headers: &axum::http::HeaderMap,
     initial_response: reqwest::Response,
-    download: &InFlightDownload,
+    download: &Arc<InFlightDownload>,
     trace: &Option<Arc<TraceWriter>>,
     max_concurrency: usize,
     data_dir: &std::path::Path,
@@ -477,11 +477,10 @@ async fn run_adaptive_upstream(
 
     // Spawn the sequential stream from the initial full-GET response.
     let stop_clone = stop_after.clone();
-    let dl_ptr = download as *const InFlightDownload as usize;
+    let dl_seq = download.clone();
     let trace_seq = trace.clone();
     let seq_handle = tokio::spawn(async move {
-        let download = unsafe { &*(dl_ptr as *const InFlightDownload) };
-        stream_response_into_chunks(initial_response, download, stop_clone, &trace_seq).await
+        stream_response_into_chunks(initial_response, &dl_seq, stop_clone, &trace_seq).await
     });
 
     // Drain remaining chunks in priority order (chunk 0 handled by sequential).
@@ -553,13 +552,12 @@ async fn run_adaptive_upstream(
                     {
                         let probe_file = download.chunk(probe_idx).get_file()
                             .ok_or_else(|| ProxyError::Internal("probe chunk file gone".into()))?;
-                        let dl_ptr2 = download as *const InFlightDownload as usize;
+                        let dl_clone = download.clone();
                         let expected = download.expected_chunk_len(probe_idx);
                         let trace_c = trace.clone();
                         parallel_handles.push(tokio::spawn(async move {
-                            let download = unsafe { &*(dl_ptr2 as *const InFlightDownload) };
                             download_chunk_from_stream(
-                                resp, &probe_file, download, probe_idx, expected, &trace_c,
+                                resp, &probe_file, &dl_clone, probe_idx, expected, &trace_c,
                             ).await
                         }));
                     }
@@ -579,12 +577,11 @@ async fn run_adaptive_upstream(
                             let client = http_client.clone();
                             let url = upstream_url.to_string();
                             let hdrs = upstream_headers.clone();
-                            let dl_ptr3 = download as *const InFlightDownload as usize;
+                            let dl_clone = download.clone();
                             let trace_c = trace.clone();
                             let ramp = ramp.clone();
 
                             parallel_handles.push(tokio::spawn(async move {
-                                let download = unsafe { &*(dl_ptr3 as *const InFlightDownload) };
                                 loop {
                                     // Ramp gate: workers beyond the current active
                                     // level yield until the ramp admits them.
@@ -607,14 +604,14 @@ async fn run_adaptive_upstream(
                                     let pos = cursor.fetch_add(1, Ordering::Relaxed);
                                     if pos >= chunks.len() { break; }
                                     let idx = chunks[pos];
-                                    if download.is_chunk_done(idx) { continue; }
+                                    if dl_clone.is_chunk_done(idx) { continue; }
 
-                                    let chunk_file = download.chunk(idx).get_file()
+                                    let chunk_file = dl_clone.chunk(idx).get_file()
                                         .ok_or_else(|| ProxyError::Internal(
                                             format!("chunk {idx} file gone")
                                         ))?;
-                                    let (start, end) = download.chunk_byte_range(idx);
-                                    let expected = download.expected_chunk_len(idx);
+                                    let (start, end) = dl_clone.chunk_byte_range(idx);
+                                    let expected = dl_clone.expected_chunk_len(idx);
 
                                     let mut req = client.get(&url);
                                     for (name, value) in hdrs.iter() {
@@ -629,7 +626,7 @@ async fn run_adaptive_upstream(
                                             || resp.status().as_u16() == 206 =>
                                         {
                                             match download_chunk_from_stream(
-                                                resp, &chunk_file, download,
+                                                resp, &chunk_file, &dl_clone,
                                                 idx, expected, &trace_c,
                                             ).await {
                                                 Ok(()) => ramp.record_chunk(expected),
@@ -730,13 +727,20 @@ fn active_sequential_chunk(download: &InFlightDownload) -> usize {
 }
 
 /// Finalize a chunk's S3 file: sync_all, close, and mark as committed.
-fn finalize_chunk_s3(download: &InFlightDownload, idx: usize) {
+///
+/// The sync_all on mountpoint-s3 triggers a blocking S3 PutObject (~60-80ms),
+/// so we offload it to spawn_blocking to avoid stalling the tokio runtime
+/// (which would block response streaming to the client).
+fn finalize_chunk_s3(download: &Arc<InFlightDownload>, idx: usize) {
     if let Some(s3_file) = download.chunk(idx).take_s3_file() {
-        if let Err(e) = s3_file.sync_all() {
-            warn!(chunk = idx, "S3 chunk sync_all failed: {e}");
-        }
-        drop(s3_file);
-        download.chunk(idx).s3_committed.store(true, Ordering::Release);
+        let dl = download.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = s3_file.sync_all() {
+                warn!(chunk = idx, "S3 chunk sync_all failed: {e}");
+            }
+            drop(s3_file);
+            dl.chunk(idx).s3_committed.store(true, Ordering::Release);
+        });
     }
 }
 
@@ -745,7 +749,7 @@ fn finalize_chunk_s3(download: &InFlightDownload, idx: usize) {
 /// that keeps running unless parallel workers take over.
 async fn stream_response_into_chunks(
     response: reqwest::Response,
-    download: &InFlightDownload,
+    download: &Arc<InFlightDownload>,
     stop_after: Arc<AtomicUsize>,
     trace: &Option<Arc<TraceWriter>>,
 ) -> Result<(), ProxyError> {
@@ -812,7 +816,7 @@ async fn stream_response_into_chunks(
 async fn download_chunk_from_stream(
     response: reqwest::Response,
     file: &std::fs::File,
-    download: &InFlightDownload,
+    download: &Arc<InFlightDownload>,
     idx: usize,
     expected: u64,
     trace: &Option<Arc<TraceWriter>>,
