@@ -12,12 +12,15 @@ use xs3lerator::handler::AppState;
 use xs3lerator::server::build_router;
 
 fn test_config() -> AppConfig {
-    let data_dir = std::env::temp_dir().join("xs3-redirect-test-data");
-    std::fs::create_dir_all(&data_dir).ok();
     AppConfig {
         bind_ip: std::net::IpAddr::from([127, 0, 0, 1]),
         port: 0,
-        data_dir,
+        s3_bucket: None,
+        s3_region: "us-east-1".to_string(),
+        s3_endpoint: None,
+        cache_dir: None,
+        cache_low_watermark: 85,
+        cache_high_watermark: 95,
         http_concurrency: 4,
         chunk_size: 5 * 1024 * 1024,
         temp_dir: std::env::temp_dir(),
@@ -26,7 +29,6 @@ fn test_config() -> AppConfig {
         elasticsearch_url: None,
         elasticsearch_manifest_index: "passsage_meta".to_string(),
         passthrough: false,
-        open_parallelism: 8,
     }
 }
 
@@ -133,14 +135,14 @@ async fn handle_final_target() -> impl IntoResponse {
 
 fn make_state() -> AppState {
     let config = test_config();
-    let data_dir = config.data_dir.clone();
     AppState {
         config: Arc::new(config),
-        data_dir,
         downloads: Arc::new(DownloadManager::default()),
         trace: None,
         es_client: None,
         http_pool: Arc::new(xs3lerator::http_pool::HttpClientPool::new()),
+        s3: None,
+        disk_cache: None,
     }
 }
 

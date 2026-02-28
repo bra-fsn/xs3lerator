@@ -7,12 +7,15 @@ use xs3lerator::handler::AppState;
 use xs3lerator::server::build_router;
 
 fn test_config() -> AppConfig {
-    let data_dir = std::env::temp_dir().join("xs3-mock-test-data");
-    std::fs::create_dir_all(&data_dir).ok();
     AppConfig {
         bind_ip: std::net::IpAddr::from([127, 0, 0, 1]),
         port: 0,
-        data_dir,
+        s3_bucket: None,
+        s3_region: "us-east-1".to_string(),
+        s3_endpoint: None,
+        cache_dir: None,
+        cache_low_watermark: 85,
+        cache_high_watermark: 95,
         http_concurrency: 4,
         chunk_size: 5 * 1024 * 1024,
         temp_dir: std::env::temp_dir(),
@@ -21,14 +24,6 @@ fn test_config() -> AppConfig {
         elasticsearch_url: None,
         elasticsearch_manifest_index: "passsage_meta".to_string(),
         passthrough: false,
-        open_parallelism: 8,
-    }
-}
-
-fn test_config_with_dir(data_dir: std::path::PathBuf) -> AppConfig {
-    AppConfig {
-        data_dir,
-        ..test_config()
     }
 }
 
@@ -46,26 +41,14 @@ async fn start_server(state: AppState) -> String {
 
 fn make_state() -> AppState {
     let config = test_config();
-    let data_dir = config.data_dir.clone();
     AppState {
         config: Arc::new(config),
-        data_dir,
         downloads: Arc::new(DownloadManager::default()),
         trace: None,
         es_client: None,
         http_pool: Arc::new(xs3lerator::http_pool::HttpClientPool::new()),
-    }
-}
-
-fn make_state_with_config(config: AppConfig) -> AppState {
-    let data_dir = config.data_dir.clone();
-    AppState {
-        config: Arc::new(config),
-        data_dir,
-        downloads: Arc::new(DownloadManager::default()),
-        trace: None,
-        es_client: None,
-        http_pool: Arc::new(xs3lerator::http_pool::HttpClientPool::new()),
+        s3: None,
+        disk_cache: None,
     }
 }
 
@@ -133,10 +116,14 @@ async fn get_without_upstream_url_returns_error() {
 #[tokio::test]
 async fn cache_hit_multi_chunk_prefetch_pipeline() {
     use base64::Engine;
-    use xs3lerator::manifest::{id_to_chunk_path, Manifest};
+    use xs3lerator::disk_cache::DiskCache;
+    use xs3lerator::manifest::Manifest;
 
     let tmp = tempfile::tempdir().unwrap();
-    let data_dir = tmp.path().to_path_buf();
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let dc = Arc::new(DiskCache::new(cache_dir.clone()));
+    dc.preseed_dirs().unwrap();
 
     let chunk_size: u64 = 1024;
     let num_chunks = 3;
@@ -145,7 +132,6 @@ async fn cache_hit_multi_chunk_prefetch_pipeline() {
 
     let mut expected_bytes = Vec::new();
     let mut chunk_ids: Vec<[u8; 16]> = Vec::new();
-    let prefix = "data/";
 
     for i in 0..num_chunks as u8 {
         let len = if (i as u64) == num_chunks - 1 {
@@ -157,10 +143,15 @@ async fn cache_hit_multi_chunk_prefetch_pipeline() {
         expected_bytes.extend_from_slice(&data);
 
         let id: [u8; 16] = rand::random();
-        let rel_path = id_to_chunk_path(&id, prefix);
-        let full_path = data_dir.join(&rel_path);
-        std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
-        std::fs::write(&full_path, &data).unwrap();
+
+        // Write chunk into disk cache using temp_file + finalize
+        let (mut f, temp_path) = dc.temp_file().unwrap();
+        {
+            use std::io::Write;
+            f.write_all(&data).unwrap();
+        }
+        drop(f);
+        dc.finalize(&temp_path, &id).unwrap();
         chunk_ids.push(id);
     }
 
@@ -171,11 +162,20 @@ async fn cache_hit_multi_chunk_prefetch_pipeline() {
     };
     let manifest_b64 = base64::engine::general_purpose::STANDARD.encode(manifest.serialize());
 
-    let config = test_config_with_dir(data_dir);
-    let state = make_state_with_config(AppConfig {
+    let config = AppConfig {
         chunk_size,
-        ..config
-    });
+        cache_dir: Some(cache_dir),
+        ..test_config()
+    };
+    let state = AppState {
+        config: Arc::new(config),
+        downloads: Arc::new(DownloadManager::default()),
+        trace: None,
+        es_client: None,
+        http_pool: Arc::new(xs3lerator::http_pool::HttpClientPool::new()),
+        s3: None,
+        disk_cache: Some(dc),
+    };
     let base = start_server(state).await;
 
     let client = reqwest::Client::new();
@@ -213,27 +213,33 @@ async fn cache_hit_multi_chunk_prefetch_pipeline() {
 #[tokio::test]
 async fn cache_hit_range_request() {
     use base64::Engine;
-    use xs3lerator::manifest::{id_to_chunk_path, Manifest};
+    use xs3lerator::disk_cache::DiskCache;
+    use xs3lerator::manifest::Manifest;
 
     let tmp = tempfile::tempdir().unwrap();
-    let data_dir = tmp.path().to_path_buf();
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let dc = Arc::new(DiskCache::new(cache_dir.clone()));
+    dc.preseed_dirs().unwrap();
 
     let chunk_size: u64 = 1024;
     let total_size = chunk_size * 2;
 
     let mut all_bytes = Vec::new();
     let mut chunk_ids: Vec<[u8; 16]> = Vec::new();
-    let prefix = "data/";
 
     for i in 0..2u8 {
         let data: Vec<u8> = (0..chunk_size as usize).map(|j| i.wrapping_add(j as u8)).collect();
         all_bytes.extend_from_slice(&data);
 
         let id: [u8; 16] = rand::random();
-        let rel_path = id_to_chunk_path(&id, prefix);
-        let full_path = data_dir.join(&rel_path);
-        std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
-        std::fs::write(&full_path, &data).unwrap();
+        let (mut f, temp_path) = dc.temp_file().unwrap();
+        {
+            use std::io::Write;
+            f.write_all(&data).unwrap();
+        }
+        drop(f);
+        dc.finalize(&temp_path, &id).unwrap();
         chunk_ids.push(id);
     }
 
@@ -244,11 +250,20 @@ async fn cache_hit_range_request() {
     };
     let manifest_b64 = base64::engine::general_purpose::STANDARD.encode(manifest.serialize());
 
-    let config = test_config_with_dir(data_dir);
-    let state = make_state_with_config(AppConfig {
+    let config = AppConfig {
         chunk_size,
-        ..config
-    });
+        cache_dir: Some(cache_dir),
+        ..test_config()
+    };
+    let state = AppState {
+        config: Arc::new(config),
+        downloads: Arc::new(DownloadManager::default()),
+        trace: None,
+        es_client: None,
+        http_pool: Arc::new(xs3lerator::http_pool::HttpClientPool::new()),
+        s3: None,
+        disk_cache: Some(dc),
+    };
     let base = start_server(state).await;
 
     let client = reqwest::Client::new();

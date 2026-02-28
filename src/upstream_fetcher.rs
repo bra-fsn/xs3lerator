@@ -2,12 +2,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, TRANSFER_ENCODING};
 use serde_json::json;
 use tracing::{debug, warn};
 
 use crate::config::AppConfig;
+use crate::disk_cache::DiskCache;
 use crate::download::{
     create_temp_chunk_file, generate_chunk_ids, is_enospc, pwrite_all,
     DownloadManager, InFlightDownload,
@@ -17,9 +19,9 @@ use crate::es_client::EsClient;
 use crate::finalize;
 use crate::headers::{filter_upstream_headers, ContractHeaders};
 use crate::http_pool::HttpClientPool;
-use crate::manifest::id_to_chunk_path;
 use crate::planner::{compute_chunk_plan, ConcurrencyRamp};
 use crate::range::parse_range_header;
+use crate::s3_client::S3Client;
 use crate::trace::{trace_log, TraceWriter};
 
 /// Fetch a file from an upstream HTTP(S) URL, buffer through per-chunk temp
@@ -60,10 +62,11 @@ pub async fn fetch_upstream(
     cache_key: Option<&str>,
     client_range: Option<&str>,
     downloads: &Arc<DownloadManager>,
-    data_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
     es_client: Option<Arc<EsClient>>,
     http_pool: &HttpClientPool,
+    s3_client: Option<Arc<S3Client>>,
+    disk_cache: Option<Arc<DiskCache>>,
 ) -> Result<UpstreamResult, ProxyError> {
     // Check for an existing in-flight download for the same cache key.
     // This handles the deduplication case within a single instance.
@@ -228,7 +231,6 @@ pub async fn fetch_upstream(
                 file_size,
                 cache_key,
                 downloads,
-                data_dir,
                 trace,
                 client_range,
                 content_type,
@@ -237,6 +239,8 @@ pub async fn fetch_upstream(
                 cache_control,
                 Some(all_upstream_headers),
                 es_client.clone(),
+                s3_client.clone(),
+                disk_cache.clone(),
             )
             .await;
         }
@@ -247,7 +251,6 @@ pub async fn fetch_upstream(
             Some(file_size),
             cache_key,
             downloads,
-            data_dir,
             trace,
             content_type,
             etag,
@@ -255,6 +258,8 @@ pub async fn fetch_upstream(
             cache_control,
             Some(all_upstream_headers),
             es_client,
+            s3_client,
+            disk_cache,
         )
         .await;
     }
@@ -267,7 +272,6 @@ pub async fn fetch_upstream(
         None,
         cache_key,
         downloads,
-        data_dir,
         trace,
         content_type,
         etag,
@@ -275,6 +279,8 @@ pub async fn fetch_upstream(
         cache_control,
         Some(all_upstream_headers),
         es_client,
+        s3_client,
+        disk_cache,
     )
     .await
 }
@@ -289,7 +295,6 @@ async fn start_parallel_upstream_download(
     file_size: u64,
     cache_key: Option<&str>,
     downloads: &Arc<DownloadManager>,
-    data_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
     client_range: Option<&str>,
     content_type: Option<String>,
@@ -298,6 +303,8 @@ async fn start_parallel_upstream_download(
     cache_control: Option<String>,
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
     es_client: Option<Arc<EsClient>>,
+    s3_client: Option<Arc<S3Client>>,
+    disk_cache: Option<Arc<DiskCache>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let plan = compute_chunk_plan(file_size, config.http_concurrency, config.chunk_size);
 
@@ -377,16 +384,17 @@ async fn start_parallel_upstream_download(
     let ck = cache_key.map(str::to_owned);
     let dm = downloads.clone();
     let http_concurrency = config.http_concurrency;
-    let data_dir_clone = data_dir.to_path_buf();
     let data_prefix_clone = config.data_prefix.clone();
     let caching = cache_key.is_some();
+    let s3c = s3_client.clone();
+    let dc = disk_cache.clone();
 
     // Spawn the adaptive download workers
     tokio::spawn(async move {
         let result = run_adaptive_upstream(
             &temp_dir, &url, &client, &hdrs, initial_response,
             &dl, &trace_clone, http_concurrency,
-            &data_dir_clone, &data_prefix_clone, caching,
+            &data_prefix_clone, caching, s3c.as_ref(), dc.as_ref(),
         )
         .await;
 
@@ -444,22 +452,27 @@ async fn run_adaptive_upstream(
     download: &Arc<InFlightDownload>,
     trace: &Option<Arc<TraceWriter>>,
     max_concurrency: usize,
-    data_dir: &std::path::Path,
     data_prefix: &str,
     caching: bool,
+    s3_client: Option<&Arc<S3Client>>,
+    disk_cache: Option<&Arc<DiskCache>>,
 ) -> Result<(), ProxyError> {
-    // Pre-create temp files and open S3 destination files for all chunks.
+    // Pre-create temp files for all chunks.
+    // When caching is enabled and we have a disk cache, also set up background
+    // S3 upload + local cache finalization (replacing the old shadow writer).
     for idx in 0..download.chunk_count() {
         let file = create_temp_chunk_file(temp_dir)
             .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
         download.chunk(idx).set_file(Arc::new(file));
 
         if caching {
-            let id = download.chunk_id(idx);
-            let rel_path = id_to_chunk_path(id, data_prefix);
-            let full_path = data_dir.join(&rel_path);
             download.chunk(idx).increment_readers();
-            spawn_s3_shadow_writer(&download, idx, full_path);
+            let dl = download.clone();
+            let chunk_idx = idx;
+            let s3c = s3_client.cloned();
+            let dc = disk_cache.cloned();
+            let prefix = data_prefix.to_string();
+            spawn_post_chunk_upload(dl, chunk_idx, s3c, dc, prefix);
         }
     }
 
@@ -719,107 +732,108 @@ fn active_sequential_chunk(download: &InFlightDownload) -> usize {
     download.chunk_count().saturating_sub(1)
 }
 
-/// Background task that shadow-copies a chunk from the local temp file to the
-/// mountpoint-s3 file.  Follows `bytes_written` progress (just like the client
-/// reader in handler.rs) so it never blocks the main stream loop.
+/// Background task that waits for a chunk to be fully written, then:
+/// 1. Copies the temp file to the local disk cache (fsync + rename).
+/// 2. Uploads the chunk to S3 via object_store::put().
 ///
-/// All S3/filesystem I/O runs inside `spawn_blocking` so it cannot stall the
-/// tokio runtime — mountpoint-s3 writes and sync_all trigger real S3 PutObject
-/// calls that can take tens of milliseconds.
-///
-/// The S3 file is opened lazily inside the blocking task so that mountpoint-s3
-/// `create_dir_all` + `open` (which trigger real S3 API calls) never block the
-/// tokio runtime.
-fn spawn_s3_shadow_writer(
-    download: &Arc<InFlightDownload>,
+/// Replaces the old mountpoint-s3 shadow writer.
+fn spawn_post_chunk_upload(
+    download: Arc<InFlightDownload>,
     idx: usize,
-    s3_chunk_path: std::path::PathBuf,
+    s3_client: Option<Arc<S3Client>>,
+    disk_cache: Option<Arc<DiskCache>>,
+    data_prefix: String,
 ) {
-    let temp_file = match download.chunk(idx).get_file() {
-        Some(f) => f,
-        None => return,
-    };
-    let dl = download.clone();
     let expected = download.expected_chunk_len(idx);
+    let chunk_id = *download.chunk_id(idx);
 
-    tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        use std::os::unix::fs::FileExt;
+    tokio::spawn(async move {
+        // Wait for the chunk to be fully written
+        if let Err(_) = download.wait_for_bytes(idx, expected).await {
+            download.wake_waiters();
+            return;
+        }
 
-        let shadow_t0 = std::time::Instant::now();
-
-        let mut s3_file = match std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&s3_chunk_path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                warn!(chunk = idx, "S3 file open failed: {e}");
-                dl.wake_waiters();
+        let temp_file = match download.chunk(idx).get_file() {
+            Some(f) => f,
+            None => {
+                download.chunk(idx).s3_committed.store(true, Ordering::Release);
+                download.wake_waiters();
                 return;
             }
         };
-        let open_ms = shadow_t0.elapsed().as_secs_f64() * 1000.0;
 
-        let mut offset: u64 = 0;
-        let mut buf = vec![0u8; 256 * 1024];
+        // 1. Finalize to local disk cache
+        if let Some(ref dc) = disk_cache {
+            if !dc.is_degraded() {
+                let dc2 = dc.clone();
+                let tf = temp_file.clone();
+                let cid = chunk_id;
+                let finalize_result = tokio::task::spawn_blocking(move || {
+                    use std::io::Write;
+                    use std::os::unix::fs::FileExt;
 
-        loop {
-            let written = dl.chunk(idx).bytes_written();
-            if written <= offset {
-                if dl.has_failed() || dl.is_cancelled() {
-                    break;
-                }
-                if dl.is_stream_complete() && written <= offset {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
+                    let (mut cache_file, temp_path) = match dc2.temp_file() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(chunk = idx, "cache finalize temp_file failed: {e}");
+                            return;
+                        }
+                    };
 
-            let available = written - offset;
-            let to_read = std::cmp::min(available as usize, buf.len());
-            match temp_file.read_exact_at(&mut buf[..to_read], offset) {
-                Ok(()) => {
-                    if let Err(e) = s3_file.write_all(&buf[..to_read]) {
-                        warn!(chunk = idx, "S3 shadow write failed: {e}");
-                        break;
+                    let mut offset = 0u64;
+                    let mut buf = vec![0u8; 256 * 1024];
+                    let len = expected;
+                    while offset < len {
+                        let to_read = std::cmp::min((len - offset) as usize, buf.len());
+                        if let Err(e) = tf.read_exact_at(&mut buf[..to_read], offset) {
+                            warn!(chunk = idx, "cache finalize read failed: {e}");
+                            return;
+                        }
+                        if let Err(e) = cache_file.write_all(&buf[..to_read]) {
+                            warn!(chunk = idx, "cache finalize write failed: {e}");
+                            return;
+                        }
+                        offset += to_read as u64;
                     }
-                    offset += to_read as u64;
-                }
-                Err(e) => {
-                    warn!(chunk = idx, "S3 shadow pread failed: {e}");
-                    break;
+                    drop(cache_file);
+
+                    if let Err(e) = dc2.finalize(&temp_path, &cid) {
+                        warn!(chunk = idx, "cache finalize rename failed: {e}");
+                    }
+                }).await;
+
+                if let Err(e) = finalize_result {
+                    warn!(chunk = idx, "cache finalize task panicked: {e}");
                 }
             }
+        }
 
-            if offset >= expected {
-                break;
+        // 2. Upload to S3
+        if let Some(ref s3) = s3_client {
+            let tf = temp_file.clone();
+            let len = expected as usize;
+            let read_result = tokio::task::spawn_blocking(move || {
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0u8; len];
+                tf.read_exact_at(&mut buf, 0)?;
+                Ok::<Bytes, std::io::Error>(Bytes::from(buf))
+            }).await;
+
+            match read_result {
+                Ok(Ok(data)) => {
+                    if let Err(e) = s3.put_chunk(&chunk_id, &data_prefix, data).await {
+                        warn!(chunk = idx, "S3 put_chunk failed: {e}");
+                    }
+                }
+                Ok(Err(e)) => warn!(chunk = idx, "S3 upload read failed: {e}"),
+                Err(e) => warn!(chunk = idx, "S3 upload task panicked: {e}"),
             }
         }
-        let write_ms = shadow_t0.elapsed().as_secs_f64() * 1000.0;
 
-        let sync_t0 = std::time::Instant::now();
-        if let Err(e) = s3_file.sync_all() {
-            warn!(chunk = idx, "S3 chunk sync_all failed: {e}");
-        }
-        let sync_ms = sync_t0.elapsed().as_secs_f64() * 1000.0;
-
-        drop(s3_file);
-        dl.chunk(idx).s3_committed.store(true, Ordering::Release);
-        dl.wake_waiters();
-
-        debug!(
-            chunk = idx,
-            bytes = offset,
-            open_ms = open_ms as u64,
-            write_ms = write_ms as u64,
-            sync_ms = sync_ms as u64,
-            total_ms = (write_ms + sync_ms) as u64,
-            "S3 shadow writer done"
-        );
+        download.chunk(idx).s3_committed.store(true, Ordering::Release);
+        download.wake_waiters();
+        debug!(chunk = idx, "post-chunk upload done");
     });
 }
 
@@ -935,7 +949,6 @@ async fn start_sequential_download(
     file_size: Option<u64>,
     cache_key: Option<&str>,
     downloads: &Arc<DownloadManager>,
-    data_dir: &std::path::Path,
     _trace: &Option<Arc<TraceWriter>>,
     content_type: Option<String>,
     etag: Option<String>,
@@ -943,6 +956,8 @@ async fn start_sequential_download(
     cache_control: Option<String>,
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
     es_client: Option<Arc<EsClient>>,
+    s3_client: Option<Arc<S3Client>>,
+    disk_cache: Option<Arc<DiskCache>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let is_unknown_size = file_size.is_none();
     let effective_size = file_size
@@ -1026,11 +1041,12 @@ async fn start_sequential_download(
             download.chunk(idx).set_file(Arc::new(chunk_file));
 
             if caching_setup {
-                let id = download.chunk_id(idx);
-                let rel_path = id_to_chunk_path(id, &config.data_prefix);
-                let full_path = data_dir.join(&rel_path);
                 download.chunk(idx).increment_readers();
-                spawn_s3_shadow_writer(&download, idx, full_path);
+                let dl = download.clone();
+                let s3c = s3_client.clone();
+                let dc = disk_cache.clone();
+                let prefix = config.data_prefix.clone();
+                spawn_post_chunk_upload(dl, idx, s3c, dc, prefix);
             }
         }
         if caching_setup {
@@ -1047,9 +1063,10 @@ async fn start_sequential_download(
     let ck = cache_key.map(str::to_owned);
     let dm = downloads.clone();
     let temp_dir = config.temp_dir.clone();
-    let data_dir_clone = data_dir.to_path_buf();
     let data_prefix_clone = config.data_prefix.clone();
     let caching = cache_key.is_some();
+    let s3c = s3_client.clone();
+    let dc = disk_cache.clone();
 
     tokio::spawn(async move {
         let mut stream = response.bytes_stream();
@@ -1076,11 +1093,12 @@ async fn start_sequential_download(
                                 }
                             }
                             if caching {
-                                let id = dl.chunk_id(chunk_idx);
-                                let rel_path = id_to_chunk_path(id, &data_prefix_clone);
-                                let full_path = data_dir_clone.join(&rel_path);
+                                let dl2 = dl.clone();
                                 dl.chunk(chunk_idx).increment_readers();
-                                spawn_s3_shadow_writer(&dl, chunk_idx, full_path);
+                                let s3c2 = s3c.clone();
+                                let dc2 = dc.clone();
+                                let prefix2 = data_prefix_clone.clone();
+                                spawn_post_chunk_upload(dl2, chunk_idx, s3c2, dc2, prefix2);
                             }
                         }
 

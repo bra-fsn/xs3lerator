@@ -110,6 +110,7 @@ impl fmt::Debug for Manifest {
 
 /// Derive the filesystem path for a UUID-identified chunk relative to data_dir.
 /// Layout: `{prefix}{h[0]}/{h[1]}/{h[2]}/{h[3]}/{full_hex}`
+#[allow(dead_code)]
 pub fn id_to_chunk_path(id: &[u8; ID_LEN], prefix: &str) -> PathBuf {
     let hex = hex_encode(id);
     PathBuf::from(format!(
@@ -123,8 +124,28 @@ pub fn id_to_chunk_path(id: &[u8; ID_LEN], prefix: &str) -> PathBuf {
     ))
 }
 
+/// Derive the S3 object key for a UUID-identified chunk.
+/// Same layout as `id_to_chunk_path` but returns a String (no PathBuf).
+pub fn id_to_s3_key(id: &[u8; ID_LEN], prefix: &str) -> String {
+    let hex = hex_encode(id);
+    format!(
+        "{}{}/{}/{}/{}/{}",
+        prefix,
+        &hex[0..1],
+        &hex[1..2],
+        &hex[2..3],
+        &hex[3..4],
+        hex
+    )
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Public hex encoding for chunk IDs (used in logging).
+pub fn hex_encode_id(id: &[u8; ID_LEN]) -> String {
+    hex_encode(id)
 }
 
 #[cfg(test)]

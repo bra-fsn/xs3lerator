@@ -1,5 +1,4 @@
 use std::cmp::min;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_stream::try_stream;
@@ -11,9 +10,10 @@ use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::json;
 use axum::http::header::CONTENT_LENGTH;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
+use crate::disk_cache::DiskCache;
 use crate::download::{InFlightDownload, DownloadManager};
 use crate::error::{ProxyError, ProxyResult};
 use crate::es_client::EsClient;
@@ -21,8 +21,9 @@ use crate::headers::{
     self, parse_upstream_url, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
 };
 use crate::http_pool::HttpClientPool;
-use crate::manifest::{Manifest, id_to_chunk_path};
+use crate::manifest::Manifest;
 use crate::range::{parse_range_header, ByteRange};
+use crate::s3_client::{self, S3Client};
 use crate::trace::{trace_log, TraceWriter};
 use crate::upstream_fetcher;
 
@@ -41,11 +42,12 @@ fn log_access(method: &str, key: &str, response: &Response) {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
-    pub data_dir: PathBuf,
     pub downloads: Arc<DownloadManager>,
     pub trace: Option<Arc<TraceWriter>>,
     pub es_client: Option<Arc<EsClient>>,
     pub http_pool: Arc<HttpClientPool>,
+    pub s3: Option<Arc<S3Client>>,
+    pub disk_cache: Option<Arc<DiskCache>>,
 }
 
 /// Health check endpoint: `GET /healthz`
@@ -270,17 +272,8 @@ pub async fn handle_get(
     }
 }
 
-/// Chunk data pre-read by the parallel prefetch pipeline.
-struct PreparedChunk {
-    data: Bytes,
-    open_ms: u64,
-    first_read_ms: u64,
-    total_read_ms: u64,
-}
-
-/// Serve from cache using a parallel read pipeline: a background task reads
-/// entire chunks from mount-s3 concurrently (each triggering an independent
-/// S3 GetObject stream), then the response streams the pre-read data in order.
+/// Serve from cache: try local disk first, fall back to streaming from S3
+/// with concurrent disk backfill.
 async fn handle_cache_hit(
     state: &AppState,
     cache_key: &str,
@@ -301,8 +294,10 @@ async fn handle_cache_hit(
 
     let chunk_range = manifest.chunks_for_range(serve_start, serve_end);
     let data_prefix = state.config.data_prefix.clone();
-    let data_dir = state.data_dir.clone();
-    let open_parallelism = state.config.open_parallelism;
+
+    let s3 = state.s3.clone();
+    let disk_cache = state.disk_cache.clone();
+    let es_client = state.es_client.clone();
 
     let chunks_meta: Vec<(usize, [u8; 16], u64)> = chunk_range.clone().map(|idx| {
         let id = manifest.chunk_ids[idx];
@@ -315,109 +310,7 @@ async fn handle_cache_hit(
     }).collect();
 
     let num_chunks = chunks_meta.len();
-    debug!(
-        cache_key,
-        num_chunks,
-        object_size,
-        open_parallelism,
-        "cache_hit: starting parallel chunk read"
-    );
-    let pipeline_start = std::time::Instant::now();
-
-    let mut receivers = Vec::with_capacity(num_chunks);
-    let mut senders: Vec<Option<tokio::sync::oneshot::Sender<Result<PreparedChunk, String>>>> =
-        Vec::with_capacity(num_chunks);
-    for _ in 0..num_chunks {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        senders.push(Some(tx));
-        receivers.push(rx);
-    }
-
-    // Parallel chunk reader: reads entire chunks from mount-s3 concurrently.
-    // Each spawn_blocking does sequential 256 KiB reads through the chunk file,
-    // which mount-s3's per-file-handle prefetcher recognises as sequential I/O
-    // and accelerates with a growing read window (1.1 MiB → 2 GiB).
-    // With open_parallelism=8, we get 8 independent S3 GetObject streams.
-    tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(open_parallelism));
-
-        for (slot, (_idx, id, chunk_len)) in chunks_meta.into_iter().enumerate() {
-            let sem_wait_start = std::time::Instant::now();
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => break,
-            };
-            let sem_wait_ms = sem_wait_start.elapsed().as_millis() as u64;
-            if sem_wait_ms > 0 {
-                debug!(slot, sem_wait_ms, "chunk: semaphore wait");
-            }
-            let tx = senders[slot].take().unwrap();
-            let dir = data_dir.clone();
-            let prefix = data_prefix.clone();
-
-            tokio::task::spawn_blocking(move || {
-                let rel_path = id_to_chunk_path(&id, &prefix);
-                let full_path = dir.join(&rel_path);
-
-                let open_start = std::time::Instant::now();
-                match std::fs::File::open(&full_path) {
-                    Ok(f) => {
-                        let open_ms = open_start.elapsed().as_millis() as u64;
-                        use std::os::unix::fs::FileExt;
-                        let len = chunk_len as usize;
-                        let mut buf = vec![0u8; len];
-                        let mut pos = 0usize;
-                        let read_start = std::time::Instant::now();
-                        let mut first_read_ms = 0u64;
-                        while pos < len {
-                            let piece = min(len - pos, 256 * 1024);
-                            if let Err(e) = f.read_exact_at(
-                                &mut buf[pos..pos + piece],
-                                pos as u64,
-                            ) {
-                                let _ = tx.send(Err(format!(
-                                    "chunk file {} read at {pos}: {e}",
-                                    full_path.display()
-                                )));
-                                drop(permit);
-                                return;
-                            }
-                            if pos == 0 {
-                                first_read_ms = read_start.elapsed().as_millis() as u64;
-                            }
-                            pos += piece;
-                        }
-                        let total_read_ms = read_start.elapsed().as_millis() as u64;
-                        let throughput_mbps = if total_read_ms > 0 {
-                            (len as u64) / 1024 / total_read_ms
-                        } else {
-                            0
-                        };
-                        debug!(
-                            slot,
-                            open_ms,
-                            first_read_ms,
-                            total_read_ms,
-                            throughput_mbps,
-                            chunk_len,
-                            "chunk: read complete"
-                        );
-                        let _ = tx.send(Ok(PreparedChunk {
-                            data: Bytes::from(buf),
-                            open_ms,
-                            first_read_ms,
-                            total_read_ms,
-                        }));
-                    }
-                    Err(e) => {
-                        warn!(path = %full_path.display(), error = %e, "prefetch open failed");
-                        let _ = tx.send(Err(format!("chunk file {}: {e}", full_path.display())));
-                    }
-                };
-                drop(permit);
-            });
-        }
-    });
+    debug!(cache_key, num_chunks, object_size, "cache_hit: serving");
 
     let first_chunk_start = chunk_range.start as u64 * manifest.chunk_size;
     let offset_in_first_chunk = serve_start - first_chunk_start;
@@ -454,12 +347,19 @@ async fn handle_cache_hit(
     );
     resp_headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
 
-    let stream = make_prefetch_stream(
-        receivers,
+    let all_chunk_ids: Vec<[u8; 16]> = manifest.chunk_ids.clone();
+    let cache_key_owned = cache_key.to_string();
+
+    let stream = make_cache_hit_stream(
+        chunks_meta,
         offset_in_first_chunk,
         serve_len,
-        pipeline_start,
-        cache_key.to_string(),
+        s3,
+        disk_cache,
+        es_client,
+        data_prefix,
+        cache_key_owned,
+        all_chunk_ids,
     );
     let body = Body::from_stream(stream);
     let mut response = Response::builder()
@@ -471,48 +371,29 @@ async fn handle_cache_hit(
     Ok(response)
 }
 
-/// Stream pre-read chunk data received through ordered oneshot channels.
-fn make_prefetch_stream(
-    receivers: Vec<tokio::sync::oneshot::Receiver<Result<PreparedChunk, String>>>,
+/// Stream cache-hit data: local disk when available, S3 streaming backfill otherwise.
+/// On S3 miss, triggers cleanup and returns an error (caller falls through to upstream).
+fn make_cache_hit_stream(
+    chunks_meta: Vec<(usize, [u8; 16], u64)>,
     offset_in_first_chunk: u64,
     read_len: u64,
-    pipeline_start: std::time::Instant,
+    s3: Option<Arc<S3Client>>,
+    disk_cache: Option<Arc<DiskCache>>,
+    es_client: Option<Arc<EsClient>>,
+    data_prefix: String,
     cache_key: String,
+    all_chunk_ids: Vec<[u8; 16]>,
 ) -> impl futures::Stream<Item = Result<Bytes, ProxyError>> {
     try_stream! {
         if read_len == 0 {
             return;
         }
 
-        let num_chunks = receivers.len();
+        let pipeline_start = std::time::Instant::now();
         let mut remaining = read_len;
         let mut first = true;
-        let mut total_stall_ms: u64 = 0;
-        let mut max_stall_ms: u64 = 0;
-        let mut max_stall_slot: usize = 0;
 
-        for (stream_idx, rx) in receivers.into_iter().enumerate() {
-            let wait_start = std::time::Instant::now();
-            let chunk = rx.await
-                .map_err(|_| ProxyError::Internal("prefetch task dropped".into()))?
-                .map_err(|e| ProxyError::NotFound(e))?;
-            let stall_ms = wait_start.elapsed().as_millis() as u64;
-            total_stall_ms += stall_ms;
-            if stall_ms > max_stall_ms {
-                max_stall_ms = stall_ms;
-                max_stall_slot = stream_idx;
-            }
-            if stall_ms > 5 {
-                debug!(
-                    stream_idx,
-                    stall_ms,
-                    chunk_open_ms = chunk.open_ms,
-                    chunk_first_read_ms = chunk.first_read_ms,
-                    chunk_total_read_ms = chunk.total_read_ms,
-                    pipeline_elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
-                    "stream: waited for chunk"
-                );
-            }
+        for (_idx, id, chunk_len) in &chunks_meta {
             let start_offset = if first {
                 first = false;
                 offset_in_first_chunk as usize
@@ -520,17 +401,149 @@ fn make_prefetch_stream(
                 0
             };
 
-            let chunk_data_len = chunk.data.len();
-            let readable = chunk_data_len - start_offset;
-            let to_yield = min(readable as u64, remaining) as usize;
-            let mut pos = start_offset;
-            let end = start_offset + to_yield;
+            let chunk_len = *chunk_len as usize;
 
-            while pos < end {
-                let piece = min(end - pos, 256 * 1024);
-                yield chunk.data.slice(pos..pos + piece);
-                remaining -= piece as u64;
-                pos += piece;
+            // Try local disk first
+            let local_path = disk_cache.as_ref().and_then(|dc| dc.lookup(id));
+
+            if let Some(path) = local_path {
+                // Local disk hit: read in 256 KiB pieces via spawn_blocking
+                let mut pos = start_offset;
+                let end = chunk_len.min(start_offset + remaining as usize);
+                while pos < end {
+                    let piece = min(end - pos, 256 * 1024);
+                    let p = path.clone();
+                    let offset = pos as u64;
+                    let len = piece;
+                    let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
+                        use std::os::unix::fs::FileExt;
+                        let f = std::fs::File::open(&p)?;
+                        let mut buf = vec![0u8; len];
+                        f.read_exact_at(&mut buf, offset)?;
+                        Ok(Bytes::from(buf))
+                    })
+                    .await
+                    .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?
+                    .map_err(|e| ProxyError::Internal(format!("local read: {e}")))?;
+
+                    remaining -= data.len() as u64;
+                    pos += data.len();
+                    yield data;
+                }
+            } else {
+                // Local miss: stream from S3 with tee to disk cache
+                let s3_ref = match s3.as_ref() {
+                    Some(s) => s,
+                    None => {
+                        Err(ProxyError::NotFound(format!(
+                            "chunk not in local cache and no S3 client configured"
+                        )))?;
+                        return;
+                    }
+                };
+                let s3_stream = match s3_ref.get_chunk_stream(id, &data_prefix).await {
+                    Ok(stream) => stream,
+                    Err(ProxyError::NotFound(msg)) => {
+                        error!(
+                            cache_key = cache_key.as_str(),
+                            chunk_id = crate::manifest::hex_encode_id(id),
+                            "S3 chunk missing during cache hit: {msg}"
+                        );
+                        // Cleanup in background
+                        let es = es_client.clone();
+                        let s3c = s3.clone();
+                        let ck = cache_key.clone();
+                        let ids = all_chunk_ids.clone();
+                        let prefix = data_prefix.clone();
+                        tokio::spawn(async move {
+                            if let (Some(es), Some(s3c)) = (es, s3c) {
+                                s3_client::cleanup_corrupt_manifest(
+                                    &es, &s3c, &ck, &ids, &prefix,
+                                ).await;
+                            }
+                        });
+                        Err(ProxyError::NotFound(msg))?;
+                        return;
+                    }
+                    Err(e) => {
+                        Err(e)?;
+                        return;
+                    }
+                };
+
+                // Set up disk backfill writer
+                let backfill = disk_cache.as_ref().and_then(|dc| {
+                    if dc.is_degraded() {
+                        return None;
+                    }
+                    match dc.temp_file() {
+                        Ok((file, path)) => Some((file, path, dc.clone(), *id)),
+                        Err(e) => {
+                            warn!("cache backfill temp file failed: {e}");
+                            None
+                        }
+                    }
+                });
+
+                let (backfill_tx, backfill_handle) = if let Some((file, temp_path, dc, chunk_id)) = backfill {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+                    let handle = tokio::task::spawn_blocking(move || {
+                        use std::io::Write;
+                        let mut writer = std::io::BufWriter::new(file);
+                        while let Some(chunk) = rx.blocking_recv() {
+                            if let Err(e) = writer.write_all(&chunk) {
+                                warn!("backfill write failed: {e}");
+                                return;
+                            }
+                        }
+                        drop(writer);
+                        if let Err(e) = dc.finalize(&temp_path, &chunk_id) {
+                            warn!("backfill finalize failed: {e}");
+                        }
+                    });
+                    (Some(tx), Some(handle))
+                } else {
+                    (None, None)
+                };
+
+                // Tee: stream S3 bytes to client + backfill writer
+                let mut s3_stream = s3_stream;
+                let mut s3_offset = 0usize;
+                while let Some(piece_result) = s3_stream.next().await {
+                    let piece = piece_result?;
+                    let piece_len = piece.len();
+
+                    // Send to backfill writer (non-blocking, drop if full)
+                    if let Some(ref tx) = backfill_tx {
+                        let _ = tx.try_send(piece.clone());
+                    }
+
+                    // Yield the client's slice
+                    let piece_start = if s3_offset < start_offset {
+                        let skip = start_offset - s3_offset;
+                        if skip >= piece_len {
+                            s3_offset += piece_len;
+                            continue;
+                        }
+                        skip
+                    } else {
+                        0
+                    };
+
+                    let available = piece_len - piece_start;
+                    let to_yield = min(available as u64, remaining) as usize;
+                    if to_yield > 0 {
+                        yield piece.slice(piece_start..piece_start + to_yield);
+                        remaining -= to_yield as u64;
+                    }
+                    s3_offset += piece_len;
+                }
+
+                // Signal backfill writer to finish
+                drop(backfill_tx);
+                if let Some(handle) = backfill_handle {
+                    let _ = handle.await;
+                }
             }
 
             if remaining == 0 {
@@ -540,21 +553,12 @@ fn make_prefetch_stream(
 
         let total_ms = pipeline_start.elapsed().as_millis() as u64;
         let served_bytes = read_len - remaining;
-        let throughput_mbps = if total_ms > 0 {
-            served_bytes / 1024 / total_ms
-        } else {
-            0
-        };
         debug!(
             cache_key = cache_key.as_str(),
-            num_chunks,
+            num_chunks = chunks_meta.len(),
             total_ms,
-            total_stall_ms,
-            max_stall_ms,
-            max_stall_slot,
             served_bytes,
-            throughput_mbps,
-            "stream: transfer complete"
+            "cache_hit: transfer complete"
         );
     }
 }
@@ -629,10 +633,11 @@ async fn handle_upstream_path(
         cache_key,
         client_range,
         &state.downloads,
-        &state.data_dir,
         &state.trace,
         state.es_client.clone(),
         &state.http_pool,
+        state.s3.clone(),
+        state.disk_cache.clone(),
     )
     .await?;
     let fetch_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -748,8 +753,6 @@ async fn handle_upstream_path(
         resp_headers,
         false,
         download_start,
-        Some(state.data_dir.clone()),
-        Some(state.config.data_prefix.clone()),
     )
 }
 
@@ -801,8 +804,6 @@ fn build_streaming_response(
     mut extra_headers: HeaderMap,
     cancel_on_drop: bool,
     download_start: u64,
-    data_dir: Option<PathBuf>,
-    data_prefix: Option<String>,
 ) -> ProxyResult<Response> {
     let (serve_start, serve_end, status) = match client_range {
         Some(ref r) => (r.start, r.end_inclusive, StatusCode::PARTIAL_CONTENT),
@@ -827,7 +828,7 @@ fn build_streaming_response(
     );
     extra_headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
 
-    let stream = make_download_stream(download, download_start, serve_len, cancel_on_drop, data_dir, data_prefix);
+    let stream = make_download_stream(download, download_start, serve_len, cancel_on_drop);
     let body = Body::from_stream(stream);
     let mut response = Response::builder()
         .status(status)
@@ -899,8 +900,6 @@ fn make_download_stream(
     download_start: u64,
     read_len: u64,
     cancel_on_drop: bool,
-    data_dir: Option<PathBuf>,
-    data_prefix: Option<String>,
 ) -> impl futures::Stream<Item = Result<Bytes, ProxyError>> {
     try_stream! {
         let _cancel_guard = if cancel_on_drop {
@@ -946,70 +945,25 @@ fn make_download_stream(
             let remaining = read_end - pos + 1;
             let to_read = min(chunk_remaining, remaining).min(256 * 1024);
 
-            // Multi-tier serve: try temp file first, then S3 fallback
-            if let Some(file) = download.chunk(chunk_idx).get_file() {
-                // Temp file available — wait for bytes and pread
-                download.wait_for_bytes(chunk_idx, chunk_offset + to_read).await?;
+            // Wait for bytes, then read from temp file
+            download.wait_for_bytes(chunk_idx, chunk_offset + to_read).await?;
 
-                let buf_len = to_read as usize;
-                let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
-                    use std::os::unix::fs::FileExt;
-                    let mut buf = vec![0u8; buf_len];
-                    file.read_exact_at(&mut buf, chunk_offset)?;
-                    Ok(Bytes::from(buf))
-                })
-                .await
-                .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?
-                .map_err(|e| ProxyError::Internal(format!("pread: {e}")))?;
+            let file = download.chunk(chunk_idx).get_file()
+                .ok_or_else(|| ProxyError::Internal("chunk released before read".into()))?;
 
-                pos += data.len() as u64;
-                yield data;
-            } else if download.chunk(chunk_idx).s3_committed.load(std::sync::atomic::Ordering::Acquire) {
-                // Temp released but S3 committed — read from mountpoint-s3
-                let id = *download.chunk_id(chunk_idx);
-                let dir = data_dir.clone().ok_or_else(|| {
-                    ProxyError::Internal("no data_dir for S3 fallback".into())
-                })?;
-                let prefix = data_prefix.clone().unwrap_or_default();
-                let offset = chunk_offset;
-                let buf_len = to_read as usize;
+            let buf_len = to_read as usize;
+            let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0u8; buf_len];
+                file.read_exact_at(&mut buf, chunk_offset)?;
+                Ok(Bytes::from(buf))
+            })
+            .await
+            .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?
+            .map_err(|e| ProxyError::Internal(format!("pread: {e}")))?;
 
-                let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
-                    use std::os::unix::fs::FileExt;
-                    let rel_path = id_to_chunk_path(&id, &prefix);
-                    let full_path = dir.join(&rel_path);
-                    let f = std::fs::File::open(&full_path)?;
-                    let mut buf = vec![0u8; buf_len];
-                    f.read_exact_at(&mut buf, offset)?;
-                    Ok(Bytes::from(buf))
-                })
-                .await
-                .map_err(|e| ProxyError::Internal(format!("s3 read task: {e}")))?
-                .map_err(|e| ProxyError::Internal(format!("s3 pread: {e}")))?;
-
-                pos += data.len() as u64;
-                yield data;
-            } else {
-                // Chunk not yet downloaded — wait for bytes, then read from temp
-                download.wait_for_bytes(chunk_idx, chunk_offset + to_read).await?;
-
-                let file = download.chunk(chunk_idx).get_file()
-                    .ok_or_else(|| ProxyError::Internal("chunk released before read".into()))?;
-
-                let buf_len = to_read as usize;
-                let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
-                    use std::os::unix::fs::FileExt;
-                    let mut buf = vec![0u8; buf_len];
-                    file.read_exact_at(&mut buf, chunk_offset)?;
-                    Ok(Bytes::from(buf))
-                })
-                .await
-                .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?
-                .map_err(|e| ProxyError::Internal(format!("pread: {e}")))?;
-
-                pos += data.len() as u64;
-                yield data;
-            }
+            pos += data.len() as u64;
+            yield data;
         }
 
         if let Some(last) = prev_chunk {

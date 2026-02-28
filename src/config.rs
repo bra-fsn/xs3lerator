@@ -7,18 +7,19 @@ use clap::Parser;
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_HTTP_CONCURRENCY: usize = 8;
 const DEFAULT_CHUNK_SIZE: &str = "32MiB";
-const DEFAULT_OPEN_PARALLELISM: usize = 8;
+const DEFAULT_CACHE_LOW_WATERMARK: u8 = 85;
+const DEFAULT_CACHE_HIGH_WATERMARK: u8 = 95;
 
 /// High-performance HTTP download accelerator and caching proxy with
-/// content-addressed S3 storage and parallel chunked downloads.
+/// content-addressed S3 storage and local disk cache.
 ///
 /// The URL path encodes the upstream URL to fetch.  An optional
 /// `X-Xs3lerator-Cache-Key` header enables the caching layer
-/// (Elasticsearch manifest + content-addressed data directory).
+/// (Elasticsearch manifest + content-addressed S3 chunks + local disk cache).
 /// Without it, xs3lerator acts as a pure download accelerator.
 ///
 /// In `--passthrough` mode, the caching layer is fully disabled:
-/// no Elasticsearch connection, no data directory required.
+/// no Elasticsearch connection, no S3, no cache directory.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "xs3lerator", version, about, long_about = None)]
 pub struct CliArgs {
@@ -30,10 +31,29 @@ pub struct CliArgs {
     #[arg(long, env = "XS3_PORT", default_value_t = DEFAULT_PORT)]
     pub port: u16,
 
-    /// Root directory for content-addressed chunk storage (typically a mount-s3
-    /// mountpoint, e.g. /data).  Not required in passthrough mode.
-    #[arg(long, env = "XS3_DATA_DIR")]
-    pub data_dir: Option<PathBuf>,
+    /// S3 bucket for content-addressed chunk storage.
+    #[arg(long, env = "XS3_S3_BUCKET")]
+    pub s3_bucket: Option<String>,
+
+    /// AWS region for the S3 bucket.
+    #[arg(long, env = "XS3_S3_REGION", default_value = "us-east-1")]
+    pub s3_region: String,
+
+    /// Custom S3 endpoint (for LocalStack / MinIO).
+    #[arg(long, env = "XS3_S3_ENDPOINT")]
+    pub s3_endpoint: Option<String>,
+
+    /// Local directory for caching chunks. Not required in passthrough mode.
+    #[arg(long, env = "XS3_CACHE_DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Disk usage percentage (0-100) at which LRU eviction starts.
+    #[arg(long, env = "XS3_CACHE_LOW_WATERMARK", default_value_t = DEFAULT_CACHE_LOW_WATERMARK)]
+    pub cache_low_watermark: u8,
+
+    /// Disk usage percentage (0-100) at which random eviction kicks in.
+    #[arg(long, env = "XS3_CACHE_HIGH_WATERMARK", default_value_t = DEFAULT_CACHE_HIGH_WATERMARK)]
+    pub cache_high_watermark: u8,
 
     /// Maximum parallel connections per upstream HTTP download.
     #[arg(long, env = "XS3_HTTP_CONCURRENCY", default_value_t = DEFAULT_HTTP_CONCURRENCY)]
@@ -48,8 +68,8 @@ pub struct CliArgs {
     )]
     pub chunk_size: u64,
 
-    /// Directory for temporary chunk files.  Defaults to the system temp dir.
-    /// Set to /dev/shm for pure-RAM buffering on EBS-constrained environments.
+    /// Directory for temporary chunk files during upstream downloads.
+    /// Defaults to the system temp dir.
     #[arg(long, env = "XS3_TEMP_DIR")]
     pub temp_dir: Option<PathBuf>,
 
@@ -63,7 +83,7 @@ pub struct CliArgs {
     #[arg(long, env = "XS3_DEBUG_TRACE")]
     pub debug_trace: Option<String>,
 
-    /// Subdirectory under data-dir for content-addressed data chunks.
+    /// S3 key prefix for content-addressed data chunks.
     #[arg(long, env = "XS3_DATA_PREFIX", default_value = "data/")]
     pub data_prefix: String,
 
@@ -76,23 +96,22 @@ pub struct CliArgs {
     pub elasticsearch_manifest_index: String,
 
     /// Passthrough-only mode: disable all caching infrastructure.
-    /// No Elasticsearch, no data directory, no S3 writes.
+    /// No Elasticsearch, no S3, no cache directory.
     /// xs3lerator acts as a pure parallel download accelerator.
     #[arg(long, env = "XS3_PASSTHROUGH", default_value_t = false)]
     pub passthrough: bool,
-
-    /// Maximum concurrent open() + preread calls in the prefetch pipeline.
-    /// On FUSE/mount-s3, each open()+read(1 byte) triggers an S3 GetObject,
-    /// so parallelism here directly reduces cold-cache latency.
-    #[arg(long, env = "XS3_OPEN_PARALLELISM", default_value_t = DEFAULT_OPEN_PARALLELISM)]
-    pub open_parallelism: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind_ip: IpAddr,
     pub port: u16,
-    pub data_dir: PathBuf,
+    pub s3_bucket: Option<String>,
+    pub s3_region: String,
+    pub s3_endpoint: Option<String>,
+    pub cache_dir: Option<PathBuf>,
+    pub cache_low_watermark: u8,
+    pub cache_high_watermark: u8,
     pub http_concurrency: usize,
     pub chunk_size: u64,
     pub temp_dir: PathBuf,
@@ -101,7 +120,6 @@ pub struct AppConfig {
     pub elasticsearch_url: Option<String>,
     pub elasticsearch_manifest_index: String,
     pub passthrough: bool,
-    pub open_parallelism: usize,
 }
 
 impl TryFrom<CliArgs> for AppConfig {
@@ -110,6 +128,14 @@ impl TryFrom<CliArgs> for AppConfig {
     fn try_from(args: CliArgs) -> Result<Self, Self::Error> {
         anyhow::ensure!(args.http_concurrency >= 1, "http-concurrency must be >= 1");
         anyhow::ensure!(args.chunk_size >= 1024, "chunk-size must be >= 1 KiB");
+        anyhow::ensure!(
+            args.cache_low_watermark < args.cache_high_watermark,
+            "cache-low-watermark must be < cache-high-watermark"
+        );
+        anyhow::ensure!(
+            args.cache_high_watermark <= 100,
+            "cache-high-watermark must be <= 100"
+        );
 
         if args.passthrough {
             anyhow::ensure!(
@@ -118,19 +144,15 @@ impl TryFrom<CliArgs> for AppConfig {
             );
         }
 
-        let data_dir = if args.passthrough {
-            args.data_dir.unwrap_or_else(std::env::temp_dir)
-        } else {
-            let dir = args
-                .data_dir
-                .ok_or_else(|| anyhow::anyhow!("--data-dir is required (unless --passthrough)"))?;
-            anyhow::ensure!(
-                dir.is_dir(),
-                "data-dir {:?} is not an existing directory",
-                dir
-            );
-            dir
-        };
+        if !args.passthrough {
+            if let Some(ref dir) = args.cache_dir {
+                anyhow::ensure!(
+                    dir.is_dir(),
+                    "cache-dir {:?} is not an existing directory",
+                    dir
+                );
+            }
+        }
 
         let temp_dir = args.temp_dir.unwrap_or_else(std::env::temp_dir);
         anyhow::ensure!(
@@ -142,7 +164,12 @@ impl TryFrom<CliArgs> for AppConfig {
         Ok(Self {
             bind_ip: args.bind_ip.unwrap_or_else(|| IpAddr::from([0, 0, 0, 0])),
             port: args.port,
-            data_dir,
+            s3_bucket: args.s3_bucket,
+            s3_region: args.s3_region,
+            s3_endpoint: args.s3_endpoint,
+            cache_dir: args.cache_dir,
+            cache_low_watermark: args.cache_low_watermark,
+            cache_high_watermark: args.cache_high_watermark,
             http_concurrency: args.http_concurrency,
             chunk_size: args.chunk_size,
             temp_dir,
@@ -151,7 +178,6 @@ impl TryFrom<CliArgs> for AppConfig {
             elasticsearch_url: args.elasticsearch_url,
             elasticsearch_manifest_index: args.elasticsearch_manifest_index,
             passthrough: args.passthrough,
-            open_parallelism: args.open_parallelism,
         })
     }
 }
@@ -175,20 +201,20 @@ mod tests {
 
     #[test]
     fn defaults_produce_valid_config() {
-        let dir = std::env::temp_dir();
-        let args = CliArgs::parse_from(["xs3lerator", "--data-dir", dir.to_str().unwrap()]);
+        let args = CliArgs::parse_from(["xs3lerator", "--passthrough"]);
         let config = AppConfig::try_from(args).unwrap();
         assert_eq!(config.http_concurrency, 8);
         assert_eq!(config.chunk_size, 33_554_432);
         assert!(!config.upstream_tls_skip_verify);
-        assert!(!config.passthrough);
+        assert!(config.passthrough);
     }
 
     #[test]
-    fn passthrough_mode_no_data_dir() {
+    fn passthrough_mode_no_cache_dir() {
         let args = CliArgs::parse_from(["xs3lerator", "--passthrough"]);
         let config = AppConfig::try_from(args).unwrap();
         assert!(config.passthrough);
+        assert!(config.cache_dir.is_none());
     }
 
     #[test]
@@ -198,6 +224,19 @@ mod tests {
             "--passthrough",
             "--elasticsearch-url",
             "http://localhost:9200",
+        ]);
+        assert!(AppConfig::try_from(args).is_err());
+    }
+
+    #[test]
+    fn watermark_validation() {
+        let args = CliArgs::parse_from([
+            "xs3lerator",
+            "--passthrough",
+            "--cache-low-watermark",
+            "95",
+            "--cache-high-watermark",
+            "85",
         ]);
         assert!(AppConfig::try_from(args).is_err());
     }

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod disk_cache;
 pub mod download;
 pub mod error;
 pub mod es_client;
@@ -9,6 +10,7 @@ pub mod http_pool;
 pub mod manifest;
 pub mod planner;
 pub mod range;
+pub mod s3_client;
 pub mod server;
 pub mod trace;
 pub mod upstream_fetcher;

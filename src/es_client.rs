@@ -24,6 +24,16 @@ struct ManifestDoc {
     manifest_b64: String,
 }
 
+#[derive(Serialize)]
+struct ClearManifestBody {
+    doc: ClearManifestDoc,
+}
+
+#[derive(Serialize)]
+struct ClearManifestDoc {
+    manifest_b64: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct EsGetResponse {
     #[serde(default)]
@@ -130,6 +140,37 @@ impl EsClient {
         }
 
         debug!(key, "manifest written to ES");
+        Ok(())
+    }
+
+    /// Remove the manifest_b64 field from an ES document, preserving all other
+    /// fields written by passsage.  After this, get_manifest() returns None
+    /// and passsage won't send the X-Xs3lerator-Manifest header, causing the
+    /// next request to trigger a full upstream fetch.
+    pub async fn clear_manifest(&self, key: &str) -> Result<(), ProxyError> {
+        let body = ClearManifestBody {
+            doc: ClearManifestDoc { manifest_b64: None },
+        };
+        let url = format!("{}?retry_on_conflict=3", self.update_url(key));
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal(format!("ES clear_manifest: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProxyError::Internal(format!(
+                "ES clear_manifest {status}: {body}"
+            )));
+        }
+
+        debug!(key, "manifest_b64 cleared from ES");
         Ok(())
     }
 }
