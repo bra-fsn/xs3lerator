@@ -41,52 +41,10 @@ impl DiskCache {
         self.degraded.store(v, Ordering::Relaxed);
     }
 
-    /// Pre-create the 65536 two-level hex directories and the .tmp staging dir.
+    /// Create the .tmp staging dir. Leaf directories are created on-demand by `finalize`.
     pub fn preseed_dirs(&self) -> io::Result<usize> {
         fs::create_dir_all(self.cache_dir.join(TMP_SUBDIR))?;
-
-        let pairs: Vec<(char, char)> = HEX
-            .iter()
-            .flat_map(|&a| HEX.iter().map(move |&b| (a, b)))
-            .collect();
-
-        let created = std::sync::atomic::AtomicUsize::new(0);
-        let error: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
-        let chunk_size = (pairs.len() + 32 - 1) / 32;
-
-        std::thread::scope(|s| {
-            for chunk in pairs.chunks(chunk_size) {
-                let created = &created;
-                let error = &error;
-                let chunk = chunk.to_vec();
-                let base = &self.cache_dir;
-                s.spawn(move || {
-                    for (a, b) in chunk {
-                        if error.lock().unwrap().is_some() {
-                            return;
-                        }
-                        let dir = base.join(format!("{a}{b}"));
-                        if dir.exists() {
-                            continue;
-                        }
-                        match fs::create_dir_all(&dir) {
-                            Ok(()) => {
-                                created.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            Err(e) => {
-                                *error.lock().unwrap() = Some(e);
-                                return;
-                            }
-                        }
-                    }
-                });
-            }
-        });
-
-        if let Some(e) = error.into_inner().unwrap() {
-            return Err(e);
-        }
-        Ok(created.load(std::sync::atomic::Ordering::Relaxed))
+        Ok(0)
     }
 
     /// Return the cache path for a chunk id, if the file exists on disk.
@@ -99,12 +57,16 @@ impl DiskCache {
         }
     }
 
-    /// Build the local cache path for a chunk: `cache_dir/XXYY/<full_hex>`
-    /// where XX = first hex byte of UUID. Two-level dirs give 256 buckets.
+    /// Build the local cache path for a chunk: `cache_dir/h[0]/h[1]/h[2]/h[3]/<full_hex>`
+    /// Mirrors the S3 key layout `data/a/8/6/8/a868…`.
     fn chunk_path(&self, chunk_id: &[u8; ID_LEN]) -> PathBuf {
         let hex: String = chunk_id.iter().map(|b| format!("{b:02x}")).collect();
-        let bucket = &hex[0..2];
-        self.cache_dir.join(bucket).join(&hex)
+        self.cache_dir
+            .join(&hex[0..1])
+            .join(&hex[1..2])
+            .join(&hex[2..3])
+            .join(&hex[3..4])
+            .join(&hex)
     }
 
     /// Create a new temp file under `cache_dir/.tmp/`.
@@ -202,11 +164,26 @@ fn gc_loop(cache: &DiskCache, low_watermark: u8, high_watermark: u8) {
     }
 }
 
+/// Iterate all leaf directories in the 4-level hex tree: `cache_dir/a/b/c/d/`.
+fn leaf_dirs(base: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    HEX.iter().flat_map(move |&a| {
+        HEX.iter().flat_map(move |&b| {
+            HEX.iter().flat_map(move |&c| {
+                HEX.iter().map(move |&d| {
+                    base.join(format!("{a}"))
+                        .join(format!("{b}"))
+                        .join(format!("{c}"))
+                        .join(format!("{d}"))
+                })
+            })
+        })
+    })
+}
+
 /// Random eviction: quickly delete files until usage drops below low_watermark.
 fn random_evict(cache: &DiskCache, target_pct: u8) {
     let mut deleted = 0u64;
-    for entry in HEX.iter().flat_map(|&a| HEX.iter().map(move |&b| format!("{a}{b}"))) {
-        let dir = cache.cache_dir().join(&entry);
+    for dir in leaf_dirs(cache.cache_dir()) {
         let Ok(rd) = fs::read_dir(&dir) else { continue };
         for file_entry in rd.flatten() {
             let path = file_entry.path();
@@ -238,8 +215,7 @@ fn lru_evict(cache: &DiskCache, target_pct: u8) {
     const BATCH_SIZE: usize = 4096;
     let mut files: Vec<(u64, PathBuf)> = Vec::with_capacity(BATCH_SIZE);
 
-    for entry in HEX.iter().flat_map(|&a| HEX.iter().map(move |&b| format!("{a}{b}"))) {
-        let dir = cache.cache_dir().join(&entry);
+    for dir in leaf_dirs(cache.cache_dir()) {
         let Ok(rd) = fs::read_dir(&dir) else { continue };
         for file_entry in rd.flatten() {
             let path = file_entry.path();
@@ -298,15 +274,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preseed_creates_directories() {
+    fn preseed_creates_tmp_dir() {
         let tmp = std::env::temp_dir().join(format!("xs3-test-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
         let cache = DiskCache::new(tmp.clone());
-        let created = cache.preseed_dirs().unwrap();
-        assert!(created > 0);
+        cache.preseed_dirs().unwrap();
         assert!(tmp.join(TMP_SUBDIR).is_dir());
-        assert!(tmp.join("00").is_dir());
-        assert!(tmp.join("ff").is_dir());
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -326,6 +299,8 @@ mod tests {
         let final_path = cache.finalize(&temp_path, &id).unwrap();
         assert!(final_path.exists());
         assert!(!temp_path.exists());
+        // 0xab repeated → hex "abab…"; path should be a/b/a/b/<full_hex>
+        assert!(final_path.starts_with(tmp.join("a").join("b").join("a").join("b")));
 
         let found = cache.lookup(&id);
         assert!(found.is_some());
