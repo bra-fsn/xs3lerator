@@ -128,18 +128,6 @@ impl ChunkSlot {
         self.s3_file.lock().take()
     }
 
-    /// Write data to the S3 file if present. Returns Ok(true) if written, Ok(false) if no S3 file.
-    pub fn write_to_s3_file(&self, data: &[u8]) -> std::io::Result<bool> {
-        use std::io::Write;
-        let mut guard = self.s3_file.lock();
-        if let Some(ref mut f) = *guard {
-            f.write_all(data)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
     pub fn increment_readers(&self) {
         self.reader_count.fetch_add(1, Ordering::AcqRel);
     }

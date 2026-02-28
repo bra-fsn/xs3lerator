@@ -466,6 +466,7 @@ async fn run_adaptive_upstream(
                 })?;
             download.chunk(idx).set_s3_file(s3_file);
             download.chunk(idx).increment_readers();
+            spawn_s3_shadow_writer(&download, idx);
         }
     }
 
@@ -725,22 +726,76 @@ fn active_sequential_chunk(download: &InFlightDownload) -> usize {
     download.chunk_count().saturating_sub(1)
 }
 
-/// Finalize a chunk's S3 file: sync_all, close, and mark as committed.
+/// Background task that shadow-copies a chunk from the local temp file to the
+/// mountpoint-s3 file.  Follows `bytes_written` progress (just like the client
+/// reader in handler.rs) so it never blocks the main stream loop.
 ///
-/// The sync_all on mountpoint-s3 triggers a blocking S3 PutObject (~60-80ms),
-/// so we offload it to spawn_blocking to avoid stalling the tokio runtime
-/// (which would block response streaming to the client).
-fn finalize_chunk_s3(download: &Arc<InFlightDownload>, idx: usize) {
-    if let Some(s3_file) = download.chunk(idx).take_s3_file() {
-        let dl = download.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = s3_file.sync_all() {
-                warn!(chunk = idx, "S3 chunk sync_all failed: {e}");
+/// All S3/filesystem I/O runs inside `spawn_blocking` so it cannot stall the
+/// tokio runtime — mountpoint-s3 writes and sync_all trigger real S3 PutObject
+/// calls that can take tens of milliseconds.
+fn spawn_s3_shadow_writer(download: &Arc<InFlightDownload>, idx: usize) {
+    let mut s3_file = match download.chunk(idx).take_s3_file() {
+        Some(f) => f,
+        None => return,
+    };
+    let temp_file = match download.chunk(idx).get_file() {
+        Some(f) => f,
+        None => {
+            download.chunk(idx).set_s3_file(s3_file);
+            return;
+        }
+    };
+    let dl = download.clone();
+    let expected = download.expected_chunk_len(idx);
+
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+
+        let mut offset: u64 = 0;
+        let mut buf = vec![0u8; 256 * 1024];
+
+        loop {
+            let written = dl.chunk(idx).bytes_written();
+            if written <= offset {
+                if dl.has_failed() || dl.is_cancelled() {
+                    break;
+                }
+                if dl.is_stream_complete() && written <= offset {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
             }
-            drop(s3_file);
-            dl.chunk(idx).s3_committed.store(true, Ordering::Release);
-        });
-    }
+
+            let available = written - offset;
+            let to_read = std::cmp::min(available as usize, buf.len());
+            match temp_file.read_exact_at(&mut buf[..to_read], offset) {
+                Ok(()) => {
+                    if let Err(e) = s3_file.write_all(&buf[..to_read]) {
+                        warn!(chunk = idx, "S3 shadow write failed: {e}");
+                        break;
+                    }
+                    offset += to_read as u64;
+                }
+                Err(e) => {
+                    warn!(chunk = idx, "S3 shadow pread failed: {e}");
+                    break;
+                }
+            }
+
+            if offset >= expected {
+                break;
+            }
+        }
+
+        if let Err(e) = s3_file.sync_all() {
+            warn!(chunk = idx, "S3 chunk sync_all failed: {e}");
+        }
+        drop(s3_file);
+        dl.chunk(idx).s3_committed.store(true, Ordering::Release);
+        dl.chunk(idx).decrement_reader();
+    });
 }
 
 /// Stream a full-GET response body into sequential chunks, stopping after the
@@ -790,16 +845,11 @@ async fn stream_response_into_chunks(
             pwrite_all(&file, chunk_offset, slice)
                 .map_err(|e| ProxyError::Internal(format!("pwrite chunk {chunk_idx}: {e}")))?;
 
-            // Tee-write to S3 file if present
-            download.chunk(chunk_idx).write_to_s3_file(slice)
-                .map_err(|e| ProxyError::Internal(format!("s3 write chunk {chunk_idx}: {e}")))?;
-
             piece_offset += to_write;
             global_offset += to_write as u64;
             download.record_written(chunk_idx, to_write as u64);
 
             if download.is_chunk_done(chunk_idx) {
-                finalize_chunk_s3(download, chunk_idx);
                 download.mark_chunk_done(chunk_idx);
                 trace_log(trace, || json!({
                     "event": "sequential_chunk_done",
@@ -833,13 +883,10 @@ async fn download_chunk_from_stream(
         let slice = &piece[..to_write];
         pwrite_all(file, offset, slice)
             .map_err(|e| ProxyError::Internal(format!("pwrite chunk {idx}: {e}")))?;
-        download.chunk(idx).write_to_s3_file(slice)
-            .map_err(|e| ProxyError::Internal(format!("s3 write chunk {idx}: {e}")))?;
         offset += to_write as u64;
         download.record_written(idx, to_write as u64);
     }
 
-    finalize_chunk_s3(download, idx);
     download.mark_chunk_done(idx);
 
     trace_log(trace, || json!({
@@ -971,6 +1018,7 @@ async fn start_sequential_download(
                     })?;
                 download.chunk(idx).set_s3_file(s3_file);
                 download.chunk(idx).increment_readers();
+                spawn_s3_shadow_writer(&download, idx);
             }
         }
     }
@@ -1019,7 +1067,11 @@ async fn start_sequential_download(
                                     .create(true).truncate(true).write(true)
                                     .open(&full_path)
                                 {
-                                    Ok(f) => dl.chunk(chunk_idx).set_s3_file(f),
+                                    Ok(f) => {
+                                        dl.chunk(chunk_idx).set_s3_file(f);
+                                        dl.chunk(chunk_idx).increment_readers();
+                                        spawn_s3_shadow_writer(&dl, chunk_idx);
+                                    }
                                     Err(e) => {
                                         warn!(cache_key = ?ck, "S3 file creation failed: {e}");
                                     }
@@ -1043,13 +1095,11 @@ async fn start_sequential_download(
                                 dl.mark_failed();
                                 break 'outer;
                             }
-                            let _ = dl.chunk(chunk_idx).write_to_s3_file(slice);
                             piece_offset += to_write;
                             global_offset += to_write as u64;
                             dl.record_written(chunk_idx, to_write as u64);
 
                             if dl.is_chunk_done(chunk_idx) {
-                                finalize_chunk_s3(&dl, chunk_idx);
                                 dl.mark_chunk_done(chunk_idx);
                             }
                         } else {
@@ -1070,7 +1120,6 @@ async fn start_sequential_download(
         } else {
             for idx in 0..dl.chunk_count() {
                 if !dl.is_chunk_done(idx) && !dl.has_failed() {
-                    finalize_chunk_s3(&dl, idx);
                     dl.mark_chunk_done(idx);
                 }
             }
