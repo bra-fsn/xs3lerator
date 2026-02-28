@@ -59,7 +59,7 @@ pub async fn fetch_upstream(
     upstream_url: &str,
     cache_key: Option<&str>,
     client_range: Option<&str>,
-    downloads: &DownloadManager,
+    downloads: &Arc<DownloadManager>,
     data_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
     es_client: Option<Arc<EsClient>>,
@@ -281,7 +281,7 @@ async fn start_parallel_upstream_download(
     initial_response: reqwest::Response,
     file_size: u64,
     cache_key: Option<&str>,
-    downloads: &DownloadManager,
+    downloads: &Arc<DownloadManager>,
     data_dir: &std::path::Path,
     trace: &Option<Arc<TraceWriter>>,
     client_range: Option<&str>,
@@ -368,7 +368,7 @@ async fn start_parallel_upstream_download(
     let client = http_client.clone();
     let hdrs = upstream_headers.clone();
     let ck = cache_key.map(str::to_owned);
-    let dm_ptr = downloads as *const DownloadManager as usize;
+    let dm = downloads.clone();
     let http_concurrency = config.http_concurrency;
     let data_dir_clone = data_dir.to_path_buf();
     let data_prefix_clone = config.data_prefix.clone();
@@ -376,7 +376,6 @@ async fn start_parallel_upstream_download(
 
     // Spawn the adaptive download workers
     tokio::spawn(async move {
-        let downloads = unsafe { &*(dm_ptr as *const DownloadManager) };
         let result = run_adaptive_upstream(
             &temp_dir, &url, &client, &hdrs, initial_response,
             &dl, &trace_clone, http_concurrency,
@@ -395,7 +394,7 @@ async fn start_parallel_upstream_download(
         }
         if let Some(ref key) = ck {
             dl.wait_for_s3_complete().await;
-            downloads.remove(key);
+            dm.remove(key);
         }
     });
 
@@ -863,7 +862,7 @@ async fn start_sequential_download(
     response: reqwest::Response,
     file_size: Option<u64>,
     cache_key: Option<&str>,
-    downloads: &DownloadManager,
+    downloads: &Arc<DownloadManager>,
     data_dir: &std::path::Path,
     _trace: &Option<Arc<TraceWriter>>,
     content_type: Option<String>,
@@ -978,14 +977,13 @@ async fn start_sequential_download(
 
     let dl = download.clone();
     let ck = cache_key.map(str::to_owned);
-    let dm_ptr = downloads as *const DownloadManager as usize;
+    let dm = downloads.clone();
     let temp_dir = config.temp_dir.clone();
     let data_dir_clone = data_dir.to_path_buf();
     let data_prefix_clone = config.data_prefix.clone();
     let caching = cache_key.is_some();
 
     tokio::spawn(async move {
-        let downloads = unsafe { &*(dm_ptr as *const DownloadManager) };
         let mut stream = response.bytes_stream();
         let mut global_offset = 0u64;
 
@@ -1080,7 +1078,7 @@ async fn start_sequential_download(
 
         if let Some(ref key) = ck {
             dl.wait_for_s3_complete().await;
-            downloads.remove(key);
+            dm.remove(key);
         }
     });
 
