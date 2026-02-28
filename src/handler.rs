@@ -620,6 +620,7 @@ async fn handle_upstream_path(
     cache_key: Option<&str>,
     client_range: Option<&str>,
 ) -> ProxyResult<Response> {
+    let t0 = std::time::Instant::now();
     let result = upstream_fetcher::fetch_upstream(
         &state.config,
         contract,
@@ -634,6 +635,13 @@ async fn handle_upstream_path(
         &state.http_pool,
     )
     .await?;
+    let fetch_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    debug!(
+        upstream_url,
+        fetch_ms = fetch_ms as u64,
+        unknown_size = result.full_size.is_none(),
+        "upstream fetch returned"
+    );
 
     // Redirect passthrough
     if let Some(redirect_code) = result.redirect_status {

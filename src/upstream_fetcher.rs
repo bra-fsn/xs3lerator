@@ -121,8 +121,15 @@ pub async fn fetch_upstream(
     let response = req_builder.send().await.map_err(|e| {
         ProxyError::Upstream(format!("upstream request failed: {e}"))
     })?;
+    let upstream_ttfb_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let status = response.status();
+    debug!(
+        upstream_url,
+        status = status.as_u16(),
+        upstream_ttfb_ms = upstream_ttfb_ms as u64,
+        "upstream response received"
+    );
     if status.is_redirection() && !contract.follow_redirects {
         let redirect_headers = response.headers().clone();
         debug!(
@@ -752,6 +759,7 @@ fn spawn_s3_shadow_writer(download: &Arc<InFlightDownload>, idx: usize) {
         use std::io::Write;
         use std::os::unix::fs::FileExt;
 
+        let shadow_t0 = std::time::Instant::now();
         let mut offset: u64 = 0;
         let mut buf = vec![0u8; 256 * 1024];
 
@@ -788,13 +796,26 @@ fn spawn_s3_shadow_writer(download: &Arc<InFlightDownload>, idx: usize) {
                 break;
             }
         }
+        let write_ms = shadow_t0.elapsed().as_secs_f64() * 1000.0;
 
+        let sync_t0 = std::time::Instant::now();
         if let Err(e) = s3_file.sync_all() {
             warn!(chunk = idx, "S3 chunk sync_all failed: {e}");
         }
+        let sync_ms = sync_t0.elapsed().as_secs_f64() * 1000.0;
+
         drop(s3_file);
         dl.chunk(idx).s3_committed.store(true, Ordering::Release);
         dl.wake_waiters();
+
+        debug!(
+            chunk = idx,
+            bytes = offset,
+            write_ms = write_ms as u64,
+            sync_ms = sync_ms as u64,
+            total_ms = (write_ms + sync_ms) as u64,
+            "S3 shadow writer done"
+        );
     });
 }
 
@@ -994,6 +1015,7 @@ async fn start_sequential_download(
 
     if !is_unknown_size {
         let caching_setup = cache_key.is_some();
+        let s3_setup_t0 = std::time::Instant::now();
         for idx in 0..download.chunk_count() {
             let chunk_file = create_temp_chunk_file(&config.temp_dir)
                 .map_err(|e| ProxyError::Internal(format!("create temp file: {e}")))?;
@@ -1020,6 +1042,14 @@ async fn start_sequential_download(
                 download.chunk(idx).increment_readers();
                 spawn_s3_shadow_writer(&download, idx);
             }
+        }
+        if caching_setup {
+            let s3_setup_ms = s3_setup_t0.elapsed().as_secs_f64() * 1000.0;
+            debug!(
+                chunks = download.chunk_count(),
+                s3_setup_ms = s3_setup_ms as u64,
+                "S3 file setup complete"
+            );
         }
     }
 
