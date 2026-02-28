@@ -87,7 +87,22 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, server::build_router(state)).await?;
+    axum::serve(listener, server::build_router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
+    info!("shutdown complete");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+
+    tokio::select! {
+        _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
+        _ = sigint.recv() => info!("received SIGINT, shutting down"),
+    }
 }
