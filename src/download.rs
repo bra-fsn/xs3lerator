@@ -60,7 +60,7 @@ pub struct ChunkSlot {
     file: Mutex<Option<Arc<File>>>,
     /// Bytes written to this chunk's file so far (monotonically increasing).
     bytes_written: AtomicU64,
-    /// UUIDv7 identifier for this chunk (immutable, set at construction).
+    /// UUIDv4 identifier for this chunk (immutable, set at construction).
     id: [u8; ID_LEN],
     /// Open file descriptor for the mountpoint-s3 write handle.
     /// `None` before the S3 file is opened or after it's been closed.
@@ -473,10 +473,14 @@ pub fn pwrite_all(file: &File, offset: u64, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Generate `n` UUIDv7 identifiers for chunks.
+/// Generate `n` random UUIDv4 identifiers for chunks.
+///
+/// v4 over v7: UUIDv7's time-sorted prefix concentrates S3 writes into the
+/// same key-prefix partition, risking 503 SlowDown. Random v4 prefixes spread
+/// chunks uniformly across partitions.
 pub fn generate_chunk_ids(n: usize) -> Vec<[u8; ID_LEN]> {
     (0..n)
-        .map(|_| *uuid::Uuid::now_v7().as_bytes())
+        .map(|_| *uuid::Uuid::new_v4().as_bytes())
         .collect()
 }
 
