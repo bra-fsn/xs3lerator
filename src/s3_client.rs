@@ -25,7 +25,20 @@ impl S3Client {
             .with_region(region);
 
         if let Some(ep) = endpoint {
-            builder = builder.with_endpoint(ep).with_allow_http(true);
+            builder = builder
+                .with_endpoint(ep)
+                .with_allow_http(true)
+                .with_virtual_hosted_style_request(false);
+        }
+
+        if let Ok(key_id) = std::env::var("AWS_ACCESS_KEY_ID") {
+            builder = builder.with_access_key_id(key_id);
+        }
+        if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+            builder = builder.with_secret_access_key(secret);
+        }
+        if let Ok(token) = std::env::var("AWS_SESSION_TOKEN") {
+            builder = builder.with_token(token);
         }
 
         let store = builder
