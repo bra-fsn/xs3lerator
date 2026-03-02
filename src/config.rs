@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use byte_unit::Byte;
 use clap::Parser;
@@ -9,6 +10,8 @@ const DEFAULT_HTTP_CONCURRENCY: usize = 8;
 const DEFAULT_CHUNK_SIZE: &str = "32MiB";
 const DEFAULT_CACHE_LOW_WATERMARK: u8 = 85;
 const DEFAULT_CACHE_HIGH_WATERMARK: u8 = 95;
+const DEFAULT_UPSTREAM_CONNECT_TIMEOUT: u64 = 30;
+const DEFAULT_UPSTREAM_READ_TIMEOUT: u64 = 300;
 
 /// High-performance HTTP download accelerator and caching proxy with
 /// content-addressed S3 storage and local disk cache.
@@ -78,6 +81,18 @@ pub struct CliArgs {
     #[arg(long, env = "XS3_UPSTREAM_TLS_SKIP_VERIFY", default_value_t = false)]
     pub upstream_tls_skip_verify: bool,
 
+    /// Default connect timeout (seconds) for upstream HTTP requests.
+    /// Covers TCP handshake + TLS negotiation. Per-request override via
+    /// X-Xs3lerator-Connect-Timeout header.
+    #[arg(long, env = "XS3_UPSTREAM_CONNECT_TIMEOUT", default_value_t = DEFAULT_UPSTREAM_CONNECT_TIMEOUT)]
+    pub upstream_connect_timeout: u64,
+
+    /// Default read timeout (seconds) for upstream HTTP responses.
+    /// Max idle time between received data chunks. Per-request override via
+    /// X-Xs3lerator-Read-Timeout header. 0 = no timeout.
+    #[arg(long, env = "XS3_UPSTREAM_READ_TIMEOUT", default_value_t = DEFAULT_UPSTREAM_READ_TIMEOUT)]
+    pub upstream_read_timeout: u64,
+
     /// Path to write JSONL debug trace (download/reader timing, chunk
     /// progress).  Disabled when omitted.
     #[arg(long, env = "XS3_DEBUG_TRACE")]
@@ -116,6 +131,8 @@ pub struct AppConfig {
     pub chunk_size: u64,
     pub temp_dir: PathBuf,
     pub upstream_tls_skip_verify: bool,
+    pub upstream_connect_timeout: Duration,
+    pub upstream_read_timeout: Option<Duration>,
     pub data_prefix: String,
     pub elasticsearch_url: Option<String>,
     pub elasticsearch_manifest_index: String,
@@ -174,6 +191,12 @@ impl TryFrom<CliArgs> for AppConfig {
             chunk_size: args.chunk_size,
             temp_dir,
             upstream_tls_skip_verify: args.upstream_tls_skip_verify,
+            upstream_connect_timeout: Duration::from_secs(args.upstream_connect_timeout),
+            upstream_read_timeout: if args.upstream_read_timeout == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(args.upstream_read_timeout))
+            },
             data_prefix: args.data_prefix,
             elasticsearch_url: args.elasticsearch_url,
             elasticsearch_manifest_index: args.elasticsearch_manifest_index,

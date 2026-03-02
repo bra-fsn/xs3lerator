@@ -28,6 +28,8 @@ fn test_config() -> AppConfig {
         chunk_size: 5 * 1024 * 1024,
         temp_dir: std::env::temp_dir(),
         upstream_tls_skip_verify: false,
+        upstream_connect_timeout: std::time::Duration::from_secs(30),
+        upstream_read_timeout: Some(std::time::Duration::from_secs(300)),
         data_prefix: "data/".to_string(),
         elasticsearch_url: None,
         elasticsearch_manifest_index: "passsage_meta".to_string(),

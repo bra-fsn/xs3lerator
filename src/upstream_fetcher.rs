@@ -106,8 +106,14 @@ pub async fn fetch_upstream(
 
     // Get a pooled reqwest client (connections are reused across requests)
     let skip_tls = config.upstream_tls_skip_verify || contract.tls_skip_verify;
+    let connect_timeout = contract.connect_timeout.unwrap_or(config.upstream_connect_timeout);
+    let read_timeout = match contract.read_timeout {
+        Some(d) if d.is_zero() => None,
+        Some(d) => Some(d),
+        None => config.upstream_read_timeout,
+    };
     let http_client = http_pool
-        .get(skip_tls, contract.follow_redirects)
+        .get(skip_tls, contract.follow_redirects, connect_timeout, read_timeout)
         .map_err(|e| ProxyError::Internal(format!("get http client: {e}")))?;
 
     // Build filtered headers for the upstream request

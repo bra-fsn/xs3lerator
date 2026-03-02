@@ -82,8 +82,14 @@ pub async fn handle_head(
 
     let contract = parse_contract_headers(&headers);
     let skip_tls = state.config.upstream_tls_skip_verify || contract.tls_skip_verify;
+    let connect_timeout = contract.connect_timeout.unwrap_or(state.config.upstream_connect_timeout);
+    let read_timeout = match contract.read_timeout {
+        Some(d) if d.is_zero() => None,
+        Some(d) => Some(d),
+        None => state.config.upstream_read_timeout,
+    };
     let http_client = state.http_pool
-        .get(skip_tls, contract.follow_redirects)
+        .get(skip_tls, contract.follow_redirects, connect_timeout, read_timeout)
         .map_err(|e| ProxyError::Internal(format!("get http client: {e}")))?;
 
     let upstream_headers = headers::filter_upstream_headers(&headers);

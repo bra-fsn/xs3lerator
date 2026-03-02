@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::http::HeaderMap;
 
 /// Parsed contract headers from a client request.
@@ -29,6 +31,12 @@ pub struct ContractHeaders {
     /// When true, serve cached content on upstream errors instead of passing
     /// the error through to the caller.
     pub stale_if_error: bool,
+    /// Per-request connect timeout override (seconds). Takes precedence over
+    /// the server-wide --upstream-connect-timeout default.
+    pub connect_timeout: Option<Duration>,
+    /// Per-request read timeout override (seconds). Takes precedence over
+    /// the server-wide --upstream-read-timeout default. 0 = no timeout.
+    pub read_timeout: Option<Duration>,
 }
 
 const HEADER_CACHE_KEY: &str = "x-xs3lerator-cache-key";
@@ -40,6 +48,8 @@ const HEADER_MANIFEST: &str = "x-xs3lerator-manifest";
 const HEADER_IF_NONE_MATCH: &str = "x-xs3lerator-if-none-match";
 const HEADER_IF_MODIFIED_SINCE: &str = "x-xs3lerator-if-modified-since";
 const HEADER_STALE_IF_ERROR: &str = "x-xs3lerator-stale-if-error";
+const HEADER_CONNECT_TIMEOUT: &str = "x-xs3lerator-connect-timeout";
+const HEADER_READ_TIMEOUT: &str = "x-xs3lerator-read-timeout";
 
 /// Contract header prefix — all headers with this prefix are stripped before
 /// forwarding to the upstream server.
@@ -110,6 +120,19 @@ pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    let connect_timeout = headers
+        .get(HEADER_CONNECT_TIMEOUT)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&v| v > 0.0)
+        .map(Duration::from_secs_f64);
+
+    let read_timeout = headers
+        .get(HEADER_READ_TIMEOUT)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|v| if v <= 0.0 { Duration::ZERO } else { Duration::from_secs_f64(v) });
+
     ContractHeaders {
         cache_key,
         cache_skip,
@@ -120,6 +143,8 @@ pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
         if_none_match,
         if_modified_since,
         stale_if_error,
+        connect_timeout,
+        read_timeout,
     }
 }
 
