@@ -535,71 +535,88 @@ fn make_cache_hit_stream(
             let mut local_served = false;
             if let Some(path) = local_path {
                 let end = chunk_len.min(start_offset + remaining as usize);
-                let total_to_read = end - start_offset;
 
                 const CACHE_HIT_PIECE: usize = 2 * 1024 * 1024; // 2 MiB
-                const READAHEAD_DEPTH: usize = 8;
+                const CONCURRENT_READS: usize = 8;
 
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(READAHEAD_DEPTH);
+                let file_result = tokio::task::spawn_blocking({
+                    let p = path.clone();
+                    move || std::fs::File::open(&p)
+                }).await
+                .map_err(|e| ProxyError::Internal(format!("open task: {e}")))?;
 
-                let read_start = start_offset;
-                let read_end = end;
-                let read_path = path.clone();
-                tokio::task::spawn_blocking(move || {
-                    use std::os::unix::fs::FileExt;
-                    let f = match std::fs::File::open(&read_path) {
-                        Ok(f) => f,
-                        Err(e) => { let _ = tx.blocking_send(Err(e)); return; }
-                    };
-                    let mut pos = read_start;
-                    while pos < read_end {
-                        let piece = min(read_end - pos, CACHE_HIT_PIECE);
-                        let mut buf = vec![0u8; piece];
-                        match f.read_exact_at(&mut buf, pos as u64) {
-                            Ok(()) => {
-                                if tx.blocking_send(Ok(Bytes::from(buf))).is_err() {
-                                    return; // receiver dropped (client disconnected)
+                match file_result {
+                    Ok(f) => {
+                        let file = Arc::new(f);
+
+                        let mut pieces: Vec<(u64, usize)> = Vec::new();
+                        let mut pos = start_offset;
+                        while pos < end {
+                            let piece = min(end - pos, CACHE_HIT_PIECE);
+                            pieces.push((pos as u64, piece));
+                            pos += piece;
+                        }
+
+                        let mut futs = futures::stream::FuturesOrdered::new();
+                        let mut next_piece = 0usize;
+
+                        while next_piece < pieces.len() && next_piece < CONCURRENT_READS {
+                            let (offset, len) = pieces[next_piece];
+                            let fd = file.clone();
+                            futs.push_back(tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
+                                use std::os::unix::fs::FileExt;
+                                let mut buf = vec![0u8; len];
+                                fd.read_exact_at(&mut buf, offset)?;
+                                Ok(Bytes::from(buf))
+                            }));
+                            next_piece += 1;
+                        }
+
+                        let mut ok = true;
+                        while let Some(join_result) = futs.next().await {
+                            match join_result {
+                                Ok(Ok(bytes)) => {
+                                    remaining -= bytes.len() as u64;
+                                    yield bytes;
+
+                                    if next_piece < pieces.len() {
+                                        let (offset, len) = pieces[next_piece];
+                                        let fd = file.clone();
+                                        futs.push_back(tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
+                                            use std::os::unix::fs::FileExt;
+                                            let mut buf = vec![0u8; len];
+                                            fd.read_exact_at(&mut buf, offset)?;
+                                            Ok(Bytes::from(buf))
+                                        }));
+                                        next_piece += 1;
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    warn!(
+                                        cache_key = cache_key.as_str(),
+                                        chunk_id = crate::manifest::hex_encode_id(id),
+                                        "local cache read failed, falling back to S3: {e}"
+                                    );
+                                    ok = false;
+                                    break;
+                                }
+                                Err(e) => {
+                                    Err(ProxyError::Internal(format!("read task: {e}")))?;
+                                    return;
                                 }
                             }
-                            Err(e) => { let _ = tx.blocking_send(Err(e)); return; }
                         }
-                        pos += piece;
-                    }
-                });
-
-                let mut ok = true;
-                let mut local_read = 0usize;
-                while local_read < total_to_read {
-                    match rx.recv().await {
-                        Some(Ok(bytes)) => {
-                            local_read += bytes.len();
-                            remaining -= bytes.len() as u64;
-                            yield bytes;
-                        }
-                        Some(Err(e)) => {
-                            warn!(
-                                cache_key = cache_key.as_str(),
-                                chunk_id = crate::manifest::hex_encode_id(id),
-                                "local cache read failed, falling back to S3: {e}"
-                            );
-                            ok = false;
-                            break;
-                        }
-                        None => {
-                            if local_read < total_to_read {
-                                warn!(
-                                    cache_key = cache_key.as_str(),
-                                    chunk_id = crate::manifest::hex_encode_id(id),
-                                    "local cache reader exited early ({local_read}/{total_to_read})"
-                                );
-                                ok = false;
-                            }
-                            break;
+                        if ok {
+                            local_served = true;
                         }
                     }
-                }
-                if ok {
-                    local_served = true;
+                    Err(e) => {
+                        warn!(
+                            cache_key = cache_key.as_str(),
+                            chunk_id = crate::manifest::hex_encode_id(id),
+                            "local cache open failed, falling back to S3: {e}"
+                        );
+                    }
                 }
             }
             if !local_served {
