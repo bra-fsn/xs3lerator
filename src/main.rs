@@ -2,6 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use tower::Service;
 use tracing::info;
 
 mod config;
@@ -119,9 +122,50 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, server::build_router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let graceful = tokio::sync::watch::channel(false);
+    let graceful_tx = graceful.0;
+    let router = server::build_router(state);
+
+    tokio::spawn({
+        let _shutdown_rx = graceful.1.clone();
+        async move {
+            shutdown_signal().await;
+            let _ = graceful_tx.send(true);
+        }
+    });
+
+    loop {
+        let mut shutdown_rx = graceful.1.clone();
+        let (stream, _remote_addr) = tokio::select! {
+            result = listener.accept() => result?,
+            _ = shutdown_rx.wait_for(|v| *v) => break,
+        };
+
+        let tower_service = router.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let hyper_service = hyper::service::service_fn(move |req| {
+                let mut svc = tower_service.clone();
+                async move { svc.call(req).await }
+            });
+
+            let builder = AutoBuilder::new(TokioExecutor::new());
+            let conn = builder.serve_connection_with_upgrades(io, hyper_service);
+            tokio::pin!(conn);
+
+            let mut shutdown_rx = shutdown_rx.clone();
+            tokio::select! {
+                result = conn.as_mut() => {
+                    if let Err(e) = result {
+                        tracing::debug!("connection error: {e}");
+                    }
+                }
+                _ = shutdown_rx.wait_for(|v| *v) => {
+                    conn.as_mut().graceful_shutdown();
+                }
+            }
+        });
+    }
 
     info!("shutdown complete");
     Ok(())

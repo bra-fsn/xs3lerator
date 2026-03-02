@@ -1,6 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use tower::Service;
 use xs3lerator::config::AppConfig;
 use xs3lerator::download::DownloadManager;
 use xs3lerator::handler::AppState;
@@ -30,13 +33,30 @@ fn test_config() -> AppConfig {
 }
 
 async fn start_server(state: AppState) -> String {
-    let app = build_router(state);
+    let router = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let tower_service = router.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let hyper_service = hyper::service::service_fn(move |req| {
+                    let mut svc = tower_service.clone();
+                    async move { svc.call(req).await }
+                });
+                let builder = AutoBuilder::new(TokioExecutor::new());
+                let _ = builder
+                    .serve_connection_with_upgrades(io, hyper_service)
+                    .await;
+            });
+        }
     });
     format!("http://{addr}")
 }
