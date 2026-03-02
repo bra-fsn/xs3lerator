@@ -539,84 +539,57 @@ fn make_cache_hit_stream(
                 const CACHE_HIT_PIECE: usize = 2 * 1024 * 1024; // 2 MiB
                 const CONCURRENT_READS: usize = 8;
 
-                let file_result = tokio::task::spawn_blocking({
-                    let p = path.clone();
-                    move || std::fs::File::open(&p)
-                }).await
-                .map_err(|e| ProxyError::Internal(format!("open task: {e}")))?;
+                let mut pieces: Vec<(u64, usize)> = Vec::new();
+                let mut pos = start_offset;
+                while pos < end {
+                    let piece = min(end - pos, CACHE_HIT_PIECE);
+                    pieces.push((pos as u64, piece));
+                    pos += piece;
+                }
 
-                match file_result {
-                    Ok(f) => {
-                        let file = Arc::new(f);
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(CONCURRENT_READS);
+                let read_path = path.clone();
+                let read_pieces = pieces.clone();
 
-                        let mut pieces: Vec<(u64, usize)> = Vec::new();
-                        let mut pos = start_offset;
-                        while pos < end {
-                            let piece = min(end - pos, CACHE_HIT_PIECE);
-                            pieces.push((pos as u64, piece));
-                            pos += piece;
+                std::thread::spawn(move || {
+                    cache_hit_uring_reader(read_path, read_pieces, CONCURRENT_READS, tx);
+                });
+
+                let mut ok = true;
+                let total_pieces = pieces.len();
+                let mut received = 0usize;
+                while received < total_pieces {
+                    match rx.recv().await {
+                        Some(Ok(bytes)) => {
+                            remaining -= bytes.len() as u64;
+                            // We're inside try_stream! which is async, use async recv
+                            received += 1;
+                            yield bytes;
                         }
-
-                        let mut futs = futures::stream::FuturesOrdered::new();
-                        let mut next_piece = 0usize;
-
-                        while next_piece < pieces.len() && next_piece < CONCURRENT_READS {
-                            let (offset, len) = pieces[next_piece];
-                            let fd = file.clone();
-                            futs.push_back(tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
-                                use std::os::unix::fs::FileExt;
-                                let mut buf = vec![0u8; len];
-                                fd.read_exact_at(&mut buf, offset)?;
-                                Ok(Bytes::from(buf))
-                            }));
-                            next_piece += 1;
+                        Some(Err(e)) => {
+                            warn!(
+                                cache_key = cache_key.as_str(),
+                                chunk_id = crate::manifest::hex_encode_id(id),
+                                "local cache read failed, falling back to S3: {e}"
+                            );
+                            ok = false;
+                            break;
                         }
-
-                        let mut ok = true;
-                        while let Some(join_result) = futs.next().await {
-                            match join_result {
-                                Ok(Ok(bytes)) => {
-                                    remaining -= bytes.len() as u64;
-                                    yield bytes;
-
-                                    if next_piece < pieces.len() {
-                                        let (offset, len) = pieces[next_piece];
-                                        let fd = file.clone();
-                                        futs.push_back(tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
-                                            use std::os::unix::fs::FileExt;
-                                            let mut buf = vec![0u8; len];
-                                            fd.read_exact_at(&mut buf, offset)?;
-                                            Ok(Bytes::from(buf))
-                                        }));
-                                        next_piece += 1;
-                                    }
-                                }
-                                Ok(Err(e)) => {
-                                    warn!(
-                                        cache_key = cache_key.as_str(),
-                                        chunk_id = crate::manifest::hex_encode_id(id),
-                                        "local cache read failed, falling back to S3: {e}"
-                                    );
-                                    ok = false;
-                                    break;
-                                }
-                                Err(e) => {
-                                    Err(ProxyError::Internal(format!("read task: {e}")))?;
-                                    return;
-                                }
+                        None => {
+                            if received < total_pieces {
+                                warn!(
+                                    cache_key = cache_key.as_str(),
+                                    chunk_id = crate::manifest::hex_encode_id(id),
+                                    "local reader exited early ({received}/{total_pieces} pieces)"
+                                );
+                                ok = false;
                             }
-                        }
-                        if ok {
-                            local_served = true;
+                            break;
                         }
                     }
-                    Err(e) => {
-                        warn!(
-                            cache_key = cache_key.as_str(),
-                            chunk_id = crate::manifest::hex_encode_id(id),
-                            "local cache open failed, falling back to S3: {e}"
-                        );
-                    }
+                }
+                if ok {
+                    local_served = true;
                 }
             }
             if !local_served {
@@ -1006,6 +979,238 @@ impl Drop for ReaderGuard {
             self.download.chunk(idx).decrement_reader();
         }
     }
+}
+
+/// Read cache-hit chunk data using io_uring for concurrent I/O, with ordered
+/// delivery through the channel.  Falls back to synchronous pread if io_uring
+/// is unavailable (old kernel, seccomp-blocked, etc.).
+fn cache_hit_uring_reader(
+    path: std::path::PathBuf,
+    pieces: Vec<(u64, usize)>,
+    concurrency: usize,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) {
+    let f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => { let _ = tx.blocking_send(Err(e)); return; }
+    };
+
+    match cache_hit_uring_inner(&f, &pieces, concurrency, &tx) {
+        Ok(()) => {}
+        Err(UringFallback::Unsupported) => {
+            // io_uring not available — fall back to concurrent pread
+            cache_hit_pread_fallback(&f, &pieces, concurrency, &tx);
+        }
+        Err(UringFallback::IoError(e)) => {
+            let _ = tx.blocking_send(Err(e));
+        }
+    }
+}
+
+enum UringFallback {
+    Unsupported,
+    IoError(std::io::Error),
+}
+
+fn cache_hit_uring_inner(
+    f: &std::fs::File,
+    pieces: &[(u64, usize)],
+    concurrency: usize,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<(), UringFallback> {
+    use io_uring::{opcode, types, IoUring};
+    use std::os::unix::io::AsRawFd;
+
+    let ring_size = (concurrency as u32 * 2).next_power_of_two().max(8);
+    let mut ring = IoUring::new(ring_size).map_err(|_| UringFallback::Unsupported)?;
+    let fd = types::Fd(f.as_raw_fd());
+
+    let piece_size = pieces.iter().map(|(_, len)| *len).max().unwrap_or(0);
+
+    // Per-slot state: buffer + which piece index it's working on
+    let mut buffers: Vec<Vec<u8>> = (0..concurrency).map(|_| vec![0u8; piece_size]).collect();
+    let mut slot_piece: Vec<usize> = vec![0; concurrency];
+
+    // Reorder buffer: store completed reads at their piece index, drain in order
+    let mut reorder: Vec<Option<Bytes>> = vec![None; pieces.len()];
+    let mut next_yield = 0usize;
+    let mut next_submit = 0usize;
+    let mut in_flight = 0usize;
+
+    // Submit initial batch
+    while in_flight < concurrency && next_submit < pieces.len() {
+        let slot = in_flight;
+        let (offset, len) = pieces[next_submit];
+        slot_piece[slot] = next_submit;
+        let entry = opcode::Read::new(fd, buffers[slot].as_mut_ptr(), len as u32)
+            .offset(offset)
+            .build()
+            .user_data(slot as u64);
+        unsafe { ring.submission().push(&entry).unwrap(); }
+        next_submit += 1;
+        in_flight += 1;
+    }
+    ring.submit().map_err(|e| UringFallback::IoError(e))?;
+
+    while in_flight > 0 {
+        ring.submit_and_wait(1).map_err(|e| UringFallback::IoError(e))?;
+
+        // Collect completions (must drop CQ borrow before accessing SQ)
+        let mut completed: Vec<(usize, i32)> = Vec::new();
+        for cqe in ring.completion() {
+            completed.push((cqe.user_data() as usize, cqe.result()));
+        }
+
+        for (slot, result) in completed {
+            if result < 0 {
+                return Err(UringFallback::IoError(
+                    std::io::Error::from_raw_os_error(-result)
+                ));
+            }
+            let bytes_read = result as usize;
+            let piece_idx = slot_piece[slot];
+            let (_offset, expected_len) = pieces[piece_idx];
+            if bytes_read != expected_len {
+                return Err(UringFallback::IoError(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("short read: got {bytes_read}, expected {expected_len}"),
+                )));
+            }
+
+            reorder[piece_idx] = Some(Bytes::copy_from_slice(&buffers[slot][..bytes_read]));
+            in_flight -= 1;
+
+            // Refill this slot with the next piece
+            if next_submit < pieces.len() {
+                let (offset, len) = pieces[next_submit];
+                slot_piece[slot] = next_submit;
+                let entry = opcode::Read::new(fd, buffers[slot].as_mut_ptr(), len as u32)
+                    .offset(offset)
+                    .build()
+                    .user_data(slot as u64);
+                unsafe { ring.submission().push(&entry).unwrap(); }
+                next_submit += 1;
+                in_flight += 1;
+            }
+
+            // Drain contiguous completed pieces in order
+            while next_yield < reorder.len() {
+                if let Some(data) = reorder[next_yield].take() {
+                    if tx.blocking_send(Ok(data)).is_err() {
+                        return Ok(()); // receiver dropped
+                    }
+                    next_yield += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Re-submit any new SQEs we added
+        if in_flight > 0 {
+            ring.submit().map_err(|e| UringFallback::IoError(e))?;
+        }
+    }
+
+    // Drain any remaining reordered pieces
+    while next_yield < reorder.len() {
+        if let Some(data) = reorder[next_yield].take() {
+            if tx.blocking_send(Ok(data)).is_err() {
+                return Ok(());
+            }
+            next_yield += 1;
+        } else {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Fallback for when io_uring is not available: concurrent pread from threads.
+fn cache_hit_pread_fallback(
+    f: &std::fs::File,
+    pieces: &[(u64, usize)],
+    concurrency: usize,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) {
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let piece_size = pieces.iter().map(|(_, len)| *len).max().unwrap_or(0);
+    let pieces_arc: Arc<Vec<(u64, usize)>> = Arc::new(pieces.to_vec());
+    let next_idx = Arc::new(AtomicUsize::new(0));
+    let reorder: Arc<parking_lot::Mutex<Vec<Option<Bytes>>>> =
+        Arc::new(parking_lot::Mutex::new(vec![None; pieces.len()]));
+    let next_yield = Arc::new(AtomicUsize::new(0));
+
+    // We need to dup the fd so each thread can read independently
+    let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(f);
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for _ in 0..concurrency.min(pieces.len()) {
+            let pieces_ref = pieces_arc.clone();
+            let idx_ref = next_idx.clone();
+            let reorder_ref = reorder.clone();
+            let yield_ref = next_yield.clone();
+            let tx_ref = tx.clone();
+
+            handles.push(s.spawn(move || {
+                // Safe: fd is valid for the duration of this scope (f is alive)
+                let file = unsafe {
+                    use std::os::unix::io::FromRawFd;
+                    std::fs::File::from_raw_fd(libc::dup(raw_fd))
+                };
+                let mut buf = vec![0u8; piece_size];
+
+                loop {
+                    let i = idx_ref.fetch_add(1, Ordering::Relaxed);
+                    if i >= pieces_ref.len() { break; }
+                    let (offset, len) = pieces_ref[i];
+
+                    match file.read_exact_at(&mut buf[..len], offset) {
+                        Ok(()) => {
+                            let data = Bytes::copy_from_slice(&buf[..len]);
+                            {
+                                let mut reo = reorder_ref.lock();
+                                reo[i] = Some(data);
+                            }
+                            // Try to drain in-order from the front
+                            loop {
+                                let y = yield_ref.load(Ordering::Acquire);
+                                let data = {
+                                    let mut reo = reorder_ref.lock();
+                                    if y < reo.len() { reo[y].take() } else { None }
+                                };
+                                if let Some(d) = data {
+                                    if tx_ref.blocking_send(Ok(d)).is_err() { return; }
+                                    yield_ref.fetch_add(1, Ordering::Release);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx_ref.blocking_send(Err(e));
+                            return;
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        // Final drain of any remaining ordered pieces
+        let y_start = next_yield.load(Ordering::Acquire);
+        let mut reo = reorder.lock();
+        for i in y_start..reo.len() {
+            if let Some(d) = reo[i].take() {
+                if tx.blocking_send(Ok(d)).is_err() { break; }
+            }
+        }
+    });
 }
 
 /// Build the HTTP response that streams data from in-flight chunk files.
