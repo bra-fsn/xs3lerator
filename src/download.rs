@@ -114,7 +114,7 @@ impl ChunkSlot {
         self.bytes_written.load(Ordering::Acquire)
     }
 
-    /// Set the mountpoint-s3 write handle for this chunk.
+    /// Increment the reader count for this chunk.
     pub fn increment_readers(&self) {
         self.reader_count.fetch_add(1, Ordering::AcqRel);
     }

@@ -774,8 +774,6 @@ fn active_sequential_chunk(download: &InFlightDownload) -> usize {
 /// Background task that waits for a chunk to be fully written, then:
 /// 1. Copies the temp file to the local disk cache (fsync + rename).
 /// 2. Uploads the chunk to S3 via object_store::put().
-///
-/// Replaces the old mountpoint-s3 shadow writer.
 fn spawn_post_chunk_upload(
     download: Arc<InFlightDownload>,
     idx: usize,

@@ -18,9 +18,8 @@ GET request fetching and S3 content caching.
   - **Passthrough mode** (`--passthrough`): pure download accelerator.  No
     Elasticsearch, no S3, no cache directory.  Just parallel chunked
     downloads from arbitrary HTTP(S) upstreams.
-- **Direct S3 operations** via `object_store` — no filesystem-level S3
-  mount (mountpoint-s3) required.  Chunks are uploaded/downloaded directly
-  to/from S3 using the `object_store` crate.
+- **Direct S3 operations** via `object_store` — chunks are uploaded/downloaded
+  directly to/from S3 using the `object_store` crate.
 - **Local disk cache** (`--cache-dir`): EBS- or tmpfs-backed cache for
   chunks with a sharded 256×256 directory layout.  On startup, the directory
   structure is pre-created before the HTTP server begins accepting requests.

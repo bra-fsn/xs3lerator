@@ -109,7 +109,7 @@ class TestCacheMiss:
             "Manifest should contain at least one chunk ID"
         )
 
-        # Verify the actual chunk data landed in S3 (through mount-s3).
+        # Verify the actual chunk data landed in S3.
         # The manifest was only written after chunks were persisted + sync'd,
         # so by this point they should be visible via the S3 API.
         import struct

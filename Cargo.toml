@@ -2,7 +2,7 @@
 name = "xs3lerator"
 version = "0.6.0"
 edition = "2021"
-description = "High-performance HTTP caching proxy with content-addressed storage on mount-s3"
+description = "High-performance HTTP download accelerator and caching proxy for S3"
 license = "MIT"
 
 [[bin]]

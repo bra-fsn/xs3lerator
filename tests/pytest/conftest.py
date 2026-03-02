@@ -1,6 +1,6 @@
 """Fixtures for xs3lerator integration tests.
 
-Requires Docker Compose: all services (LocalStack, Elasticsearch, mount-s3,
+Requires Docker Compose: all services (LocalStack, Elasticsearch,
 xs3lerator) must be running.  The test server runs on the host and is
 reached by the xs3lerator container via host.docker.internal.
 
@@ -300,12 +300,7 @@ def seed_cached_object(
     es_url: str = ELASTICSEARCH_URL,
     es_index: str = ES_MANIFEST_INDEX,
 ):
-    """Upload chunks to S3 and write manifest to ES for cache-hit tests.
-
-    mount-s3 bridges S3 to the xs3lerator filesystem, so writing chunks
-    to S3 via boto3 is sufficient — they appear at the expected paths
-    inside the xs3lerator container.
-    """
+    """Upload chunks to S3 and write manifest to ES for cache-hit tests."""
     manifest_bytes, chunks = build_manifest(payload, chunk_size)
 
     for chunk_id, chunk_data in chunks:

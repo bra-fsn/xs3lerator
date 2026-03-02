@@ -46,20 +46,6 @@ jobs:
           cache-to: type=gha,scope=compose,mode=max
           platforms: linux/amd64
 
-      - name: Build mount-s3 image (cached)
-        uses: docker/build-push-action@v6
-        with:
-          context: ./docker
-          file: docker/Dockerfile.mount-s3
-          load: true
-          tags: xs3lerator_mount-s3:latest
-          cache-from: type=gha,scope=compose-mount-s3
-          cache-to: type=gha,scope=compose-mount-s3,mode=max
-          platforms: linux/amd64
-
-      - name: Create shared data directory
-        run: mkdir -p .data
-
       - name: Start all services
         env:
           RUST_LOG: "debug"
