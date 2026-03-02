@@ -534,36 +534,66 @@ fn make_cache_hit_stream(
 
             let mut local_served = false;
             if let Some(path) = local_path {
-                let mut pos = start_offset;
                 let end = chunk_len.min(start_offset + remaining as usize);
+                let total_to_read = end - start_offset;
+
+                const CACHE_HIT_PIECE: usize = 2 * 1024 * 1024; // 2 MiB
+                const READAHEAD_DEPTH: usize = 8;
+
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(READAHEAD_DEPTH);
+
+                let read_start = start_offset;
+                let read_end = end;
+                let read_path = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    use std::os::unix::fs::FileExt;
+                    let f = match std::fs::File::open(&read_path) {
+                        Ok(f) => f,
+                        Err(e) => { let _ = tx.blocking_send(Err(e)); return; }
+                    };
+                    let mut pos = read_start;
+                    while pos < read_end {
+                        let piece = min(read_end - pos, CACHE_HIT_PIECE);
+                        let mut buf = vec![0u8; piece];
+                        match f.read_exact_at(&mut buf, pos as u64) {
+                            Ok(()) => {
+                                if tx.blocking_send(Ok(Bytes::from(buf))).is_err() {
+                                    return; // receiver dropped (client disconnected)
+                                }
+                            }
+                            Err(e) => { let _ = tx.blocking_send(Err(e)); return; }
+                        }
+                        pos += piece;
+                    }
+                });
+
                 let mut ok = true;
-                while pos < end {
-                    let piece = min(end - pos, 256 * 1024);
-                    let p = path.clone();
-                    let offset = pos as u64;
-                    let len = piece;
-                    let data = tokio::task::spawn_blocking(move || -> Result<Bytes, std::io::Error> {
-                        use std::os::unix::fs::FileExt;
-                        let f = std::fs::File::open(&p)?;
-                        let mut buf = vec![0u8; len];
-                        f.read_exact_at(&mut buf, offset)?;
-                        Ok(Bytes::from(buf))
-                    })
-                    .await
-                    .map_err(|e| ProxyError::Internal(format!("read task: {e}")))?;
-                    match data {
-                        Ok(bytes) => {
+                let mut local_read = 0usize;
+                while local_read < total_to_read {
+                    match rx.recv().await {
+                        Some(Ok(bytes)) => {
+                            local_read += bytes.len();
                             remaining -= bytes.len() as u64;
-                            pos += bytes.len();
                             yield bytes;
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             warn!(
                                 cache_key = cache_key.as_str(),
                                 chunk_id = crate::manifest::hex_encode_id(id),
                                 "local cache read failed, falling back to S3: {e}"
                             );
                             ok = false;
+                            break;
+                        }
+                        None => {
+                            if local_read < total_to_read {
+                                warn!(
+                                    cache_key = cache_key.as_str(),
+                                    chunk_id = crate::manifest::hex_encode_id(id),
+                                    "local cache reader exited early ({local_read}/{total_to_read})"
+                                );
+                                ok = false;
+                            }
                             break;
                         }
                     }
