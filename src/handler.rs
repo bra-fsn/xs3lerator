@@ -19,6 +19,7 @@ use crate::error::{ProxyError, ProxyResult};
 use crate::es_client::EsClient;
 use crate::headers::{
     self, parse_upstream_url, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
+    RESP_REVALIDATED,
 };
 use crate::http_pool::HttpClientPool;
 use crate::manifest::Manifest;
@@ -227,6 +228,22 @@ pub async fn handle_get(
 
     let cache_key_str = cache_key.as_deref().unwrap();
 
+    // Conditional revalidation: passsage supplied an ETag to validate
+    // upstream. We send the conditional GET, and on 304 or upstream error
+    // (with stale_if_error) serve from the existing S3 cache.
+    if contract.if_none_match.is_some() {
+        return handle_conditional_revalidation(
+            &state,
+            &contract,
+            &headers,
+            &upstream_url,
+            cache_key_str,
+            client_range_header.as_deref(),
+        )
+        .await
+        .map(|resp| { log_access("GET", log_key, &resp); resp });
+    }
+
     // If passsage supplied the manifest in the header, try to use it directly
     // to skip the ES lookup entirely.
     let header_manifest = contract.manifest_b64.as_deref().and_then(|b64| {
@@ -269,6 +286,109 @@ pub async fn handle_get(
             .await
             .map(|resp| { log_access("GET", log_key, &resp); resp })
         }
+    }
+}
+
+/// Handle a conditional revalidation request.
+///
+/// The caller (passsage) already has the content cached and supplied the
+/// ETag via `X-Xs3lerator-If-None-Match`.  We send a conditional GET to
+/// upstream and branch on the result:
+///
+/// - **304 Not Modified**: serve from S3 cache, `X-Xs3lerator-Revalidated: true`
+/// - **200 OK**: content changed, process as a normal upstream download with
+///   `X-Xs3lerator-Cache-Hit: false`
+/// - **Error + stale_if_error**: serve from S3 cache,
+///   `X-Xs3lerator-Revalidated: stale-error`
+/// - **Error without stale_if_error**: pass the error through
+async fn handle_conditional_revalidation(
+    state: &AppState,
+    contract: &headers::ContractHeaders,
+    client_headers: &HeaderMap,
+    upstream_url: &str,
+    cache_key: &str,
+    client_range: Option<&str>,
+) -> ProxyResult<Response> {
+    let t0 = std::time::Instant::now();
+    let result = upstream_fetcher::fetch_upstream(
+        &state.config,
+        contract,
+        client_headers,
+        upstream_url,
+        Some(cache_key),
+        client_range,
+        &state.downloads,
+        &state.trace,
+        state.es_client.clone(),
+        &state.http_pool,
+        state.s3.clone(),
+        state.disk_cache.clone(),
+    )
+    .await;
+    let fetch_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Resolve the manifest from the header (for cache-hit serving on 304/stale-error)
+    let header_manifest = contract.manifest_b64.as_deref().and_then(|b64| {
+        match crate::es_client::decode_manifest_b64(b64) {
+            Ok(m) => Some(Arc::new(m)),
+            Err(e) => {
+                debug!(cache_key, error = %e, "header manifest decode failed in revalidation");
+                None
+            }
+        }
+    });
+
+    match result {
+        Ok(upstream) if upstream.revalidated => {
+            debug!(
+                cache_key,
+                fetch_ms = fetch_ms as u64,
+                "conditional revalidation: 304 Not Modified, serving from cache"
+            );
+            let mut resp = handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
+            resp.headers_mut().insert(
+                RESP_REVALIDATED,
+                HeaderValue::from_static("true"),
+            );
+            Ok(resp)
+        }
+        Ok(upstream) if upstream.error_passthrough.is_some() && contract.stale_if_error => {
+            let (status_code, _err_resp) = upstream.error_passthrough.unwrap();
+            debug!(
+                cache_key,
+                status_code,
+                fetch_ms = fetch_ms as u64,
+                "conditional revalidation: upstream error, serving stale from cache (stale-if-error)"
+            );
+            let mut resp = handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
+            resp.headers_mut().insert(
+                RESP_REVALIDATED,
+                HeaderValue::from_static("stale-error"),
+            );
+            Ok(resp)
+        }
+        Ok(upstream) => {
+            debug!(
+                cache_key,
+                fetch_ms = fetch_ms as u64,
+                "conditional revalidation: content changed, serving from upstream"
+            );
+            build_upstream_response(state, upstream, Some(cache_key), client_range)
+        }
+        Err(e) if contract.stale_if_error => {
+            warn!(
+                cache_key,
+                error = %e,
+                "conditional revalidation: upstream fetch failed, serving stale from cache (stale-if-error)"
+            );
+            let mut resp = handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
+            resp.headers_mut().insert(
+                RESP_REVALIDATED,
+                HeaderValue::from_static("stale-error"),
+            );
+            Ok(resp)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -675,6 +795,17 @@ async fn handle_upstream_path(
         unknown_size = result.full_size.is_none(),
         "upstream fetch returned"
     );
+
+    build_upstream_response(state, result, cache_key, client_range)
+}
+
+/// Build an HTTP response from an already-fetched `UpstreamResult`.
+fn build_upstream_response(
+    _state: &AppState,
+    result: upstream_fetcher::UpstreamResult,
+    cache_key: Option<&str>,
+    client_range: Option<&str>,
+) -> ProxyResult<Response> {
 
     // Redirect passthrough
     if let Some(redirect_code) = result.redirect_status {

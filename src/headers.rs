@@ -20,6 +20,15 @@ pub struct ContractHeaders {
     /// Pre-supplied manifest (base64) from passsage, allowing xs3lerator to
     /// skip the ES lookup on cache hits.
     pub manifest_b64: Option<String>,
+    /// Cached ETag from passsage for conditional revalidation.
+    /// xs3lerator forwards this as `If-None-Match` to the upstream.
+    pub if_none_match: Option<String>,
+    /// Cached Last-Modified from passsage for conditional revalidation.
+    /// xs3lerator forwards this as `If-Modified-Since` to the upstream.
+    pub if_modified_since: Option<String>,
+    /// When true, serve cached content on upstream errors instead of passing
+    /// the error through to the caller.
+    pub stale_if_error: bool,
 }
 
 const HEADER_CACHE_KEY: &str = "x-xs3lerator-cache-key";
@@ -28,6 +37,9 @@ const HEADER_OBJECT_SIZE: &str = "x-xs3lerator-object-size";
 const HEADER_TLS_SKIP_VERIFY: &str = "x-xs3lerator-tls-skip-verify";
 const HEADER_FOLLOW_REDIRECTS: &str = "x-xs3lerator-follow-redirects";
 const HEADER_MANIFEST: &str = "x-xs3lerator-manifest";
+const HEADER_IF_NONE_MATCH: &str = "x-xs3lerator-if-none-match";
+const HEADER_IF_MODIFIED_SINCE: &str = "x-xs3lerator-if-modified-since";
+const HEADER_STALE_IF_ERROR: &str = "x-xs3lerator-stale-if-error";
 
 /// Contract header prefix — all headers with this prefix are stripped before
 /// forwarding to the upstream server.
@@ -39,6 +51,9 @@ pub const RESP_CACHE_HIT: &str = "x-xs3lerator-cache-hit";
 pub const RESP_FULL_SIZE: &str = "x-xs3lerator-full-size";
 /// Response header: degraded mode indicator.
 pub const RESP_DEGRADED: &str = "x-xs3lerator-degraded";
+/// Response header: conditional revalidation result.
+/// Values: "true" (304 from upstream), "stale-error" (upstream error, served cached).
+pub const RESP_REVALIDATED: &str = "x-xs3lerator-revalidated";
 
 /// Parse contract headers from an incoming request.
 pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
@@ -77,6 +92,24 @@ pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
 
+    let if_none_match = headers
+        .get(HEADER_IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+
+    let if_modified_since = headers
+        .get(HEADER_IF_MODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+
+    let stale_if_error = headers
+        .get(HEADER_STALE_IF_ERROR)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     ContractHeaders {
         cache_key,
         cache_skip,
@@ -84,6 +117,9 @@ pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
         tls_skip_verify,
         follow_redirects,
         manifest_b64,
+        if_none_match,
+        if_modified_since,
+        stale_if_error,
     }
 }
 
@@ -207,6 +243,23 @@ mod tests {
         assert!(!c.tls_skip_verify);
         assert!(!c.follow_redirects);
         assert!(c.manifest_b64.is_none());
+        assert!(c.if_none_match.is_none());
+        assert!(c.if_modified_since.is_none());
+        assert!(!c.stale_if_error);
+    }
+
+    #[test]
+    fn parse_contract_headers_conditional_revalidation() {
+        let mut h = HeaderMap::new();
+        h.insert(HEADER_CACHE_KEY, HeaderValue::from_static("https/host/abc"));
+        h.insert(HEADER_IF_NONE_MATCH, HeaderValue::from_static("\"abc123\""));
+        h.insert(HEADER_IF_MODIFIED_SINCE, HeaderValue::from_static("Mon, 01 Jan 2024 00:00:00 GMT"));
+        h.insert(HEADER_STALE_IF_ERROR, HeaderValue::from_static("true"));
+        let c = parse_contract_headers(&h);
+        assert_eq!(c.if_none_match.as_deref(), Some("\"abc123\""));
+        assert_eq!(c.if_modified_since.as_deref(), Some("Mon, 01 Jan 2024 00:00:00 GMT"));
+        assert!(c.stale_if_error);
+        assert!(!c.cache_skip);
     }
 
     #[test]

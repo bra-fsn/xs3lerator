@@ -50,6 +50,10 @@ pub struct UpstreamResult {
     /// When set, upstream returned a non-2xx/non-3xx error. The handler should
     /// stream this response body with the original status code (no S3 caching).
     pub error_passthrough: Option<(u16, reqwest::Response)>,
+    /// When true, upstream returned 304 Not Modified in response to a
+    /// conditional GET (If-None-Match / If-Modified-Since). No body was
+    /// downloaded — the handler should serve from the existing S3 cache.
+    pub revalidated: bool,
 }
 
 /// Start an upstream download, creating an `InFlightDownload` that the handler
@@ -92,6 +96,7 @@ pub async fn fetch_upstream(
                     redirect_headers: None,
                     upstream_headers: None,
                     error_passthrough: None,
+                    revalidated: false,
                 });
             }
             // We created a placeholder — remove it so we can insert the real one.
@@ -114,6 +119,14 @@ pub async fn fetch_upstream(
         }
     }
 
+    // Add conditional revalidation headers from the contract
+    if let Some(ref etag) = contract.if_none_match {
+        req_builder = req_builder.header("if-none-match", etag.as_str());
+    }
+    if let Some(ref last_mod) = contract.if_modified_since {
+        req_builder = req_builder.header("if-modified-since", last_mod.as_str());
+    }
+
     trace_log(trace, || json!({
         "event": "upstream_fetch_start",
         "url": upstream_url,
@@ -133,6 +146,27 @@ pub async fn fetch_upstream(
         upstream_ttfb_ms = upstream_ttfb_ms as u64,
         "upstream response received"
     );
+
+    // 304 Not Modified: upstream confirmed cached content is still valid.
+    // Return immediately — no body to download.
+    if status.as_u16() == 304 {
+        debug!(upstream_url, "upstream returned 304 Not Modified");
+        return Ok(UpstreamResult {
+            download: Arc::new(InFlightDownload::new_placeholder(config.chunk_size)),
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            cache_control: None,
+            full_size: None,
+            degraded_body: None,
+            redirect_status: None,
+            redirect_headers: None,
+            upstream_headers: Some(response.headers().clone()),
+            error_passthrough: None,
+            revalidated: true,
+        });
+    }
+
     if status.is_redirection() && !contract.follow_redirects {
         let redirect_headers = response.headers().clone();
         debug!(
@@ -152,6 +186,7 @@ pub async fn fetch_upstream(
             redirect_headers: Some(redirect_headers),
             upstream_headers: None,
             error_passthrough: None,
+            revalidated: false,
         });
     }
     if !status.is_success() {
@@ -170,6 +205,7 @@ pub async fn fetch_upstream(
             redirect_headers: None,
             upstream_headers: Some(resp_headers),
             error_passthrough: Some((status_code, response)),
+            revalidated: false,
         });
     }
 
@@ -329,6 +365,7 @@ async fn start_parallel_upstream_download(
                 redirect_headers: None,
                 upstream_headers: all_upstream_headers,
                 error_passthrough: None,
+                revalidated: false,
             });
         }
         download
@@ -355,6 +392,7 @@ async fn start_parallel_upstream_download(
                 redirect_headers: None,
                 upstream_headers: all_upstream_headers,
                 error_passthrough: None,
+                revalidated: false,
             });
         }
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
@@ -425,6 +463,7 @@ async fn start_parallel_upstream_download(
         redirect_headers: None,
         upstream_headers: all_upstream_headers,
         error_passthrough: None,
+        revalidated: false,
     })
 }
 
@@ -992,6 +1031,7 @@ async fn start_sequential_download(
                 redirect_headers: None,
                 upstream_headers: all_upstream_headers,
                 error_passthrough: None,
+                revalidated: false,
             });
         }
         download
@@ -1018,6 +1058,7 @@ async fn start_sequential_download(
                 redirect_headers: None,
                 upstream_headers: all_upstream_headers,
                 error_passthrough: None,
+                revalidated: false,
             });
         }
         return Err(ProxyError::Internal(format!("temp dir unavailable: {e}")));
@@ -1166,5 +1207,6 @@ async fn start_sequential_download(
         redirect_headers: None,
         upstream_headers: all_upstream_headers,
         error_passthrough: None,
+        revalidated: false,
     })
 }
