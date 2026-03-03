@@ -26,7 +26,7 @@ services:
       - fdb-data:/var/fdb/data
       - fdb-config:/var/fdb/shared
     healthcheck:
-      test: ["CMD-SHELL", "cp -f /var/fdb/fdb.cluster /var/fdb/shared/fdb.cluster 2>/dev/null; fdbcli --exec 'status minimal' 2>/dev/null | grep -q 'The database is available' || (fdbcli --exec 'configure new single ssd' >/dev/null 2>&1; false)"]
+      test: ["CMD-SHELL", "fdbcli --exec 'configure new single ssd' >/dev/null 2>&1; cp -f /var/fdb/fdb.cluster /var/fdb/shared/fdb.cluster 2>/dev/null; fdbcli --exec 'status minimal' 2>/dev/null | grep -q 'The database is available'"]
       interval: 5s
       timeout: 10s
       retries: 20
