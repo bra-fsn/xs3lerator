@@ -1,40 +1,29 @@
 # syntax=docker/dockerfile:1
 #
-# Multi-stage build producing a minimal static binary image.
-# Targets musl so the result is fully statically linked — no libc dependency.
+# Multi-stage build for xs3lerator.
+# Uses glibc (gnu) targets because foundationdb-sys requires dynamic linking
+# against libfdb_c.so — musl's static-pie mode cannot link shared libraries.
+# The runtime container (ubuntu:24.04) provides the matching glibc.
 #
 # Caching strategy: dependencies are built in a separate layer from application
 # code. In CI (GHA), type=gha,mode=max caches ALL intermediate layers across
 # runs, so the dependency layer is only rebuilt when Cargo.toml/Cargo.lock change.
-# --mount=type=cache is intentionally NOT used — those caches live inside the
-# ephemeral BuildKit builder and cannot be exported/persisted by any Docker
-# cache backend.
 
 # ── Build stage ──────────────────────────────────────────────────────────────
-FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
+FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        musl-tools \
-        gcc-aarch64-linux-gnu \
-        libc6-dev-arm64-cross \
+        gcc \
+        libc6-dev \
         libclang-dev \
         curl \
-    && curl -fsSL https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_amd64.deb -o /tmp/fdb-clients.deb \
+    && ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL "https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_${ARCH}.deb" -o /tmp/fdb-clients.deb \
     && dpkg -i /tmp/fdb-clients.deb \
     && rm /tmp/fdb-clients.deb \
     && rm -rf /var/lib/apt/lists/*
 
-RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-
-# Tell cargo which linker to use for each musl target
-ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-gnu-gcc \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-    CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
-    RUSTFLAGS="-L /usr/lib"
-
 WORKDIR /app
-
-ARG TARGETARCH
 
 # ── Dependency cache layer ───────────────────────────────────────────────────
 # Copy only manifests + stub source so this layer is invalidated only when
@@ -42,12 +31,7 @@ ARG TARGETARCH
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs
 
-RUN case "$TARGETARCH" in \
-      amd64) TARGET=x86_64-unknown-linux-musl ;; \
-      arm64) TARGET=aarch64-unknown-linux-musl ;; \
-      *) echo "unsupported arch: $TARGETARCH" && exit 1 ;; \
-    esac && \
-    cargo build --release --target "$TARGET"
+RUN cargo build --release
 
 # ── Full build ───────────────────────────────────────────────────────────────
 COPY . .
@@ -55,17 +39,10 @@ RUN touch src/main.rs src/lib.rs
 
 ARG GITHUB_SHA
 
-RUN case "$TARGETARCH" in \
-      amd64) TARGET=x86_64-unknown-linux-musl ;; \
-      arm64) TARGET=aarch64-unknown-linux-musl ;; \
-    esac && \
-    cargo build --release --target "$TARGET" && \
-    cp /app/target/"$TARGET"/release/xs3lerator /xs3lerator
+RUN cargo build --release && \
+    cp /app/target/release/xs3lerator /xs3lerator
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
-# Ubuntu base so the image has a shell for debugging (e.g. docker run -it --entrypoint /bin/bash ...).
-# Binary is musl-linked for the application code; libfdb_c.so is loaded at
-# runtime by the foundationdb crate.
 FROM ubuntu:24.04
 
 ARG TARGETARCH
