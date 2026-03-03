@@ -16,7 +16,7 @@ use crate::config::AppConfig;
 use crate::disk_cache::DiskCache;
 use crate::download::{InFlightDownload, DownloadManager};
 use crate::error::{ProxyError, ProxyResult};
-use crate::es_client::EsClient;
+use crate::fdb_client::FdbClient;
 use crate::headers::{
     self, parse_upstream_url, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
     RESP_REVALIDATED,
@@ -45,7 +45,7 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub downloads: Arc<DownloadManager>,
     pub trace: Option<Arc<TraceWriter>>,
-    pub es_client: Option<Arc<EsClient>>,
+    pub fdb_client: Option<Arc<FdbClient>>,
     pub http_pool: Arc<HttpClientPool>,
     pub s3: Option<Arc<S3Client>>,
     pub disk_cache: Option<Arc<DiskCache>>,
@@ -168,8 +168,8 @@ pub async fn handle_post(
     let manifest = fetch_manifest(&state, &source_key).await?;
 
     let manifest_bytes = manifest.serialize();
-    if let Some(ref es) = state.es_client {
-        es.put_manifest(&target_key, manifest_bytes).await?;
+    if let Some(ref fdb) = state.fdb_client {
+        fdb.put_manifest(&target_key, manifest_bytes).await?;
     }
 
     debug!(target = target_key, "manifest alias created");
@@ -253,10 +253,10 @@ pub async fn handle_get(
     // If passsage supplied the manifest in the header, try to use it directly
     // to skip the ES lookup entirely.
     let header_manifest = contract.manifest_b64.as_deref().and_then(|b64| {
-        match crate::es_client::decode_manifest_b64(b64) {
+        match crate::fdb_client::decode_manifest_b64(b64) {
             Ok(m) => Some(Arc::new(m)),
             Err(e) => {
-                debug!(cache_key = cache_key_str, error = %e, "header manifest decode failed, will fetch from ES");
+                debug!(cache_key = cache_key_str, error = %e, "header manifest decode failed, will fetch from FDB");
                 None
             }
         }
@@ -325,7 +325,7 @@ async fn handle_conditional_revalidation(
         client_range,
         &state.downloads,
         &state.trace,
-        state.es_client.clone(),
+        state.fdb_client.clone(),
         &state.http_pool,
         state.s3.clone(),
         state.disk_cache.clone(),
@@ -335,7 +335,7 @@ async fn handle_conditional_revalidation(
 
     // Resolve the manifest from the header (for cache-hit serving on 304/stale-error)
     let header_manifest = contract.manifest_b64.as_deref().and_then(|b64| {
-        match crate::es_client::decode_manifest_b64(b64) {
+        match crate::fdb_client::decode_manifest_b64(b64) {
             Ok(m) => Some(Arc::new(m)),
             Err(e) => {
                 debug!(cache_key, error = %e, "header manifest decode failed in revalidation");
@@ -423,7 +423,7 @@ async fn handle_cache_hit(
 
     let s3 = state.s3.clone();
     let disk_cache = state.disk_cache.clone();
-    let es_client = state.es_client.clone();
+    let fdb_client = state.fdb_client.clone();
 
     let chunks_meta: Vec<(usize, [u8; 16], u64)> = chunk_range.clone().map(|idx| {
         let id = manifest.chunk_ids[idx];
@@ -482,7 +482,7 @@ async fn handle_cache_hit(
         serve_len,
         s3,
         disk_cache,
-        es_client,
+        fdb_client,
         data_prefix,
         cache_key_owned,
         all_chunk_ids,
@@ -505,7 +505,7 @@ fn make_cache_hit_stream(
     read_len: u64,
     s3: Option<Arc<S3Client>>,
     disk_cache: Option<Arc<DiskCache>>,
-    es_client: Option<Arc<EsClient>>,
+    fdb_client: Option<Arc<FdbClient>>,
     data_prefix: String,
     cache_key: String,
     all_chunk_ids: Vec<[u8; 16]>,
@@ -612,15 +612,15 @@ fn make_cache_hit_stream(
                             "S3 chunk missing during cache hit: {msg}"
                         );
                         // Cleanup in background
-                        let es = es_client.clone();
+                        let fdb = fdb_client.clone();
                         let s3c = s3.clone();
                         let ck = cache_key.clone();
                         let ids = all_chunk_ids.clone();
                         let prefix = data_prefix.clone();
                         tokio::spawn(async move {
-                            if let (Some(es), Some(s3c)) = (es, s3c) {
+                            if let (Some(fdb), Some(s3c)) = (fdb, s3c) {
                                 s3_client::cleanup_corrupt_manifest(
-                                    &es, &s3c, &ck, &ids, &prefix,
+                                    &fdb, &s3c, &ck, &ids, &prefix,
                                 ).await;
                             }
                         });
@@ -737,13 +737,13 @@ fn make_cache_hit_stream(
     }
 }
 
-/// Fetch manifest from Elasticsearch.
+/// Fetch manifest from FoundationDB.
 async fn fetch_manifest(
     state: &AppState,
     cache_key: &str,
 ) -> ProxyResult<Arc<Manifest>> {
-    let manifest = if let Some(ref es) = state.es_client {
-        es.get_manifest(cache_key).await?
+    let manifest = if let Some(ref fdb) = state.fdb_client {
+        fdb.get_manifest(cache_key).await?
     } else {
         None
     };
@@ -808,7 +808,7 @@ async fn handle_upstream_path(
         client_range,
         &state.downloads,
         &state.trace,
-        state.es_client.clone(),
+        state.fdb_client.clone(),
         &state.http_pool,
         state.s3.clone(),
         state.disk_cache.clone(),

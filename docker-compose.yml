@@ -15,16 +15,14 @@ services:
       timeout: 5s
       retries: 10
 
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:9.0.0
+  foundationdb:
+    image: foundationdb/foundationdb:7.3.63
     ports:
-      - "9200:9200"
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms256m -Xmx256m"
+      - "4500:4500"
+    volumes:
+      - fdb-data:/var/fdb/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      test: ["CMD", "fdbcli", "--exec", "status minimal"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -46,16 +44,19 @@ services:
       - XS3_CACHE_DIR=/cache
       - XS3_HTTP_CONCURRENCY=4
       - XS3_CHUNK_SIZE=5m
-      - XS3_ELASTICSEARCH_URL=http://elasticsearch:9200
+      - XS3_FDB_CLUSTER_FILE=/var/fdb/fdb.cluster
     tmpfs:
       - /cache:size=1G
+    volumes:
+      - fdb-data:/var/fdb:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       localstack:
         condition: service_healthy
-      elasticsearch:
+      foundationdb:
         condition: service_healthy
 
 volumes:
   localstack-data:
+  fdb-data:

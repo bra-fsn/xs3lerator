@@ -2,7 +2,7 @@ pub mod config;
 pub mod disk_cache;
 pub mod download;
 pub mod error;
-pub mod es_client;
+pub mod fdb_client;
 pub mod finalize;
 pub mod handler;
 pub mod headers;

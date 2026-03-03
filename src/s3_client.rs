@@ -9,7 +9,7 @@ use object_store::{GetResultPayload, ObjectStore, PutPayload};
 use tracing::{debug, warn};
 
 use crate::error::ProxyError;
-use crate::es_client::EsClient;
+use crate::fdb_client::FdbClient;
 use crate::manifest::{id_to_s3_key, ID_LEN};
 
 /// Wrapper around `object_store::aws::AmazonS3` providing chunk-level ops.
@@ -114,16 +114,16 @@ impl S3Client {
     }
 }
 
-/// Cleanup a corrupt/orphaned manifest: clear from ES and delete all S3 chunks.
+/// Cleanup a corrupt/orphaned manifest: clear from FDB and delete all S3 chunks.
 pub async fn cleanup_corrupt_manifest(
-    es_client: &EsClient,
+    fdb_client: &FdbClient,
     s3_client: &S3Client,
     cache_key: &str,
     chunk_ids: &[[u8; ID_LEN]],
     prefix: &str,
 ) {
-    if let Err(e) = es_client.clear_manifest(cache_key).await {
-        warn!(cache_key, "failed to clear manifest from ES: {e}");
+    if let Err(e) = fdb_client.clear_manifest(cache_key).await {
+        warn!(cache_key, "failed to clear manifest from FDB: {e}");
     }
 
     debug!(

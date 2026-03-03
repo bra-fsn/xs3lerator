@@ -15,7 +15,7 @@ use crate::download::{
     DownloadManager, InFlightDownload,
 };
 use crate::error::ProxyError;
-use crate::es_client::EsClient;
+use crate::fdb_client::FdbClient;
 use crate::finalize;
 use crate::headers::{filter_upstream_headers, ContractHeaders};
 use crate::http_pool::HttpClientPool;
@@ -67,7 +67,7 @@ pub async fn fetch_upstream(
     client_range: Option<&str>,
     downloads: &Arc<DownloadManager>,
     trace: &Option<Arc<TraceWriter>>,
-    es_client: Option<Arc<EsClient>>,
+    fdb_client: Option<Arc<FdbClient>>,
     http_pool: &HttpClientPool,
     s3_client: Option<Arc<S3Client>>,
     disk_cache: Option<Arc<DiskCache>>,
@@ -280,7 +280,7 @@ pub async fn fetch_upstream(
                 last_modified,
                 cache_control,
                 Some(all_upstream_headers),
-                es_client.clone(),
+                fdb_client.clone(),
                 s3_client.clone(),
                 disk_cache.clone(),
             )
@@ -299,7 +299,7 @@ pub async fn fetch_upstream(
             last_modified,
             cache_control,
             Some(all_upstream_headers),
-            es_client,
+            fdb_client,
             s3_client,
             disk_cache,
         )
@@ -320,7 +320,7 @@ pub async fn fetch_upstream(
         last_modified,
         cache_control,
         Some(all_upstream_headers),
-        es_client,
+        fdb_client,
         s3_client,
         disk_cache,
     )
@@ -344,7 +344,7 @@ async fn start_parallel_upstream_download(
     last_modified: Option<String>,
     cache_control: Option<String>,
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
-    es_client: Option<Arc<EsClient>>,
+    fdb_client: Option<Arc<FdbClient>>,
     s3_client: Option<Arc<S3Client>>,
     disk_cache: Option<Arc<DiskCache>>,
 ) -> Result<UpstreamResult, ProxyError> {
@@ -415,7 +415,7 @@ async fn start_parallel_upstream_download(
         finalize::spawn_finalize(
             key.to_string(),
             download.clone(),
-            es_client,
+            fdb_client,
         );
     }
 
@@ -998,7 +998,7 @@ async fn start_sequential_download(
     last_modified: Option<String>,
     cache_control: Option<String>,
     all_upstream_headers: Option<reqwest::header::HeaderMap>,
-    es_client: Option<Arc<EsClient>>,
+    fdb_client: Option<Arc<FdbClient>>,
     s3_client: Option<Arc<S3Client>>,
     disk_cache: Option<Arc<DiskCache>>,
 ) -> Result<UpstreamResult, ProxyError> {
@@ -1073,7 +1073,7 @@ async fn start_sequential_download(
         finalize::spawn_finalize(
             key.to_string(),
             download.clone(),
-            es_client.clone(),
+            fdb_client.clone(),
         );
     }
 

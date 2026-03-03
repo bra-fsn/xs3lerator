@@ -18,11 +18,11 @@ const DEFAULT_UPSTREAM_READ_TIMEOUT: u64 = 300;
 ///
 /// The URL path encodes the upstream URL to fetch.  An optional
 /// `X-Xs3lerator-Cache-Key` header enables the caching layer
-/// (Elasticsearch manifest + content-addressed S3 chunks + local disk cache).
+/// (FoundationDB manifest + content-addressed S3 chunks + local disk cache).
 /// Without it, xs3lerator acts as a pure download accelerator.
 ///
 /// In `--passthrough` mode, the caching layer is fully disabled:
-/// no Elasticsearch connection, no S3, no cache directory.
+/// no FoundationDB connection, no S3, no cache directory.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "xs3lerator", version, about, long_about = None)]
 pub struct CliArgs {
@@ -102,16 +102,12 @@ pub struct CliArgs {
     #[arg(long, env = "XS3_DATA_PREFIX", default_value = "data/")]
     pub data_prefix: String,
 
-    /// Elasticsearch URL for manifest storage.
-    #[arg(long, env = "XS3_ELASTICSEARCH_URL")]
-    pub elasticsearch_url: Option<String>,
-
-    /// Elasticsearch index name.
-    #[arg(long, env = "XS3_ELASTICSEARCH_INDEX", default_value = "passsage_meta")]
-    pub elasticsearch_manifest_index: String,
+    /// Path to FoundationDB cluster file for manifest storage.
+    #[arg(long, env = "XS3_FDB_CLUSTER_FILE")]
+    pub fdb_cluster_file: Option<String>,
 
     /// Passthrough-only mode: disable all caching infrastructure.
-    /// No Elasticsearch, no S3, no cache directory.
+    /// No FoundationDB, no S3, no cache directory.
     /// xs3lerator acts as a pure parallel download accelerator.
     #[arg(long, env = "XS3_PASSTHROUGH", default_value_t = false)]
     pub passthrough: bool,
@@ -134,8 +130,7 @@ pub struct AppConfig {
     pub upstream_connect_timeout: Duration,
     pub upstream_read_timeout: Option<Duration>,
     pub data_prefix: String,
-    pub elasticsearch_url: Option<String>,
-    pub elasticsearch_manifest_index: String,
+    pub fdb_cluster_file: Option<String>,
     pub passthrough: bool,
 }
 
@@ -156,8 +151,8 @@ impl TryFrom<CliArgs> for AppConfig {
 
         if args.passthrough {
             anyhow::ensure!(
-                args.elasticsearch_url.is_none(),
-                "--elasticsearch-url is incompatible with --passthrough"
+                args.fdb_cluster_file.is_none(),
+                "--fdb-cluster-file is incompatible with --passthrough"
             );
         }
 
@@ -198,8 +193,7 @@ impl TryFrom<CliArgs> for AppConfig {
                 Some(Duration::from_secs(args.upstream_read_timeout))
             },
             data_prefix: args.data_prefix,
-            elasticsearch_url: args.elasticsearch_url,
-            elasticsearch_manifest_index: args.elasticsearch_manifest_index,
+            fdb_cluster_file: args.fdb_cluster_file,
             passthrough: args.passthrough,
         })
     }
@@ -241,12 +235,12 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_rejects_elasticsearch() {
+    fn passthrough_rejects_fdb() {
         let args = CliArgs::parse_from([
             "xs3lerator",
             "--passthrough",
-            "--elasticsearch-url",
-            "http://localhost:9200",
+            "--fdb-cluster-file",
+            "/etc/foundationdb/fdb.cluster",
         ]);
         assert!(AppConfig::try_from(args).is_err());
     }
