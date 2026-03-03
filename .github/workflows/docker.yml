@@ -22,6 +22,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install FoundationDB client
+        run: |
+          curl -fsSL https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_amd64.deb -o /tmp/fdb-clients.deb
+          sudo dpkg -i /tmp/fdb-clients.deb
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
