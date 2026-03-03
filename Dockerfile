@@ -29,7 +29,8 @@ RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 # Tell cargo which linker to use for each musl target
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-gnu-gcc \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-    CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
+    CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
+    RUSTFLAGS="-L /usr/lib"
 
 WORKDIR /app
 
