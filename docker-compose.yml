@@ -19,12 +19,16 @@ services:
     image: foundationdb/foundationdb:7.3.63
     ports:
       - "4500:4500"
+    environment:
+      - FDB_NETWORKING_MODE=container
+      - FDB_COORDINATOR_PORT=4500
     volumes:
       - fdb-data:/var/fdb/data
+      - fdb-config:/var/fdb/shared
     healthcheck:
-      test: ["CMD", "fdbcli", "--exec", "status minimal"]
+      test: ["CMD-SHELL", "cp -f /var/fdb/fdb.cluster /var/fdb/shared/fdb.cluster 2>/dev/null; fdbcli --exec 'status minimal' 2>/dev/null | grep -q 'The database is available' || (fdbcli --exec 'configure new single ssd' >/dev/null 2>&1; false)"]
       interval: 5s
-      timeout: 5s
+      timeout: 10s
       retries: 20
 
   xs3lerator:
@@ -44,11 +48,11 @@ services:
       - XS3_CACHE_DIR=/cache
       - XS3_HTTP_CONCURRENCY=4
       - XS3_CHUNK_SIZE=5m
-      - XS3_FDB_CLUSTER_FILE=/var/fdb/fdb.cluster
+      - XS3_FDB_CLUSTER_FILE=/var/fdb/shared/fdb.cluster
     tmpfs:
       - /cache:size=1G
     volumes:
-      - fdb-data:/var/fdb:ro
+      - fdb-config:/var/fdb/shared:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -60,3 +64,4 @@ services:
 volumes:
   localstack-data:
   fdb-data:
+  fdb-config:
