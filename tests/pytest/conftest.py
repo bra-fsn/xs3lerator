@@ -125,7 +125,7 @@ def fdb_database():
     try:
         db = fdb.open(FDB_CLUSTER_FILE)
         tr = db.create_transaction()
-        tr.get(b'\xff').wait()
+        tr.get(b'\x00').wait()
     except Exception:
         pytest.skip("FoundationDB not reachable")
     return db
