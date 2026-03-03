@@ -15,6 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install FoundationDB client
+        run: |
+          ARCH=$(dpkg --print-architecture)
+          case "$ARCH" in amd64) FDB_ARCH=amd64 ;; arm64) FDB_ARCH=aarch64 ;; *) echo "unsupported: $ARCH" && exit 1 ;; esac
+          curl -fsSL "https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_${FDB_ARCH}.deb" -o /tmp/fdb-clients.deb
+          sudo dpkg -i /tmp/fdb-clients.deb
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -57,6 +64,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install FoundationDB client
+        run: |
+          ARCH=$(dpkg --print-architecture)
+          case "$ARCH" in amd64) FDB_ARCH=amd64 ;; arm64) FDB_ARCH=aarch64 ;; *) echo "unsupported: $ARCH" && exit 1 ;; esac
+          curl -fsSL "https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_${FDB_ARCH}.deb" -o /tmp/fdb-clients.deb
+          sudo dpkg -i /tmp/fdb-clients.deb
+
       - name: Install Python dependencies
         run: pip install -r tests/pytest/requirements.txt
 
@@ -65,7 +79,7 @@ jobs:
         env:
           PROXY_URL: http://localhost:8888
           LOCALSTACK_ENDPOINT: http://localhost:4566
-          ELASTICSEARCH_URL: http://localhost:9200
+          FDB_CLUSTER_FILE: /tmp/fdb.cluster
           TEST_SERVER_BIND_HOST: "0.0.0.0"
           TEST_SERVER_HOST: host.docker.internal
 

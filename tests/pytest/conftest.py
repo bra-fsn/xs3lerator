@@ -1,19 +1,18 @@
 """Fixtures for xs3lerator integration tests.
 
-Requires Docker Compose: all services (LocalStack, Elasticsearch,
+Requires Docker Compose: all services (LocalStack, FoundationDB,
 xs3lerator) must be running.  The test server runs on the host and is
 reached by the xs3lerator container via host.docker.internal.
 
 Environment variables:
     PROXY_URL              xs3lerator base URL (required)
     LOCALSTACK_ENDPOINT    S3 endpoint        (default: http://localhost:4566)
-    ELASTICSEARCH_URL      ES endpoint        (default: http://localhost:9200)
+    FDB_CLUSTER_FILE       FDB cluster file   (default: None, uses system default)
     TEST_SERVER_BIND_HOST  Bind address        (default: 0.0.0.0)
     TEST_SERVER_HOST       Host xs3lerator uses to reach the test server
                            (default: host.docker.internal)
 """
 
-import base64
 import os
 import socket
 import struct
@@ -21,6 +20,8 @@ import time
 from urllib.parse import quote as url_quote
 
 import boto3
+import fdb
+import msgpack
 import pytest
 import requests
 
@@ -32,11 +33,15 @@ from test_server import TestServer, generate_payload  # noqa: F401 (re-export)
 
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8888")
 LOCALSTACK_ENDPOINT = os.environ.get("LOCALSTACK_ENDPOINT", "http://localhost:4566")
-ELASTICSEARCH_URL = os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200")
-ES_MANIFEST_INDEX = "passsage_meta"
+FDB_CLUSTER_FILE = os.environ.get("FDB_CLUSTER_FILE", None)
 TEST_SERVER_BIND_HOST = os.environ.get("TEST_SERVER_BIND_HOST", "0.0.0.0")
 TEST_SERVER_HOST = os.environ.get("TEST_SERVER_HOST", "host.docker.internal")
 TEST_BUCKET = "xs3lerator-test"
+
+MANIFEST_PREFIX = b'\x03'
+SPLIT_VALUE_CHUNK = 90_000
+
+fdb.api_version(730)
 
 
 def _free_port() -> int:
@@ -59,62 +64,43 @@ def _wait_for_url(url: str, timeout: float = 30.0, interval: float = 0.5):
 
 
 # ---------------------------------------------------------------------------
-# Elasticsearch helpers
+# FoundationDB helpers
 # ---------------------------------------------------------------------------
 
 
-def _es_doc_url(es_url: str, index: str, doc_id: str) -> str:
-    encoded_id = url_quote(doc_id, safe="")
-    return f"{es_url}/{index}/_doc/{encoded_id}"
+def _manifest_key(cache_key: str) -> bytes:
+    return MANIFEST_PREFIX + cache_key.encode("utf-8")
 
 
-def es_get_manifest_b64(es_url: str, index: str, doc_id: str) -> str | None:
-    """Fetch manifest_b64 from Elasticsearch, return None if not found."""
-    url = _es_doc_url(es_url, index, doc_id)
-    resp = requests.get(url, timeout=5)
-    if resp.status_code == 404:
+def fdb_get_manifest(db, cache_key: str) -> bytes | None:
+    """Fetch a (possibly split) manifest from FDB. Returns raw bytes or None."""
+    key = _manifest_key(cache_key)
+    end_key = key + b'\xff'
+    tr = db.create_transaction()
+    result = list(tr.get_range(key, end_key))
+    if not result:
         return None
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("found"):
-        return None
-    return data["_source"]["manifest_b64"]
+    return b''.join(bytes(kv.value) for kv in result)
 
 
-def es_put_manifest(es_url: str, index: str, doc_id: str, manifest_bytes: bytes):
-    """Write a manifest to Elasticsearch."""
-    url = _es_doc_url(es_url, index, doc_id)
-    b64 = base64.b64encode(manifest_bytes).decode()
-    resp = requests.put(
-        url,
-        json={"manifest_b64": b64},
-        headers={"Content-Type": "application/json"},
-        timeout=5,
-    )
-    resp.raise_for_status()
-    requests.post(f"{es_url}/{index}/_refresh", timeout=5)
+def fdb_put_manifest(db, cache_key: str, manifest_bytes: bytes):
+    """Write a manifest to FDB with value splitting."""
+    key = _manifest_key(cache_key)
+    end_key = key + b'\xff'
 
+    @fdb.transactional
+    def do_put(tr):
+        tr.clear_range(key, end_key)
+        chunks = [manifest_bytes[i:i + SPLIT_VALUE_CHUNK]
+                  for i in range(0, len(manifest_bytes), SPLIT_VALUE_CHUNK)]
+        if len(chunks) <= 1:
+            tr[key] = manifest_bytes
+        else:
+            tr[key] = chunks[0]
+            for i, chunk in enumerate(chunks[1:]):
+                tr[key + bytes([i])] = chunk
 
-def es_create_index(es_url: str, index: str):
-    """Create the ES manifest index if it doesn't exist."""
-    url = f"{es_url}/{index}"
-    body = {
-        "settings": {
-            "number_of_shards": 1,
-            "number_of_replicas": 0,
-            "refresh_interval": "1s",
-        },
-        "mappings": {
-            "dynamic": False,
-            "properties": {
-                "manifest_b64": {"type": "keyword", "index": False, "doc_values": False}
-            },
-        },
-    }
-    resp = requests.put(url, json=body, timeout=5)
-    if resp.status_code == 400 and "resource_already_exists_exception" in resp.text:
-        return
-    resp.raise_for_status()
+    do_put(db)
 
 
 # ---------------------------------------------------------------------------
@@ -134,15 +120,15 @@ def localstack_endpoint():
 
 
 @pytest.fixture(scope="session")
-def elasticsearch_url():
-    """Return the Elasticsearch URL, skipping if not reachable."""
+def fdb_database():
+    """Return an FDB Database handle, skipping if not reachable."""
     try:
-        resp = requests.get(ELASTICSEARCH_URL, timeout=3)
-        resp.raise_for_status()
+        db = fdb.open(FDB_CLUSTER_FILE)
+        tr = db.create_transaction()
+        tr.get(b'\x00').wait()
     except Exception:
-        pytest.skip(f"Elasticsearch not reachable at {ELASTICSEARCH_URL}")
-    es_create_index(ELASTICSEARCH_URL, ES_MANIFEST_INDEX)
-    return ELASTICSEARCH_URL
+        pytest.skip("FoundationDB not reachable")
+    return db
 
 
 @pytest.fixture(scope="session")
@@ -165,7 +151,7 @@ def test_bucket(s3_client):
     except s3_client.exceptions.BucketAlreadyOwnedByYou:
         pass
     except Exception:
-        pass  # bucket may already exist
+        pass
     return TEST_BUCKET
 
 
@@ -189,7 +175,7 @@ def test_server_external_url(test_server):
 
 
 @pytest.fixture(scope="session")
-def proxy(localstack_endpoint, elasticsearch_url, test_bucket, test_server):
+def proxy(localstack_endpoint, fdb_database, test_bucket, test_server):
     """Wait for xs3lerator to be ready and return its base URL."""
     _wait_for_url(f"{PROXY_URL}/healthz", timeout=60)
     return PROXY_URL
@@ -297,25 +283,25 @@ def seed_cached_object(
     key: str,
     payload: bytes,
     chunk_size: int = CHUNK_SIZE,
-    es_url: str = ELASTICSEARCH_URL,
-    es_index: str = ES_MANIFEST_INDEX,
+    fdb_db=None,
 ):
-    """Upload chunks to S3 and write manifest to ES for cache-hit tests."""
+    """Upload chunks to S3 and write manifest to FDB for cache-hit tests."""
     manifest_bytes, chunks = build_manifest(payload, chunk_size)
 
     for chunk_id, chunk_data in chunks:
         s3_key = _chunk_s3_key(chunk_id)
         s3_client.put_object(Bucket=bucket, Key=s3_key, Body=chunk_data)
 
-    es_put_manifest(es_url, es_index, key, manifest_bytes)
+    if fdb_db is not None:
+        fdb_put_manifest(fdb_db, key, manifest_bytes)
 
 
 @pytest.fixture(scope="session")
-def seed_object(s3_client, test_bucket, elasticsearch_url):
+def seed_object(s3_client, test_bucket, fdb_database):
     """Factory fixture for seeding content-addressed objects."""
     def _seed(key: str, payload: bytes, chunk_size: int = CHUNK_SIZE):
         seed_cached_object(
             s3_client, test_bucket, key, payload, chunk_size,
-            es_url=elasticsearch_url, es_index=ES_MANIFEST_INDEX,
+            fdb_db=fdb_database,
         )
     return _seed

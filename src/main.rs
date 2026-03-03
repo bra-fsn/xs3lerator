@@ -11,7 +11,7 @@ mod config;
 mod disk_cache;
 mod download;
 mod error;
-mod es_client;
+mod fdb_client;
 mod finalize;
 mod handler;
 mod headers;
@@ -55,15 +55,17 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(TraceWriter::new(Box::new(file)))
     });
 
-    let es_client = if config.passthrough {
+    let _fdb_guard = if !config.passthrough && config.fdb_cluster_file.is_some() {
+        Some(unsafe { fdb_client::boot() })
+    } else {
         None
-    } else if let Some(ref es_url) = config.elasticsearch_url {
-        let client = es_client::EsClient::new(es_url, &config.elasticsearch_manifest_index);
-        info!(
-            url = es_url,
-            index = config.elasticsearch_manifest_index,
-            "Elasticsearch client initialized (index managed by passsage)"
-        );
+    };
+
+    let fdb_client = if config.passthrough {
+        None
+    } else if let Some(ref cluster_file) = config.fdb_cluster_file {
+        let client = fdb_client::FdbClient::new(Some(cluster_file.as_str()))?;
+        info!(cluster_file, "FoundationDB client initialized");
         Some(Arc::new(client))
     } else {
         None
@@ -104,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(config.clone()),
         downloads: Arc::new(download::DownloadManager::default()),
         trace: trace_writer,
-        es_client,
+        fdb_client,
         http_pool: Arc::new(http_pool::HttpClientPool::new()),
         s3: s3,
         disk_cache,

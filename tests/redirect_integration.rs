@@ -28,8 +28,7 @@ fn test_config() -> AppConfig {
         upstream_connect_timeout: std::time::Duration::from_secs(30),
         upstream_read_timeout: Some(std::time::Duration::from_secs(300)),
         data_prefix: "data/".to_string(),
-        elasticsearch_url: None,
-        elasticsearch_manifest_index: "passsage_meta".to_string(),
+        fdb_cluster_file: None,
         passthrough: false,
     }
 }
@@ -141,7 +140,7 @@ fn make_state() -> AppState {
         config: Arc::new(config),
         downloads: Arc::new(DownloadManager::default()),
         trace: None,
-        es_client: None,
+        fdb_client: None,
         http_pool: Arc::new(xs3lerator::http_pool::HttpClientPool::new()),
         s3: None,
         disk_cache: None,

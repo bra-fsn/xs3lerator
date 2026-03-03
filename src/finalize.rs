@@ -5,18 +5,18 @@ use tracing::{debug, error};
 
 use crate::download::InFlightDownload;
 use crate::error::ProxyError;
-use crate::es_client::EsClient;
+use crate::fdb_client::FdbClient;
 use crate::manifest::Manifest;
 
 /// Spawn a background task that waits for all chunks to be S3-committed,
-/// then writes the manifest to Elasticsearch.
+/// then writes the manifest to FoundationDB.
 pub fn spawn_finalize(
     cache_key: String,
     download: Arc<InFlightDownload>,
-    es_client: Option<Arc<EsClient>>,
+    fdb_client: Option<Arc<FdbClient>>,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = run_finalize(&cache_key, &download, es_client.as_deref()).await {
+        if let Err(e) = run_finalize(&cache_key, &download, fdb_client.as_deref()).await {
             error!(key = cache_key, "finalize pipeline failed: {e}");
             download.mark_failed();
         }
@@ -26,7 +26,7 @@ pub fn spawn_finalize(
 async fn run_finalize(
     key: &str,
     download: &InFlightDownload,
-    es_client: Option<&EsClient>,
+    fdb_client: Option<&FdbClient>,
 ) -> Result<(), ProxyError> {
     // For unknown-size (chunked) responses, wait until stream finishes
     // to know the actual number of chunks.
@@ -82,8 +82,8 @@ async fn run_finalize(
         chunk_ids,
     };
 
-    if let Some(es) = es_client {
-        es.put_manifest(key, manifest.serialize()).await?;
+    if let Some(fdb) = fdb_client {
+        fdb.put_manifest(key, manifest.serialize()).await?;
     }
 
     download.s3_upload_complete.store(true, Ordering::Release);

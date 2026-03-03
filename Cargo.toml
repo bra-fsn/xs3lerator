@@ -40,6 +40,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 io-uring = "0.7"
+foundationdb = { version = "0.10", features = ["embedded-fdb-include", "fdb-7_3"] }
 
 [profile.release]
 strip = true
