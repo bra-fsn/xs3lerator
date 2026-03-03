@@ -65,7 +65,7 @@ FROM ubuntu:24.04
 ARG TARGETARCH
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && apt-get install -y --no-install-recommends curl ca-certificates adduser \
     && case "$TARGETARCH" in \
          amd64) FDB_ARCH=amd64 ;; \
          arm64) FDB_ARCH=arm64 ;; \
