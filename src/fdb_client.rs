@@ -55,14 +55,13 @@ impl FdbClient {
             .await
             .map_err(|e| ProxyError::Internal(format!("FDB get_range: {e}")))?;
 
-        let kvs = result.key_values();
-        if kvs.is_empty() {
+        if result.is_empty() {
             return Ok(None);
         }
 
-        let total_len: usize = kvs.iter().map(|kv| kv.value().len()).sum();
+        let total_len: usize = result.iter().map(|kv| kv.value().len()).sum();
         let mut data = Vec::with_capacity(total_len);
-        for kv in kvs {
+        for kv in result.iter() {
             data.extend_from_slice(kv.value());
         }
 
