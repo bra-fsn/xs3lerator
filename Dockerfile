@@ -17,6 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         musl-tools \
         gcc-aarch64-linux-gnu \
         libc6-dev-arm64-cross \
+        curl \
+    && curl -fsSL https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_amd64.deb -o /tmp/fdb-clients.deb \
+    && dpkg -i /tmp/fdb-clients.deb \
+    && rm /tmp/fdb-clients.deb \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
@@ -58,8 +62,23 @@ RUN case "$TARGETARCH" in \
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 # Ubuntu base so the image has a shell for debugging (e.g. docker run -it --entrypoint /bin/bash ...).
-# Binary is static (musl), so no runtime libc dependency.
+# Binary is musl-linked for the application code; libfdb_c.so is loaded at
+# runtime by the foundationdb crate.
 FROM ubuntu:24.04
+
+ARG TARGETARCH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && case "$TARGETARCH" in \
+         amd64) FDB_ARCH=amd64 ;; \
+         arm64) FDB_ARCH=arm64 ;; \
+       esac \
+    && curl -fsSL "https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_${FDB_ARCH}.deb" -o /tmp/fdb-clients.deb \
+    && dpkg -i /tmp/fdb-clients.deb \
+    && rm /tmp/fdb-clients.deb \
+    && apt-get purge -y --auto-remove curl \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /xs3lerator /usr/local/bin/xs3lerator
 
