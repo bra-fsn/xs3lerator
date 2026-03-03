@@ -51,7 +51,7 @@ impl FdbClient {
 
         let range_opt = RangeOption::from((begin.as_slice(), end.as_slice()));
         let result = trx
-            .get_range(&range_opt, 0, false)
+            .get_range(&range_opt, 1, false)
             .await
             .map_err(|e| ProxyError::Internal(format!("FDB get_range: {e}")))?;
 
