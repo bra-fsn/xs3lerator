@@ -34,6 +34,16 @@ struct ClearManifestDoc {
     manifest_b64: Option<String>,
 }
 
+#[derive(Serialize)]
+struct StoredAtUpdateBody {
+    doc: StoredAtDoc,
+}
+
+#[derive(Serialize)]
+struct StoredAtDoc {
+    stored_at: String,
+}
+
 #[derive(Deserialize)]
 struct EsGetResponse {
     #[serde(default)]
@@ -173,6 +183,45 @@ impl EsClient {
         debug!(key, "manifest_b64 cleared from ES");
         Ok(())
     }
+
+    /// Refresh the `stored_at` timestamp to "now" for a cache entry.
+    ///
+    /// Used by background revalidation: when upstream returns 304 Not Modified,
+    /// the content hasn't changed but we reset the freshness clock so passsage
+    /// considers the entry fresh on the next request.
+    pub async fn refresh_stored_at(&self, key: &str) -> Result<(), ProxyError> {
+        use std::time::SystemTime;
+
+        let secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let now = format_unix_as_iso8601(secs);
+        let body = StoredAtUpdateBody {
+            doc: StoredAtDoc { stored_at: now },
+        };
+        let url = format!("{}?retry_on_conflict=3", self.update_url(key));
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal(format!("ES refresh_stored_at: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProxyError::Internal(format!(
+                "ES refresh_stored_at {status}: {body}"
+            )));
+        }
+
+        debug!(key, "stored_at refreshed in ES");
+        Ok(())
+    }
 }
 
 /// Decode a base64 manifest string into a Manifest struct.
@@ -197,6 +246,33 @@ fn percent_encode_id(id: &str) -> String {
         }
     }
     out
+}
+
+/// Format a UNIX timestamp as an ISO 8601 UTC string (e.g. "2026-03-05T09:50:00+00:00").
+/// Compatible with Python's `datetime.fromisoformat()`.
+fn format_unix_as_iso8601(epoch_secs: u64) -> String {
+    let total_secs = epoch_secs;
+    let secs_of_day = (total_secs % 86400) as u32;
+    let z = (total_secs / 86400) as i64 + 719468;
+
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
+        year, month, day, hour, minute, second
+    )
 }
 
 #[cfg(test)]
@@ -259,5 +335,30 @@ mod tests {
         );
         assert_eq!(json["doc_as_upsert"], true);
         assert_eq!(json["doc"]["manifest_b64"], "dGVzdA==");
+    }
+
+    #[test]
+    fn format_unix_epoch_zero() {
+        assert_eq!(format_unix_as_iso8601(0), "1970-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn format_unix_known_date() {
+        // 2026-03-05T09:50:00 UTC = 1772704200
+        assert_eq!(
+            format_unix_as_iso8601(1772704200),
+            "2026-03-05T09:50:00+00:00"
+        );
+    }
+
+    #[test]
+    fn stored_at_update_body_serializes() {
+        let body = StoredAtUpdateBody {
+            doc: StoredAtDoc {
+                stored_at: "2026-03-05T09:50:00+00:00".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["doc"]["stored_at"], "2026-03-05T09:50:00+00:00");
     }
 }

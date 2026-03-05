@@ -31,6 +31,10 @@ pub struct ContractHeaders {
     /// When true, serve cached content on upstream errors instead of passing
     /// the error through to the caller.
     pub stale_if_error: bool,
+    /// When true, serve from cache immediately and revalidate upstream in the
+    /// background. Requires `if_none_match` to be set. xs3lerator returns the
+    /// cached response right away, then spawns an async task to revalidate.
+    pub background_revalidate: bool,
     /// Per-request connect timeout override (seconds). Takes precedence over
     /// the server-wide --upstream-connect-timeout default.
     pub connect_timeout: Option<Duration>,
@@ -48,6 +52,7 @@ const HEADER_MANIFEST: &str = "x-xs3lerator-manifest";
 const HEADER_IF_NONE_MATCH: &str = "x-xs3lerator-if-none-match";
 const HEADER_IF_MODIFIED_SINCE: &str = "x-xs3lerator-if-modified-since";
 const HEADER_STALE_IF_ERROR: &str = "x-xs3lerator-stale-if-error";
+const HEADER_BACKGROUND_REVALIDATE: &str = "x-xs3lerator-background-revalidate";
 const HEADER_CONNECT_TIMEOUT: &str = "x-xs3lerator-connect-timeout";
 const HEADER_READ_TIMEOUT: &str = "x-xs3lerator-read-timeout";
 
@@ -64,6 +69,8 @@ pub const RESP_DEGRADED: &str = "x-xs3lerator-degraded";
 /// Response header: conditional revalidation result.
 /// Values: "true" (304 from upstream), "stale-error" (upstream error, served cached).
 pub const RESP_REVALIDATED: &str = "x-xs3lerator-revalidated";
+/// Response header: background revalidation accepted.
+pub const RESP_BACKGROUND_REVALIDATE: &str = "x-xs3lerator-background-revalidate";
 
 /// Parse contract headers from an incoming request.
 pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
@@ -120,6 +127,12 @@ pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    let background_revalidate = headers
+        .get(HEADER_BACKGROUND_REVALIDATE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     let connect_timeout = headers
         .get(HEADER_CONNECT_TIMEOUT)
         .and_then(|v| v.to_str().ok())
@@ -143,6 +156,7 @@ pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
         if_none_match,
         if_modified_since,
         stale_if_error,
+        background_revalidate,
         connect_timeout,
         read_timeout,
     }
@@ -271,6 +285,7 @@ mod tests {
         assert!(c.if_none_match.is_none());
         assert!(c.if_modified_since.is_none());
         assert!(!c.stale_if_error);
+        assert!(!c.background_revalidate);
     }
 
     #[test]

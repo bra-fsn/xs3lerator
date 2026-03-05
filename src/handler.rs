@@ -19,7 +19,7 @@ use crate::error::{ProxyError, ProxyResult};
 use crate::es_client::EsClient;
 use crate::headers::{
     self, parse_upstream_url, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
-    RESP_REVALIDATED,
+    RESP_REVALIDATED, RESP_BACKGROUND_REVALIDATE,
 };
 use crate::http_pool::HttpClientPool;
 use crate::manifest::Manifest;
@@ -238,6 +238,20 @@ pub async fn handle_get(
     // upstream. We send the conditional GET, and on 304 or upstream error
     // (with stale_if_error) serve from the existing S3 cache.
     if contract.if_none_match.is_some() {
+        // Background revalidation: serve cache hit immediately, spawn async revalidation
+        if contract.background_revalidate {
+            return handle_background_revalidation(
+                &state,
+                &contract,
+                &headers,
+                &upstream_url,
+                cache_key_str,
+                client_range_header.as_deref(),
+            )
+            .await
+            .map(|resp| { log_access("GET", log_key, &resp); resp });
+        }
+
         return handle_conditional_revalidation(
             &state,
             &contract,
@@ -398,7 +412,99 @@ async fn handle_conditional_revalidation(
     }
 }
 
-/// Serve from cache: try local disk first, fall back to streaming from S3
+/// Handle a background-revalidation request: serve the cache hit immediately
+/// and spawn an async task that revalidates with the upstream origin.
+///
+/// On 304 from upstream: refreshes `stored_at` in ES (resets freshness clock).
+/// On 200 from upstream: processes the new content as a normal download.
+/// On error: logs and ignores (stale entry remains).
+async fn handle_background_revalidation(
+    state: &AppState,
+    contract: &headers::ContractHeaders,
+    client_headers: &HeaderMap,
+    upstream_url: &str,
+    cache_key: &str,
+    client_range: Option<&str>,
+) -> ProxyResult<Response> {
+    let header_manifest = contract.manifest_b64.as_deref().and_then(|b64| {
+        match crate::es_client::decode_manifest_b64(b64) {
+            Ok(m) => Some(Arc::new(m)),
+            Err(e) => {
+                debug!(cache_key, error = %e, "header manifest decode failed in bg revalidation");
+                None
+            }
+        }
+    });
+
+    let mut resp = handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
+    resp.headers_mut().insert(
+        RESP_BACKGROUND_REVALIDATE,
+        HeaderValue::from_static("accepted"),
+    );
+
+    let bg_state = state.clone();
+    let bg_contract = contract.clone();
+    let bg_headers = client_headers.clone();
+    let bg_url = upstream_url.to_string();
+    let bg_key = cache_key.to_string();
+
+    tokio::spawn(async move {
+        debug!(cache_key = bg_key.as_str(), "background revalidation: starting");
+        let result = upstream_fetcher::fetch_upstream(
+            &bg_state.config,
+            &bg_contract,
+            &bg_headers,
+            &bg_url,
+            Some(&bg_key),
+            None,
+            &bg_state.downloads,
+            &bg_state.trace,
+            bg_state.es_client.clone(),
+            &bg_state.http_pool,
+            bg_state.s3.clone(),
+            bg_state.disk_cache.clone(),
+        )
+        .await;
+
+        match result {
+            Ok(upstream) if upstream.revalidated => {
+                debug!(cache_key = bg_key.as_str(), "background revalidation: 304 Not Modified");
+                if let Some(ref es) = bg_state.es_client {
+                    if let Err(e) = es.refresh_stored_at(&bg_key).await {
+                        warn!(
+                            cache_key = bg_key.as_str(),
+                            error = %e,
+                            "background revalidation: failed to refresh stored_at"
+                        );
+                    }
+                }
+            }
+            Ok(upstream) if upstream.error_passthrough.is_some() => {
+                let (status_code, _) = upstream.error_passthrough.unwrap();
+                debug!(
+                    cache_key = bg_key.as_str(),
+                    status_code,
+                    "background revalidation: upstream error, ignoring"
+                );
+            }
+            Ok(_upstream) => {
+                debug!(
+                    cache_key = bg_key.as_str(),
+                    "background revalidation: content changed, new download initiated"
+                );
+            }
+            Err(e) => {
+                debug!(
+                    cache_key = bg_key.as_str(),
+                    error = %e,
+                    "background revalidation: upstream fetch failed, ignoring"
+                );
+            }
+        }
+    });
+
+    Ok(resp)
+}
 /// with concurrent disk backfill.
 async fn handle_cache_hit(
     state: &AppState,

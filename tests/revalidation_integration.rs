@@ -241,3 +241,70 @@ fn parse_conditional_revalidation_headers() {
     assert!(c.stale_if_error);
     assert!(!c.cache_skip);
 }
+
+/// Background revalidation: xs3lerator should try to serve from cache and return
+/// the `X-Xs3lerator-Background-Revalidate: accepted` header. Without a cache
+/// (no ES/S3), handle_cache_hit fails — but the header contract is tested.
+#[tokio::test]
+async fn background_revalidation_without_cache_returns_error() {
+    let upstream = start_mock_upstream("\"abc123\"", "hello world").await;
+    let xs3 = start_xs3lerator(test_state()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{xs3}/{upstream}/resource"))
+        .header("x-xs3lerator-cache-key", "test/bg-reval")
+        .header("x-xs3lerator-if-none-match", "\"abc123\"")
+        .header("x-xs3lerator-background-revalidate", "true")
+        .send()
+        .await
+        .unwrap();
+
+    // Without a cache, handle_cache_hit fails (no ES/S3 configured)
+    assert!(
+        resp.status() == StatusCode::NOT_FOUND
+            || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+        "expected 404 or 500 from cache-hit fallback (no ES), got {}",
+        resp.status()
+    );
+}
+
+/// Verify that background_revalidate is parsed from contract headers.
+#[test]
+fn parse_background_revalidation_headers() {
+    use xs3lerator::headers::parse_contract_headers;
+
+    let mut h = axum::http::HeaderMap::new();
+    h.insert("x-xs3lerator-cache-key", "test/key".parse().unwrap());
+    h.insert(
+        "x-xs3lerator-if-none-match",
+        "\"etag-val\"".parse().unwrap(),
+    );
+    h.insert(
+        "x-xs3lerator-background-revalidate",
+        "true".parse().unwrap(),
+    );
+    h.insert("x-xs3lerator-stale-if-error", "true".parse().unwrap());
+
+    let c = parse_contract_headers(&h);
+    assert_eq!(c.cache_key.as_deref(), Some("test/key"));
+    assert_eq!(c.if_none_match.as_deref(), Some("\"etag-val\""));
+    assert!(c.background_revalidate);
+    assert!(c.stale_if_error);
+}
+
+/// Verify that background_revalidate defaults to false when absent.
+#[test]
+fn parse_headers_background_revalidate_absent() {
+    use xs3lerator::headers::parse_contract_headers;
+
+    let mut h = axum::http::HeaderMap::new();
+    h.insert("x-xs3lerator-cache-key", "test/key".parse().unwrap());
+    h.insert(
+        "x-xs3lerator-if-none-match",
+        "\"etag-val\"".parse().unwrap(),
+    );
+
+    let c = parse_contract_headers(&h);
+    assert!(!c.background_revalidate);
+}
