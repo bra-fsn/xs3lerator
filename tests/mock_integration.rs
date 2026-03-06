@@ -34,9 +34,7 @@ fn test_config() -> AppConfig {
 
 async fn start_server(state: AppState) -> String {
     let router = build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
@@ -96,11 +94,7 @@ async fn non_get_returns_405() {
         .unwrap();
     assert_eq!(resp.status(), 500);
 
-    let resp = client
-        .put(format!("{base}/test-key"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.put(format!("{base}/test-key")).send().await.unwrap();
     assert_eq!(resp.status(), 405);
 
     let resp = client
@@ -251,7 +245,9 @@ async fn cache_hit_range_request() {
     let mut chunk_ids: Vec<[u8; 16]> = Vec::new();
 
     for i in 0..2u8 {
-        let data: Vec<u8> = (0..chunk_size as usize).map(|j| i.wrapping_add(j as u8)).collect();
+        let data: Vec<u8> = (0..chunk_size as usize)
+            .map(|j| i.wrapping_add(j as u8))
+            .collect();
         all_bytes.extend_from_slice(&data);
 
         let id: [u8; 16] = rand::random();

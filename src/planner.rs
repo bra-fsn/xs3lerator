@@ -33,11 +33,7 @@ const MAX_S3_PARTS: u64 = 10_000;
 /// Actual download concurrency is managed separately by a worker pool with
 /// progressive ramp-up (see `run_s3_download` / `run_adaptive_upstream`).
 /// The `concurrency` field here is the *maximum* number of workers.
-pub fn compute_chunk_plan(
-    file_size: u64,
-    max_concurrency: usize,
-    min_chunk: u64,
-) -> ChunkPlan {
+pub fn compute_chunk_plan(file_size: u64, max_concurrency: usize, min_chunk: u64) -> ChunkPlan {
     if file_size == 0 {
         return ChunkPlan {
             concurrency: 1,

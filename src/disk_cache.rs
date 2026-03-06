@@ -105,11 +105,7 @@ impl DiskCache {
     }
 
     /// Spawn a background GC thread that monitors disk usage and evicts files.
-    pub fn spawn_gc_thread(
-        self: &Arc<Self>,
-        low_watermark_pct: u8,
-        high_watermark_pct: u8,
-    ) {
+    pub fn spawn_gc_thread(self: &Arc<Self>, low_watermark_pct: u8, high_watermark_pct: u8) {
         let cache = self.clone();
         let low = low_watermark_pct;
         let high = high_watermark_pct;
@@ -123,8 +119,8 @@ impl DiskCache {
 
 /// Compute the percentage of disk usage for the filesystem containing `path`.
 fn disk_usage_pct(path: &Path) -> io::Result<u8> {
-    let stat = nix::sys::statvfs::statvfs(path)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let stat =
+        nix::sys::statvfs::statvfs(path).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let total = stat.blocks();
     let avail = stat.blocks_available();
     if total == 0 {
@@ -148,14 +144,20 @@ fn gc_loop(cache: &DiskCache, low_watermark: u8, high_watermark: u8) {
 
         if pct < low_watermark {
             if cache.is_degraded() {
-                info!(pct, low_watermark, "GC: disk usage below low watermark, resuming caching");
+                info!(
+                    pct,
+                    low_watermark, "GC: disk usage below low watermark, resuming caching"
+                );
                 cache.set_degraded(false);
             }
             continue;
         }
 
         if pct >= high_watermark {
-            info!(pct, high_watermark, "GC: above high watermark, random eviction");
+            info!(
+                pct,
+                high_watermark, "GC: above high watermark, random eviction"
+            );
             random_evict(cache, low_watermark);
         } else {
             debug!(pct, low_watermark, "GC: above low watermark, LRU eviction");

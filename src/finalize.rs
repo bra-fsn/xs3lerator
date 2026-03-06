@@ -61,16 +61,16 @@ async fn run_finalize(
                 break;
             }
             if download.has_failed() || download.is_cancelled() {
-                return Err(ProxyError::Internal("download failed/cancelled during finalize".into()));
+                return Err(ProxyError::Internal(
+                    "download failed/cancelled during finalize".into(),
+                ));
             }
             tokio::task::yield_now().await;
         }
     }
 
     // Build manifest with UUIDs
-    let chunk_ids: Vec<[u8; 16]> = (0..num_chunks)
-        .map(|idx| *download.chunk_id(idx))
-        .collect();
+    let chunk_ids: Vec<[u8; 16]> = (0..num_chunks).map(|idx| *download.chunk_id(idx)).collect();
 
     let manifest = Manifest {
         chunk_size: download.chunk_size,

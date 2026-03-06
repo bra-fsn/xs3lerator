@@ -170,7 +170,11 @@ impl InFlightDownload {
         Self::create(object_size, chunk_size, false, chunk_ids)
     }
 
-    pub fn new_unknown_size(effective_size: u64, chunk_size: u64, chunk_ids: Vec<[u8; ID_LEN]>) -> Self {
+    pub fn new_unknown_size(
+        effective_size: u64,
+        chunk_size: u64,
+        chunk_ids: Vec<[u8; ID_LEN]>,
+    ) -> Self {
         Self::create(effective_size, chunk_size, true, chunk_ids)
     }
 
@@ -179,7 +183,12 @@ impl InFlightDownload {
         Self::create(0, chunk_size, false, Vec::new())
     }
 
-    fn create(object_size: u64, chunk_size: u64, unknown_size: bool, chunk_ids: Vec<[u8; ID_LEN]>) -> Self {
+    fn create(
+        object_size: u64,
+        chunk_size: u64,
+        unknown_size: bool,
+        chunk_ids: Vec<[u8; ID_LEN]>,
+    ) -> Self {
         let num_chunks = chunk_ids.len();
         let queue: VecDeque<usize> = (0..num_chunks).collect();
         let chunks = chunk_ids.into_iter().map(|id| ChunkSlot::new(id)).collect();
@@ -248,11 +257,7 @@ impl InFlightDownload {
     /// Returns early with the actual bytes written if the upstream stream
     /// has completed (unknown-size responses may have fewer bytes than
     /// `min_bytes`).
-    pub async fn wait_for_bytes(
-        &self,
-        idx: usize,
-        min_bytes: u64,
-    ) -> Result<u64, ProxyError> {
+    pub async fn wait_for_bytes(&self, idx: usize, min_bytes: u64) -> Result<u64, ProxyError> {
         loop {
             let written = self.chunks[idx].bytes_written();
             if written >= min_bytes {
@@ -276,7 +281,8 @@ impl InFlightDownload {
     /// actual data may be smaller.  Wakes all `wait_for_bytes` waiters so
     /// they can return with the actual bytes available.
     pub fn mark_stream_complete(&self, actual_bytes: u64) {
-        self.actual_total_bytes.store(actual_bytes, Ordering::Release);
+        self.actual_total_bytes
+            .store(actual_bytes, Ordering::Release);
         self.stream_complete.store(true, Ordering::Release);
         self.notify.notify_waiters();
     }
@@ -454,9 +460,7 @@ pub fn pwrite_all(file: &File, offset: u64, data: &[u8]) -> io::Result<()> {
 /// same key-prefix partition, risking 503 SlowDown. Random v4 prefixes spread
 /// chunks uniformly across partitions.
 pub fn generate_chunk_ids(n: usize) -> Vec<[u8; ID_LEN]> {
-    (0..n)
-        .map(|_| *uuid::Uuid::new_v4().as_bytes())
-        .collect()
+    (0..n).map(|_| *uuid::Uuid::new_v4().as_bytes()).collect()
 }
 
 #[cfg(test)]

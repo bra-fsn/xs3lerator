@@ -11,8 +11,8 @@ use tracing::{debug, warn};
 use crate::config::AppConfig;
 use crate::disk_cache::DiskCache;
 use crate::download::{
-    create_temp_chunk_file, generate_chunk_ids, is_enospc, pwrite_all,
-    DownloadManager, InFlightDownload,
+    create_temp_chunk_file, generate_chunk_ids, is_enospc, pwrite_all, DownloadManager,
+    InFlightDownload,
 };
 use crate::error::ProxyError;
 use crate::es_client::EsClient;
@@ -106,14 +106,21 @@ pub async fn fetch_upstream(
 
     // Get a pooled reqwest client (connections are reused across requests)
     let skip_tls = config.upstream_tls_skip_verify || contract.tls_skip_verify;
-    let connect_timeout = contract.connect_timeout.unwrap_or(config.upstream_connect_timeout);
+    let connect_timeout = contract
+        .connect_timeout
+        .unwrap_or(config.upstream_connect_timeout);
     let read_timeout = match contract.read_timeout {
         Some(d) if d.is_zero() => None,
         Some(d) => Some(d),
         None => config.upstream_read_timeout,
     };
     let http_client = http_pool
-        .get(skip_tls, contract.follow_redirects, connect_timeout, read_timeout)
+        .get(
+            skip_tls,
+            contract.follow_redirects,
+            connect_timeout,
+            read_timeout,
+        )
         .map_err(|e| ProxyError::Internal(format!("get http client: {e}")))?;
 
     // Build filtered headers for the upstream request
@@ -133,16 +140,19 @@ pub async fn fetch_upstream(
         req_builder = req_builder.header("if-modified-since", last_mod.as_str());
     }
 
-    trace_log(trace, || json!({
-        "event": "upstream_fetch_start",
-        "url": upstream_url,
-        "tls_skip_verify": skip_tls,
-    }));
+    trace_log(trace, || {
+        json!({
+            "event": "upstream_fetch_start",
+            "url": upstream_url,
+            "tls_skip_verify": skip_tls,
+        })
+    });
 
     let t0 = Instant::now();
-    let response = req_builder.send().await.map_err(|e| {
-        ProxyError::Upstream(format!("upstream request failed: {e}"))
-    })?;
+    let response = req_builder
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("upstream request failed: {e}")))?;
     let upstream_ttfb_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let status = response.status();
@@ -177,7 +187,10 @@ pub async fn fetch_upstream(
         let redirect_headers = response.headers().clone();
         debug!(
             status = status.as_u16(),
-            location = redirect_headers.get("location").and_then(|v| v.to_str().ok()).unwrap_or(""),
+            location = redirect_headers
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
             "upstream returned redirect, passing through to client"
         );
         return Ok(UpstreamResult {
@@ -198,7 +211,10 @@ pub async fn fetch_upstream(
     if !status.is_success() {
         let resp_headers = response.headers().clone();
         let status_code = status.as_u16();
-        warn!(status = status_code, "upstream returned error, passing through");
+        warn!(
+            status = status_code,
+            "upstream returned error, passing through"
+        );
         return Ok(UpstreamResult {
             download: Arc::new(InFlightDownload::new_placeholder(config.chunk_size)),
             content_type: None,
@@ -252,15 +268,17 @@ pub async fn fetch_upstream(
 
     let can_parallel = content_length.is_some() && accept_ranges && !is_chunked;
 
-    trace_log(trace, || json!({
-        "event": "upstream_response",
-        "status": status.as_u16(),
-        "content_length": content_length,
-        "accept_ranges": accept_ranges,
-        "chunked": is_chunked,
-        "can_parallel": can_parallel,
-        "latency_ms": t0.elapsed().as_secs_f64() * 1000.0,
-    }));
+    trace_log(trace, || {
+        json!({
+            "event": "upstream_response",
+            "status": status.as_u16(),
+            "content_length": content_length,
+            "accept_ranges": accept_ranges,
+            "chunked": is_chunked,
+            "can_parallel": can_parallel,
+            "latency_ms": t0.elapsed().as_secs_f64() * 1000.0,
+        })
+    });
 
     if let Some(file_size) = content_length {
         if can_parallel && file_size > config.chunk_size {
@@ -412,11 +430,7 @@ async fn start_parallel_upstream_download(
     }
 
     if let Some(key) = cache_key {
-        finalize::spawn_finalize(
-            key.to_string(),
-            download.clone(),
-            es_client,
-        );
+        finalize::spawn_finalize(key.to_string(), download.clone(), es_client);
     }
 
     let temp_dir = config.temp_dir.clone();
@@ -436,9 +450,18 @@ async fn start_parallel_upstream_download(
     // Spawn the adaptive download workers
     tokio::spawn(async move {
         let result = run_adaptive_upstream(
-            &temp_dir, &url, &client, &hdrs, initial_response,
-            &dl, &trace_clone, http_concurrency,
-            &data_prefix_clone, caching, s3c.as_ref(), dc.as_ref(),
+            &temp_dir,
+            &url,
+            &client,
+            &hdrs,
+            initial_response,
+            &dl,
+            &trace_clone,
+            http_concurrency,
+            &data_prefix_clone,
+            caching,
+            s3c.as_ref(),
+            dc.as_ref(),
         )
         .await;
 
@@ -548,12 +571,12 @@ async fn run_adaptive_upstream(
         // detect sluggish progress and scale up workers within seconds.
         let seq_chunk_now = active_sequential_chunk(download);
         let runway = 1usize;
-        let estimated_stop = (seq_chunk_now + runway)
-            .min(download.chunk_count().saturating_sub(1));
+        let estimated_stop = (seq_chunk_now + runway).min(download.chunk_count().saturating_sub(1));
 
         // Find a probe target *beyond* the runway — no point probing a
         // chunk the sequential stream will fill anyway.
-        let probe_target = remaining.iter()
+        let probe_target = remaining
+            .iter()
             .find(|&&i| i > estimated_stop && !download.is_chunk_done(i))
             .copied();
 
@@ -574,17 +597,19 @@ async fn run_adaptive_upstream(
             match probe_resp {
                 Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => {
                     let seq_chunk = active_sequential_chunk(download);
-                    let effective_stop = (seq_chunk + runway)
-                        .min(download.chunk_count().saturating_sub(1));
+                    let effective_stop =
+                        (seq_chunk + runway).min(download.chunk_count().saturating_sub(1));
                     stop_after.store(effective_stop, Ordering::Release);
 
-                    trace_log(trace, || json!({
-                        "event": "range_probe_ok",
-                        "probe_chunk": probe_idx,
-                        "status": resp.status().as_u16(),
-                        "seq_chunk": seq_chunk,
-                        "effective_stop": effective_stop,
-                    }));
+                    trace_log(trace, || {
+                        json!({
+                            "event": "range_probe_ok",
+                            "probe_chunk": probe_idx,
+                            "status": resp.status().as_u16(),
+                            "seq_chunk": seq_chunk,
+                            "effective_stop": effective_stop,
+                        })
+                    });
                     debug!(
                         seq_chunk,
                         effective_stop,
@@ -594,22 +619,33 @@ async fn run_adaptive_upstream(
 
                     // Ordered list of chunks for parallel workers
                     // (probe_idx handled separately by the probe worker).
-                    let parallel_chunks: Vec<usize> = remaining.iter()
-                        .filter(|&&i| i > effective_stop && i != probe_idx && !download.is_chunk_done(i))
+                    let parallel_chunks: Vec<usize> = remaining
+                        .iter()
+                        .filter(|&&i| {
+                            i > effective_stop && i != probe_idx && !download.is_chunk_done(i)
+                        })
                         .copied()
                         .collect();
 
                     // Probe worker: download the probed chunk from the already-open response.
                     {
-                        let probe_file = download.chunk(probe_idx).get_file()
+                        let probe_file = download
+                            .chunk(probe_idx)
+                            .get_file()
                             .ok_or_else(|| ProxyError::Internal("probe chunk file gone".into()))?;
                         let dl_clone = download.clone();
                         let expected = download.expected_chunk_len(probe_idx);
                         let trace_c = trace.clone();
                         parallel_handles.push(tokio::spawn(async move {
                             download_chunk_from_stream(
-                                resp, &probe_file, &dl_clone, probe_idx, expected, &trace_c,
-                            ).await
+                                resp,
+                                &probe_file,
+                                &dl_clone,
+                                probe_idx,
+                                expected,
+                                &trace_c,
+                            )
+                            .await
                         }));
                     }
 
@@ -639,9 +675,10 @@ async fn run_adaptive_upstream(
                                     if worker_id >= ramp.active_workers() {
                                         tokio::task::yield_now().await;
                                         if worker_id >= ramp.active_workers() {
-                                            tokio::time::sleep(
-                                                std::time::Duration::from_millis(50),
-                                            ).await;
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                50,
+                                            ))
+                                            .await;
                                             ramp.check_time_trigger();
                                             if worker_id >= ramp.active_workers() {
                                                 if ramp.is_frozen() {
@@ -653,14 +690,18 @@ async fn run_adaptive_upstream(
                                     }
 
                                     let pos = cursor.fetch_add(1, Ordering::Relaxed);
-                                    if pos >= chunks.len() { break; }
+                                    if pos >= chunks.len() {
+                                        break;
+                                    }
                                     let idx = chunks[pos];
-                                    if dl_clone.is_chunk_done(idx) { continue; }
+                                    if dl_clone.is_chunk_done(idx) {
+                                        continue;
+                                    }
 
-                                    let chunk_file = dl_clone.chunk(idx).get_file()
-                                        .ok_or_else(|| ProxyError::Internal(
-                                            format!("chunk {idx} file gone")
-                                        ))?;
+                                    let chunk_file =
+                                        dl_clone.chunk(idx).get_file().ok_or_else(|| {
+                                            ProxyError::Internal(format!("chunk {idx} file gone"))
+                                        })?;
                                     let (start, end) = dl_clone.chunk_byte_range(idx);
                                     let expected = dl_clone.expected_chunk_len(idx);
 
@@ -673,13 +714,20 @@ async fn run_adaptive_upstream(
                                     req = req.header("Range", format!("bytes={start}-{end}"));
                                     let response = req.send().await;
                                     match response {
-                                        Ok(resp) if resp.status().is_success()
-                                            || resp.status().as_u16() == 206 =>
+                                        Ok(resp)
+                                            if resp.status().is_success()
+                                                || resp.status().as_u16() == 206 =>
                                         {
                                             match download_chunk_from_stream(
-                                                resp, &chunk_file, &dl_clone,
-                                                idx, expected, &trace_c,
-                                            ).await {
+                                                resp,
+                                                &chunk_file,
+                                                &dl_clone,
+                                                idx,
+                                                expected,
+                                                &trace_c,
+                                            )
+                                            .await
+                                            {
                                                 Ok(()) => ramp.record_chunk(expected),
                                                 Err(e) => {
                                                     ramp.record_error();
@@ -696,9 +744,9 @@ async fn run_adaptive_upstream(
                                         }
                                         Err(e) => {
                                             ramp.record_error();
-                                            return Err(ProxyError::Upstream(
-                                                format!("range chunk {idx}: {e}")
-                                            ));
+                                            return Err(ProxyError::Upstream(format!(
+                                                "range chunk {idx}: {e}"
+                                            )));
                                         }
                                     }
                                 }
@@ -708,11 +756,13 @@ async fn run_adaptive_upstream(
                     }
                 }
                 Ok(resp) => {
-                    trace_log(trace, || json!({
-                        "event": "range_probe_rejected",
-                        "probe_chunk": probe_target,
-                        "status": resp.status().as_u16(),
-                    }));
+                    trace_log(trace, || {
+                        json!({
+                            "event": "range_probe_rejected",
+                            "probe_chunk": probe_target,
+                            "status": resp.status().as_u16(),
+                        })
+                    });
                     debug!(
                         status = resp.status().as_u16(),
                         "range probe rejected, continuing sequential"
@@ -738,7 +788,9 @@ async fn run_adaptive_upstream(
         }
         Err(e) => {
             download.mark_failed();
-            return Err(ProxyError::Internal(format!("sequential task panicked: {e}")));
+            return Err(ProxyError::Internal(format!(
+                "sequential task panicked: {e}"
+            )));
         }
     }
 
@@ -800,7 +852,10 @@ fn spawn_post_chunk_upload(
         let temp_file = match download.chunk(idx).get_file() {
             Some(f) => f,
             None => {
-                download.chunk(idx).s3_committed.store(true, Ordering::Release);
+                download
+                    .chunk(idx)
+                    .s3_committed
+                    .store(true, Ordering::Release);
                 download.wake_waiters();
                 return;
             }
@@ -844,7 +899,8 @@ fn spawn_post_chunk_upload(
                     if let Err(e) = dc2.finalize(&temp_path, &cid) {
                         warn!(chunk = idx, "cache finalize rename failed: {e}");
                     }
-                }).await;
+                })
+                .await;
 
                 if let Err(e) = finalize_result {
                     warn!(chunk = idx, "cache finalize task panicked: {e}");
@@ -861,7 +917,8 @@ fn spawn_post_chunk_upload(
                 let mut buf = vec![0u8; len];
                 tf.read_exact_at(&mut buf, 0)?;
                 Ok::<Bytes, std::io::Error>(Bytes::from(buf))
-            }).await;
+            })
+            .await;
 
             match read_result {
                 Ok(Ok(data)) => {
@@ -874,7 +931,10 @@ fn spawn_post_chunk_upload(
             }
         }
 
-        download.chunk(idx).s3_committed.store(true, Ordering::Release);
+        download
+            .chunk(idx)
+            .s3_committed
+            .store(true, Ordering::Release);
         download.wake_waiters();
         debug!(chunk = idx, "post-chunk upload done");
     });
@@ -900,10 +960,12 @@ async fn stream_response_into_chunks(
             let chunk_idx = (global_offset / download.chunk_size) as usize;
 
             if chunk_idx > stop_after.load(Ordering::Acquire) {
-                trace_log(trace, || json!({
-                    "event": "sequential_stopped",
-                    "at_chunk": chunk_idx,
-                }));
+                trace_log(trace, || {
+                    json!({
+                        "event": "sequential_stopped",
+                        "at_chunk": chunk_idx,
+                    })
+                });
                 break 'outer;
             }
             if chunk_idx >= download.chunk_count() {
@@ -933,10 +995,12 @@ async fn stream_response_into_chunks(
 
             if download.is_chunk_done(chunk_idx) {
                 download.mark_chunk_done(chunk_idx);
-                trace_log(trace, || json!({
-                    "event": "sequential_chunk_done",
-                    "chunk": chunk_idx,
-                }));
+                trace_log(trace, || {
+                    json!({
+                        "event": "sequential_chunk_done",
+                        "chunk": chunk_idx,
+                    })
+                });
             }
         }
     }
@@ -971,12 +1035,14 @@ async fn download_chunk_from_stream(
 
     download.mark_chunk_done(idx);
 
-    trace_log(trace, || json!({
-        "event": "upstream_chunk_done",
-        "chunk": idx,
-        "bytes": offset,
-        "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0,
-    }));
+    trace_log(trace, || {
+        json!({
+            "event": "upstream_chunk_done",
+            "chunk": idx,
+            "bytes": offset,
+            "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0,
+        })
+    });
 
     Ok(())
 }
@@ -1003,8 +1069,7 @@ async fn start_sequential_download(
     disk_cache: Option<Arc<DiskCache>>,
 ) -> Result<UpstreamResult, ProxyError> {
     let is_unknown_size = file_size.is_none();
-    let effective_size = file_size
-        .unwrap_or(config.chunk_size * MAX_UNKNOWN_SIZE_CHUNKS);
+    let effective_size = file_size.unwrap_or(config.chunk_size * MAX_UNKNOWN_SIZE_CHUNKS);
     let chunk_size = config.chunk_size;
 
     let num_chunks = if effective_size == 0 {
@@ -1070,11 +1135,7 @@ async fn start_sequential_download(
 
     // Spawn finalize only when caching
     if let Some(key) = cache_key {
-        finalize::spawn_finalize(
-            key.to_string(),
-            download.clone(),
-            es_client.clone(),
-        );
+        finalize::spawn_finalize(key.to_string(), download.clone(), es_client.clone());
     }
 
     if !is_unknown_size {

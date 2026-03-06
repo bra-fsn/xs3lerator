@@ -211,7 +211,14 @@ mod tests {
         let p = id_to_chunk_path(&id, "data/");
         let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex.len(), 32);
-        let expected = format!("data/{}/{}/{}/{}/{}", &hex[0..1], &hex[1..2], &hex[2..3], &hex[3..4], hex);
+        let expected = format!(
+            "data/{}/{}/{}/{}/{}",
+            &hex[0..1],
+            &hex[1..2],
+            &hex[2..3],
+            &hex[3..4],
+            hex
+        );
         assert_eq!(p.to_str().unwrap(), expected);
     }
 }

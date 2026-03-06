@@ -144,7 +144,13 @@ pub fn parse_contract_headers(headers: &HeaderMap) -> ContractHeaders {
         .get(HEADER_READ_TIMEOUT)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<f64>().ok())
-        .map(|v| if v <= 0.0 { Duration::ZERO } else { Duration::from_secs_f64(v) });
+        .map(|v| {
+            if v <= 0.0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs_f64(v)
+            }
+        });
 
     ContractHeaders {
         cache_key,
@@ -259,7 +265,10 @@ mod tests {
     #[test]
     fn parse_contract_headers_full() {
         let mut h = HeaderMap::new();
-        h.insert(HEADER_CACHE_KEY, HeaderValue::from_static("https/host/abc123"));
+        h.insert(
+            HEADER_CACHE_KEY,
+            HeaderValue::from_static("https/host/abc123"),
+        );
         h.insert(HEADER_CACHE_SKIP, HeaderValue::from_static("true"));
         h.insert(HEADER_OBJECT_SIZE, HeaderValue::from_static("12345"));
         h.insert(HEADER_TLS_SKIP_VERIFY, HeaderValue::from_static("true"));
@@ -293,11 +302,17 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(HEADER_CACHE_KEY, HeaderValue::from_static("https/host/abc"));
         h.insert(HEADER_IF_NONE_MATCH, HeaderValue::from_static("\"abc123\""));
-        h.insert(HEADER_IF_MODIFIED_SINCE, HeaderValue::from_static("Mon, 01 Jan 2024 00:00:00 GMT"));
+        h.insert(
+            HEADER_IF_MODIFIED_SINCE,
+            HeaderValue::from_static("Mon, 01 Jan 2024 00:00:00 GMT"),
+        );
         h.insert(HEADER_STALE_IF_ERROR, HeaderValue::from_static("true"));
         let c = parse_contract_headers(&h);
         assert_eq!(c.if_none_match.as_deref(), Some("\"abc123\""));
-        assert_eq!(c.if_modified_since.as_deref(), Some("Mon, 01 Jan 2024 00:00:00 GMT"));
+        assert_eq!(
+            c.if_modified_since.as_deref(),
+            Some("Mon, 01 Jan 2024 00:00:00 GMT")
+        );
         assert!(c.stale_if_error);
         assert!(!c.cache_skip);
     }

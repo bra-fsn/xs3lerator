@@ -36,9 +36,7 @@ fn test_config() -> AppConfig {
 
 async fn start_xs3lerator(state: AppState) -> String {
     let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -57,9 +55,7 @@ async fn start_mock_upstream() -> String {
         .route("/redirect/chain-step2", get(handle_chain_step2))
         .route("/final-target", get(handle_final_target));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -316,8 +312,7 @@ async fn redirect_strips_contract_headers() {
     assert_eq!(resp.status(), 301);
     assert!(resp.headers().get("x-xs3lerator-cache-hit").is_some());
     for (name, _) in resp.headers().iter() {
-        if name.as_str().starts_with("x-xs3lerator-") && name.as_str() != "x-xs3lerator-cache-hit"
-        {
+        if name.as_str().starts_with("x-xs3lerator-") && name.as_str() != "x-xs3lerator-cache-hit" {
             panic!(
                 "unexpected contract header in redirect response: {}",
                 name.as_str()
@@ -392,13 +387,7 @@ async fn non_redirect_200_unaffected() {
         .build()
         .unwrap();
 
-    let resp = proxy_get(
-        &client,
-        &xs3,
-        &format!("{upstream}/final-target"),
-        false,
-    )
-    .await;
+    let resp = proxy_get(&client, &xs3, &format!("{upstream}/final-target"), false).await;
 
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();

@@ -72,11 +72,8 @@ async fn main() -> anyhow::Result<()> {
     let s3 = if config.passthrough {
         None
     } else if let Some(ref bucket) = config.s3_bucket {
-        let client = s3_client::S3Client::new(
-            bucket,
-            &config.s3_region,
-            config.s3_endpoint.as_deref(),
-        )?;
+        let client =
+            s3_client::S3Client::new(bucket, &config.s3_region, config.s3_endpoint.as_deref())?;
         info!(bucket, region = config.s3_region, "S3 client initialized");
         Some(Arc::new(client))
     } else {

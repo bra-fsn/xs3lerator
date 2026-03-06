@@ -6,7 +6,6 @@ pub struct ByteRange {
     pub end_inclusive: u64,
 }
 
-
 /// Parse a single-range HTTP Range header value against a known object size.
 /// Multi-range requests are rejected (returns RangeNotSatisfiable).
 pub fn parse_range_header(
@@ -27,7 +26,9 @@ pub fn parse_range_header(
     if spec.contains(',') {
         return Err(ProxyError::RangeNotSatisfiable(Some(total_size)));
     }
-    let (left, right) = spec.split_once('-').ok_or(ProxyError::RangeNotSatisfiable(Some(total_size)))?;
+    let (left, right) = spec
+        .split_once('-')
+        .ok_or(ProxyError::RangeNotSatisfiable(Some(total_size)))?;
     let left = left.trim();
     let right = right.trim();
 

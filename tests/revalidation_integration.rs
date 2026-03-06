@@ -51,9 +51,7 @@ fn test_state() -> AppState {
 
 async fn start_xs3lerator(state: AppState) -> String {
     let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -112,9 +110,7 @@ async fn start_mock_upstream(etag: &str, body: &str) -> String {
         .route("/error-resource", get(handle_upstream_error))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
