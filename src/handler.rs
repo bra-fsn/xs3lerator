@@ -4,22 +4,22 @@ use std::sync::Arc;
 use async_stream::try_stream;
 use axum::body::Body;
 use axum::extract::State;
+use axum::http::header::CONTENT_LENGTH;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::json;
-use axum::http::header::CONTENT_LENGTH;
 use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
 use crate::disk_cache::DiskCache;
-use crate::download::{InFlightDownload, DownloadManager};
+use crate::download::{DownloadManager, InFlightDownload};
 use crate::error::{ProxyError, ProxyResult};
 use crate::es_client::EsClient;
 use crate::headers::{
-    self, parse_upstream_url, parse_contract_headers, RESP_CACHE_HIT, RESP_DEGRADED, RESP_FULL_SIZE,
-    RESP_REVALIDATED, RESP_BACKGROUND_REVALIDATE,
+    self, parse_contract_headers, parse_upstream_url, RESP_BACKGROUND_REVALIDATE, RESP_CACHE_HIT,
+    RESP_DEGRADED, RESP_FULL_SIZE, RESP_REVALIDATED,
 };
 use crate::http_pool::HttpClientPool;
 use crate::manifest::Manifest;
@@ -82,14 +82,22 @@ pub async fn handle_head(
 
     let contract = parse_contract_headers(&headers);
     let skip_tls = state.config.upstream_tls_skip_verify || contract.tls_skip_verify;
-    let connect_timeout = contract.connect_timeout.unwrap_or(state.config.upstream_connect_timeout);
+    let connect_timeout = contract
+        .connect_timeout
+        .unwrap_or(state.config.upstream_connect_timeout);
     let read_timeout = match contract.read_timeout {
         Some(d) if d.is_zero() => None,
         Some(d) => Some(d),
         None => state.config.upstream_read_timeout,
     };
-    let http_client = state.http_pool
-        .get(skip_tls, contract.follow_redirects, connect_timeout, read_timeout)
+    let http_client = state
+        .http_pool
+        .get(
+            skip_tls,
+            contract.follow_redirects,
+            connect_timeout,
+            read_timeout,
+        )
         .map_err(|e| ProxyError::Internal(format!("get http client: {e}")))?;
 
     let upstream_headers = headers::filter_upstream_headers(&headers);
@@ -100,12 +108,13 @@ pub async fn handle_head(
         }
     }
 
-    let response = req_builder.send().await.map_err(|e| {
-        ProxyError::Upstream(format!("upstream HEAD failed: {e}"))
-    })?;
+    let response = req_builder
+        .send()
+        .await
+        .map_err(|e| ProxyError::Upstream(format!("upstream HEAD failed: {e}")))?;
 
-    let status = StatusCode::from_u16(response.status().as_u16())
-        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_headers = HeaderMap::new();
     merge_upstream_headers(response.headers(), &mut resp_headers);
 
@@ -210,13 +219,15 @@ pub async fn handle_get(
 
     let log_key = cache_key.as_deref().unwrap_or(&upstream_url);
 
-    trace_log(&state.trace, || json!({
-        "event": "request",
-        "upstream_url": upstream_url,
-        "cache_key": cache_key,
-        "cache_skip": contract.cache_skip,
-        "object_size": contract.object_size,
-    }));
+    trace_log(&state.trace, || {
+        json!({
+            "event": "request",
+            "upstream_url": upstream_url,
+            "cache_key": cache_key,
+            "cache_skip": contract.cache_skip,
+            "object_size": contract.object_size,
+        })
+    });
 
     // No cache key → pure passthrough (download accelerator only)
     if cache_key.is_none() || contract.cache_skip {
@@ -229,7 +240,10 @@ pub async fn handle_get(
             client_range_header.as_deref(),
         )
         .await
-        .map(|resp| { log_access("GET", log_key, &resp); resp });
+        .map(|resp| {
+            log_access("GET", log_key, &resp);
+            resp
+        });
     }
 
     let cache_key_str = cache_key.as_deref().unwrap();
@@ -249,7 +263,10 @@ pub async fn handle_get(
                 client_range_header.as_deref(),
             )
             .await
-            .map(|resp| { log_access("GET", log_key, &resp); resp });
+            .map(|resp| {
+                log_access("GET", log_key, &resp);
+                resp
+            });
         }
 
         return handle_conditional_revalidation(
@@ -261,7 +278,10 @@ pub async fn handle_get(
             client_range_header.as_deref(),
         )
         .await
-        .map(|resp| { log_access("GET", log_key, &resp); resp });
+        .map(|resp| {
+            log_access("GET", log_key, &resp);
+            resp
+        });
     }
 
     // If passsage supplied the manifest in the header, try to use it directly
@@ -304,7 +324,10 @@ pub async fn handle_get(
                 client_range_header.as_deref(),
             )
             .await
-            .map(|resp| { log_access("GET", log_key, &resp); resp })
+            .map(|resp| {
+                log_access("GET", log_key, &resp);
+                resp
+            })
         }
     }
 }
@@ -348,15 +371,16 @@ async fn handle_conditional_revalidation(
     let fetch_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // Resolve the manifest from the header (for cache-hit serving on 304/stale-error)
-    let header_manifest = contract.manifest_b64.as_deref().and_then(|b64| {
-        match crate::es_client::decode_manifest_b64(b64) {
-            Ok(m) => Some(Arc::new(m)),
-            Err(e) => {
-                debug!(cache_key, error = %e, "header manifest decode failed in revalidation");
-                None
-            }
-        }
-    });
+    let header_manifest =
+        contract.manifest_b64.as_deref().and_then(
+            |b64| match crate::es_client::decode_manifest_b64(b64) {
+                Ok(m) => Some(Arc::new(m)),
+                Err(e) => {
+                    debug!(cache_key, error = %e, "header manifest decode failed in revalidation");
+                    None
+                }
+            },
+        );
 
     match result {
         Ok(upstream) if upstream.revalidated => {
@@ -365,11 +389,10 @@ async fn handle_conditional_revalidation(
                 fetch_ms = fetch_ms as u64,
                 "conditional revalidation: 304 Not Modified, serving from cache"
             );
-            let mut resp = handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
-            resp.headers_mut().insert(
-                RESP_REVALIDATED,
-                HeaderValue::from_static("true"),
-            );
+            let mut resp =
+                handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
+            resp.headers_mut()
+                .insert(RESP_REVALIDATED, HeaderValue::from_static("true"));
             Ok(resp)
         }
         Ok(upstream) if upstream.error_passthrough.is_some() && contract.stale_if_error => {
@@ -380,11 +403,10 @@ async fn handle_conditional_revalidation(
                 fetch_ms = fetch_ms as u64,
                 "conditional revalidation: upstream error, serving stale from cache (stale-if-error)"
             );
-            let mut resp = handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
-            resp.headers_mut().insert(
-                RESP_REVALIDATED,
-                HeaderValue::from_static("stale-error"),
-            );
+            let mut resp =
+                handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
+            resp.headers_mut()
+                .insert(RESP_REVALIDATED, HeaderValue::from_static("stale-error"));
             Ok(resp)
         }
         Ok(upstream) => {
@@ -401,11 +423,10 @@ async fn handle_conditional_revalidation(
                 error = %e,
                 "conditional revalidation: upstream fetch failed, serving stale from cache (stale-if-error)"
             );
-            let mut resp = handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
-            resp.headers_mut().insert(
-                RESP_REVALIDATED,
-                HeaderValue::from_static("stale-error"),
-            );
+            let mut resp =
+                handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
+            resp.headers_mut()
+                .insert(RESP_REVALIDATED, HeaderValue::from_static("stale-error"));
             Ok(resp)
         }
         Err(e) => Err(e),
@@ -449,7 +470,10 @@ async fn handle_background_revalidation(
     let bg_key = cache_key.to_string();
 
     tokio::spawn(async move {
-        debug!(cache_key = bg_key.as_str(), "background revalidation: starting");
+        debug!(
+            cache_key = bg_key.as_str(),
+            "background revalidation: starting"
+        );
         let result = upstream_fetcher::fetch_upstream(
             &bg_state.config,
             &bg_contract,
@@ -468,7 +492,10 @@ async fn handle_background_revalidation(
 
         match result {
             Ok(upstream) if upstream.revalidated => {
-                debug!(cache_key = bg_key.as_str(), "background revalidation: 304 Not Modified");
+                debug!(
+                    cache_key = bg_key.as_str(),
+                    "background revalidation: 304 Not Modified"
+                );
                 if let Some(ref es) = bg_state.es_client {
                     if let Err(e) = es.refresh_stored_at(&bg_key).await {
                         warn!(
@@ -483,8 +510,7 @@ async fn handle_background_revalidation(
                 let (status_code, _) = upstream.error_passthrough.unwrap();
                 debug!(
                     cache_key = bg_key.as_str(),
-                    status_code,
-                    "background revalidation: upstream error, ignoring"
+                    status_code, "background revalidation: upstream error, ignoring"
                 );
             }
             Ok(_upstream) => {
@@ -531,15 +557,18 @@ async fn handle_cache_hit(
     let disk_cache = state.disk_cache.clone();
     let es_client = state.es_client.clone();
 
-    let chunks_meta: Vec<(usize, [u8; 16], u64)> = chunk_range.clone().map(|idx| {
-        let id = manifest.chunk_ids[idx];
-        let chunk_len = if idx == manifest.num_chunks() - 1 {
-            manifest.total_size - (idx as u64 * manifest.chunk_size)
-        } else {
-            manifest.chunk_size
-        };
-        (idx, id, chunk_len)
-    }).collect();
+    let chunks_meta: Vec<(usize, [u8; 16], u64)> = chunk_range
+        .clone()
+        .map(|idx| {
+            let id = manifest.chunk_ids[idx];
+            let chunk_len = if idx == manifest.num_chunks() - 1 {
+                manifest.total_size - (idx as u64 * manifest.chunk_size)
+            } else {
+                manifest.chunk_size
+            };
+            (idx, id, chunk_len)
+        })
+        .collect();
 
     let num_chunks = chunks_meta.len();
     debug!(cache_key, num_chunks, object_size, "cache_hit: serving");
@@ -624,6 +653,13 @@ fn make_cache_hit_stream(
         let pipeline_start = std::time::Instant::now();
         let mut remaining = read_len;
         let mut first = true;
+        let mut local_bytes_served = 0u64;
+        let mut s3_bytes_served = 0u64;
+        let mut local_only_chunks = 0usize;
+        let mut s3_only_chunks = 0usize;
+        let mut mixed_source_chunks = 0usize;
+        let mut local_lookup_miss_chunks = 0usize;
+        let mut local_read_fallback_chunks = 0usize;
 
         for (_idx, id, chunk_len) in &chunks_meta {
             let start_offset = if first {
@@ -634,6 +670,8 @@ fn make_cache_hit_stream(
             };
 
             let chunk_len = *chunk_len as usize;
+            let mut served_from_local_chunk = false;
+            let mut served_from_s3_chunk = false;
 
             // Try local disk first
             let local_path = disk_cache.as_ref().and_then(|dc| dc.lookup(id));
@@ -664,10 +702,13 @@ fn make_cache_hit_stream(
                 let mut ok = true;
                 let total_pieces = pieces.len();
                 let mut received = 0usize;
+                let mut local_read_failed = false;
                 while received < total_pieces {
                     match rx.recv().await {
                         Some(Ok(bytes)) => {
                             remaining -= bytes.len() as u64;
+                            local_bytes_served += bytes.len() as u64;
+                            served_from_local_chunk = true;
                             // We're inside try_stream! which is async, use async recv
                             received += 1;
                             yield bytes;
@@ -679,6 +720,7 @@ fn make_cache_hit_stream(
                                 "local cache read failed, falling back to S3: {e}"
                             );
                             ok = false;
+                            local_read_failed = true;
                             break;
                         }
                         None => {
@@ -689,6 +731,7 @@ fn make_cache_hit_stream(
                                     "local reader exited early ({received}/{total_pieces} pieces)"
                                 );
                                 ok = false;
+                                local_read_failed = true;
                             }
                             break;
                         }
@@ -696,7 +739,11 @@ fn make_cache_hit_stream(
                 }
                 if ok {
                     local_served = true;
+                } else if local_read_failed {
+                    local_read_fallback_chunks += 1;
                 }
+            } else {
+                local_lookup_miss_chunks += 1;
             }
             if !local_served {
                 // Local miss: stream from S3 with tee to disk cache
@@ -802,6 +849,8 @@ fn make_cache_hit_stream(
                     if to_yield > 0 {
                         yield piece.slice(piece_start..piece_start + to_yield);
                         remaining -= to_yield as u64;
+                        s3_bytes_served += to_yield as u64;
+                        served_from_s3_chunk = true;
                     }
                     s3_offset += piece_len;
 
@@ -826,6 +875,14 @@ fn make_cache_hit_stream(
                 }
             }
 
+            if served_from_local_chunk && served_from_s3_chunk {
+                mixed_source_chunks += 1;
+            } else if served_from_local_chunk {
+                local_only_chunks += 1;
+            } else if served_from_s3_chunk {
+                s3_only_chunks += 1;
+            }
+
             if remaining == 0 {
                 break;
             }
@@ -833,6 +890,28 @@ fn make_cache_hit_stream(
 
         let total_ms = pipeline_start.elapsed().as_millis() as u64;
         let served_bytes = read_len - remaining;
+        let source_path = if s3_bytes_served == 0 {
+            "local_pvc"
+        } else if local_bytes_served == 0 {
+            "s3"
+        } else {
+            "mixed"
+        };
+        info!(
+            cache_key = cache_key.as_str(),
+            num_chunks = chunks_meta.len(),
+            total_ms,
+            served_bytes,
+            source_path,
+            local_bytes_served,
+            s3_bytes_served,
+            local_only_chunks,
+            s3_only_chunks,
+            mixed_source_chunks,
+            local_lookup_miss_chunks,
+            local_read_fallback_chunks,
+            "cache_hit: source metrics"
+        );
         debug!(
             cache_key = cache_key.as_str(),
             num_chunks = chunks_meta.len(),
@@ -844,18 +923,15 @@ fn make_cache_hit_stream(
 }
 
 /// Fetch manifest from Elasticsearch.
-async fn fetch_manifest(
-    state: &AppState,
-    cache_key: &str,
-) -> ProxyResult<Arc<Manifest>> {
+async fn fetch_manifest(state: &AppState, cache_key: &str) -> ProxyResult<Arc<Manifest>> {
     let manifest = if let Some(ref es) = state.es_client {
         es.get_manifest(cache_key).await?
     } else {
         None
     };
 
-    let manifest: Manifest = manifest
-        .ok_or_else(|| ProxyError::NotFound(format!("no manifest for {cache_key}")))?;
+    let manifest: Manifest =
+        manifest.ok_or_else(|| ProxyError::NotFound(format!("no manifest for {cache_key}")))?;
 
     Ok(Arc::new(manifest))
 }
@@ -875,10 +951,7 @@ const UPSTREAM_STRIP_HEADERS: &[&str] = &[
 ];
 
 /// Merge upstream response headers into an axum HeaderMap.
-fn merge_upstream_headers(
-    upstream: &reqwest::header::HeaderMap,
-    out: &mut HeaderMap,
-) {
+fn merge_upstream_headers(upstream: &reqwest::header::HeaderMap, out: &mut HeaderMap) {
     for (name, value) in upstream.iter() {
         let key = name.as_str().to_lowercase();
         if key.starts_with(headers::CONTRACT_PREFIX) {
@@ -938,11 +1011,9 @@ fn build_upstream_response(
     cache_key: Option<&str>,
     client_range: Option<&str>,
 ) -> ProxyResult<Response> {
-
     // Redirect passthrough
     if let Some(redirect_code) = result.redirect_status {
-        let status = StatusCode::from_u16(redirect_code)
-            .unwrap_or(StatusCode::FOUND);
+        let status = StatusCode::from_u16(redirect_code).unwrap_or(StatusCode::FOUND);
         let mut resp_headers = HeaderMap::new();
         if let Some(ref rh) = result.redirect_headers {
             merge_upstream_headers(rh, &mut resp_headers);
@@ -961,8 +1032,7 @@ fn build_upstream_response(
 
     // Error passthrough
     if let Some((status_code, error_response)) = result.error_passthrough {
-        let status = StatusCode::from_u16(status_code)
-            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut resp_headers = HeaderMap::new();
         if let Some(ref uh) = result.upstream_headers {
             merge_upstream_headers(uh, &mut resp_headers);
@@ -1068,7 +1138,10 @@ impl ReaderGuard {
         for &idx in &chunks {
             download.chunk(idx).increment_readers();
         }
-        Self { download, live_chunks: chunks }
+        Self {
+            download,
+            live_chunks: chunks,
+        }
     }
 
     fn consumed(&mut self, chunk_idx: usize) {
@@ -1098,7 +1171,10 @@ fn cache_hit_uring_reader(
 ) {
     let f = match std::fs::File::open(&path) {
         Ok(f) => f,
-        Err(e) => { let _ = tx.blocking_send(Err(e)); return; }
+        Err(e) => {
+            let _ = tx.blocking_send(Err(e));
+            return;
+        }
     };
 
     match cache_hit_uring_inner(&f, &pieces, concurrency, &tx) {
@@ -1152,14 +1228,17 @@ fn cache_hit_uring_inner(
             .offset(offset)
             .build()
             .user_data(slot as u64);
-        unsafe { ring.submission().push(&entry).unwrap(); }
+        unsafe {
+            ring.submission().push(&entry).unwrap();
+        }
         next_submit += 1;
         in_flight += 1;
     }
     ring.submit().map_err(|e| UringFallback::IoError(e))?;
 
     while in_flight > 0 {
-        ring.submit_and_wait(1).map_err(|e| UringFallback::IoError(e))?;
+        ring.submit_and_wait(1)
+            .map_err(|e| UringFallback::IoError(e))?;
 
         // Collect completions (must drop CQ borrow before accessing SQ)
         let mut completed: Vec<(usize, i32)> = Vec::new();
@@ -1169,9 +1248,9 @@ fn cache_hit_uring_inner(
 
         for (slot, result) in completed {
             if result < 0 {
-                return Err(UringFallback::IoError(
-                    std::io::Error::from_raw_os_error(-result)
-                ));
+                return Err(UringFallback::IoError(std::io::Error::from_raw_os_error(
+                    -result,
+                )));
             }
             let bytes_read = result as usize;
             let piece_idx = slot_piece[slot];
@@ -1194,7 +1273,9 @@ fn cache_hit_uring_inner(
                     .offset(offset)
                     .build()
                     .user_data(slot as u64);
-                unsafe { ring.submission().push(&entry).unwrap(); }
+                unsafe {
+                    ring.submission().push(&entry).unwrap();
+                }
                 next_submit += 1;
                 in_flight += 1;
             }
@@ -1272,7 +1353,9 @@ fn cache_hit_pread_fallback(
 
                 loop {
                     let i = idx_ref.fetch_add(1, Ordering::Relaxed);
-                    if i >= pieces_ref.len() { break; }
+                    if i >= pieces_ref.len() {
+                        break;
+                    }
                     let (offset, len) = pieces_ref[i];
 
                     match file.read_exact_at(&mut buf[..len], offset) {
@@ -1287,10 +1370,16 @@ fn cache_hit_pread_fallback(
                                 let y = yield_ref.load(Ordering::Acquire);
                                 let data = {
                                     let mut reo = reorder_ref.lock();
-                                    if y < reo.len() { reo[y].take() } else { None }
+                                    if y < reo.len() {
+                                        reo[y].take()
+                                    } else {
+                                        None
+                                    }
                                 };
                                 if let Some(d) = data {
-                                    if tx_ref.blocking_send(Ok(d)).is_err() { return; }
+                                    if tx_ref.blocking_send(Ok(d)).is_err() {
+                                        return;
+                                    }
                                     yield_ref.fetch_add(1, Ordering::Release);
                                 } else {
                                     break;
@@ -1313,7 +1402,9 @@ fn cache_hit_pread_fallback(
         let mut reo = reorder.lock();
         for i in y_start..reo.len() {
             if let Some(d) = reo[i].take() {
-                if tx.blocking_send(Ok(d)).is_err() { break; }
+                if tx.blocking_send(Ok(d)).is_err() {
+                    break;
+                }
             }
         }
     });
@@ -1341,8 +1432,7 @@ fn build_streaming_response(
     if status == StatusCode::PARTIAL_CONTENT {
         extra_headers.insert(
             "content-range",
-            HeaderValue::from_str(&format!("bytes {serve_start}-{serve_end}/{full_size}"))
-                .unwrap(),
+            HeaderValue::from_str(&format!("bytes {serve_start}-{serve_end}/{full_size}")).unwrap(),
         );
     }
     extra_headers.insert(
