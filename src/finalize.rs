@@ -133,12 +133,7 @@ async fn run_finalize(
     // Clean up orphaned S3 chunks from the previous manifest.
     if let (Some(old), Some(s3)) = (old_manifest, s3_client) {
         let new_ids: HashSet<[u8; ID_LEN]> = manifest.chunk_ids.iter().copied().collect();
-        let orphaned: Vec<[u8; ID_LEN]> = old
-            .chunk_ids
-            .iter()
-            .filter(|id| !new_ids.contains(*id))
-            .copied()
-            .collect();
+        let orphaned = orphaned_chunk_ids(&old, &new_ids);
 
         if !orphaned.is_empty() {
             let s3 = s3.clone();
@@ -159,4 +154,88 @@ async fn run_finalize(
     }
 
     Ok(())
+}
+
+/// Compute chunk IDs present in `old` but absent in `new_ids`.
+fn orphaned_chunk_ids(
+    old: &Manifest,
+    new_ids: &HashSet<[u8; ID_LEN]>,
+) -> Vec<[u8; ID_LEN]> {
+    old.chunk_ids
+        .iter()
+        .filter(|id| !new_ids.contains(*id))
+        .copied()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_manifest(chunk_ids: Vec<[u8; ID_LEN]>) -> Manifest {
+        let n = chunk_ids.len();
+        Manifest {
+            chunk_size: 1024,
+            total_size: 1024 * n as u64,
+            chunk_ids,
+        }
+    }
+
+    fn id(byte: u8) -> [u8; ID_LEN] {
+        [byte; ID_LEN]
+    }
+
+    #[test]
+    fn all_chunks_replaced() {
+        let old = make_manifest(vec![id(1), id(2), id(3)]);
+        let new_ids: HashSet<_> = [id(4), id(5), id(6)].into_iter().collect();
+        let orphans = orphaned_chunk_ids(&old, &new_ids);
+        assert_eq!(orphans.len(), 3);
+        assert!(orphans.contains(&id(1)));
+        assert!(orphans.contains(&id(2)));
+        assert!(orphans.contains(&id(3)));
+    }
+
+    #[test]
+    fn no_chunks_replaced_identical_manifests() {
+        let old = make_manifest(vec![id(1), id(2)]);
+        let new_ids: HashSet<_> = [id(1), id(2)].into_iter().collect();
+        let orphans = orphaned_chunk_ids(&old, &new_ids);
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn partial_overlap() {
+        let old = make_manifest(vec![id(1), id(2), id(3)]);
+        let new_ids: HashSet<_> = [id(2), id(4)].into_iter().collect();
+        let orphans = orphaned_chunk_ids(&old, &new_ids);
+        assert_eq!(orphans.len(), 2);
+        assert!(orphans.contains(&id(1)));
+        assert!(orphans.contains(&id(3)));
+        assert!(!orphans.contains(&id(2)));
+    }
+
+    #[test]
+    fn empty_old_manifest() {
+        let old = make_manifest(vec![]);
+        let new_ids: HashSet<_> = [id(1)].into_iter().collect();
+        let orphans = orphaned_chunk_ids(&old, &new_ids);
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn new_manifest_superset_of_old() {
+        let old = make_manifest(vec![id(1), id(2)]);
+        let new_ids: HashSet<_> = [id(1), id(2), id(3)].into_iter().collect();
+        let orphans = orphaned_chunk_ids(&old, &new_ids);
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn single_chunk_replaced() {
+        let old = make_manifest(vec![id(0xaa)]);
+        let new_ids: HashSet<_> = [id(0xbb)].into_iter().collect();
+        let orphans = orphaned_chunk_ids(&old, &new_ids);
+        assert_eq!(orphans, vec![id(0xaa)]);
+    }
 }

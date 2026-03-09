@@ -484,3 +484,98 @@ class TestErrors:
     def test_upstream_500(self, proxy_get, unique_key):
         r = proxy_get(unique_key, "/status/500", cache_skip=True)
         assert r.status_code >= 400
+
+
+# ── Orphan chunk cleanup on refresh ──────────────────────────────────────
+
+
+class TestOrphanCleanup:
+    """Verify that when upstream content changes during conditional
+    revalidation, old S3 chunks are deleted after the new manifest is
+    written to ES."""
+
+    @staticmethod
+    def _chunk_ids_from_manifest(manifest_data: bytes) -> list[bytes]:
+        import struct
+        num = struct.unpack_from("<I", manifest_data, 22)[0]
+        return [manifest_data[26 + i * 16 : 26 + (i + 1) * 16] for i in range(num)]
+
+    @staticmethod
+    def _chunk_s3_key(chunk_id: bytes) -> str:
+        h = chunk_id.hex()
+        return f"data/{h[0]}/{h[1]}/{h[2]}/{h[3]}/{h}"
+
+    @staticmethod
+    def _s3_object_exists(s3_client, bucket: str, key: str) -> bool:
+        try:
+            s3_client.head_object(Bucket=bucket, Key=key)
+            return True
+        except s3_client.exceptions.ClientError:
+            return False
+
+    def test_refresh_deletes_old_chunks(
+        self, proxy, proxy_get, unique_key, s3_client, test_bucket, elasticsearch_url,
+    ):
+        """Seed an object, trigger a conditional revalidation that returns new
+        content, and verify the old S3 chunks are deleted while the new ones
+        are kept."""
+        import base64
+
+        # 1. Seed the initial cached object (small enough for single chunk)
+        payload_v1 = generate_payload(SMALL)
+        seed_cached_object(
+            s3_client, test_bucket, unique_key, payload_v1,
+            es_url=elasticsearch_url, es_index=ES_MANIFEST_INDEX,
+        )
+
+        # Record the old chunk IDs
+        old_b64 = es_get_manifest_b64(elasticsearch_url, ES_MANIFEST_INDEX, unique_key)
+        assert old_b64 is not None
+        old_manifest = base64.b64decode(old_b64)
+        old_chunk_ids = self._chunk_ids_from_manifest(old_manifest)
+        assert len(old_chunk_ids) > 0
+
+        # Verify old chunks exist in S3
+        for cid in old_chunk_ids:
+            assert self._s3_object_exists(s3_client, test_bucket, self._chunk_s3_key(cid)), (
+                f"old chunk {cid.hex()} should exist before refresh"
+            )
+
+        # 2. Trigger conditional revalidation with a *different* ETag so
+        #    upstream returns 200 (content changed). Use a different size so
+        #    the new content is verifiably different.
+        new_size = SMALL + 1000
+        r = proxy_get(
+            unique_key,
+            f"/data/{new_size}?etag=v2-etag",
+            extra_headers={
+                "X-Xs3lerator-If-None-Match": '"old-etag-does-not-match"',
+            },
+        )
+        assert r.status_code == 200
+        assert len(r.content) == new_size
+
+        # 3. Wait for the new manifest to appear in ES
+        new_b64 = wait_for_manifest_es(elasticsearch_url, ES_MANIFEST_INDEX, unique_key)
+        new_manifest = base64.b64decode(new_b64)
+        new_chunk_ids = self._chunk_ids_from_manifest(new_manifest)
+
+        # The new manifest should have different chunk IDs (UUIDs are random)
+        assert set(c.hex() for c in new_chunk_ids) != set(c.hex() for c in old_chunk_ids), (
+            "new manifest should reference different chunks than the old one"
+        )
+
+        # 4. Verify new chunks exist in S3
+        for cid in new_chunk_ids:
+            assert self._s3_object_exists(s3_client, test_bucket, self._chunk_s3_key(cid)), (
+                f"new chunk {cid.hex()} should exist after refresh"
+            )
+
+        # 5. Wait for orphan deletion (5s grace period + buffer)
+        time.sleep(8)
+
+        # 6. Verify old chunks have been deleted
+        for cid in old_chunk_ids:
+            assert not self._s3_object_exists(s3_client, test_bucket, self._chunk_s3_key(cid)), (
+                f"old chunk {cid.hex()} should have been deleted after refresh"
+            )

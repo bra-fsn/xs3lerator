@@ -95,8 +95,17 @@ class TestHandler(BaseHTTPRequestHandler):
         ranges_lie = "ranges_lie" in params
         no_ranges = "no_ranges" in params
         slow_ms = int(params.get("slow", [0])[0])
+        etag_val = params.get("etag", [f"test-{size}"])[0]
 
         range_header = self.headers.get("Range")
+        if_none_match = self.headers.get("If-None-Match")
+
+        # Conditional GET: return 304 if ETag matches
+        if if_none_match and if_none_match.strip('"') == etag_val:
+            self.send_response(304)
+            self.send_header("ETag", f'"{etag_val}"')
+            self.end_headers()
+            return
 
         # Server advertises ranges but rejects them
         if ranges_lie and range_header:
@@ -122,7 +131,7 @@ class TestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(size))
         if not no_ranges:
             self.send_header("Accept-Ranges", "bytes")
-        self.send_header("ETag", f'"test-{size}"')
+        self.send_header("ETag", f'"{etag_val}"')
         self.end_headers()
         self._write_with_delay(data, slow_ms)
 
