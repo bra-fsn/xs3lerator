@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, TRANSFER_ENCODING};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, warn};
 
 use crate::config::AppConfig;
@@ -149,17 +150,36 @@ pub async fn fetch_upstream(
     });
 
     let t0 = Instant::now();
-    let response = req_builder
-        .send()
-        .await
-        .map_err(|e| ProxyError::Upstream(format!("upstream request failed: {e}")))?;
+    let response = {
+        let retry_req = req_builder.try_clone();
+        match req_builder.send().await {
+            Ok(resp) => resp,
+            Err(e) if retry_req.is_some() && (e.is_connect() || e.is_request()) => {
+                let retry_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                warn!(
+                    upstream_url,
+                    retry_ms = retry_ms as u64,
+                    "retrying after stale connection error: {e}"
+                );
+                retry_req
+                    .unwrap()
+                    .send()
+                    .await
+                    .map_err(|e2| ProxyError::Upstream(format!("upstream request failed (retry): {e2}")))?
+            }
+            Err(e) => return Err(ProxyError::Upstream(format!("upstream request failed: {e}"))),
+        }
+    };
     let upstream_ttfb_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let status = response.status();
+    let final_url = response.url().to_string();
     debug!(
         upstream_url,
+        final_url = final_url.as_str(),
         status = status.as_u16(),
         upstream_ttfb_ms = upstream_ttfb_ms as u64,
+        content_length = response.content_length().map(|n| n as i64).unwrap_or(-1),
         "upstream response received"
     );
 
@@ -945,10 +965,24 @@ fn spawn_post_chunk_upload(
             .await;
 
             match read_result {
-                Ok(Ok(data)) => match s3.put_chunk(&chunk_id, &data_prefix, data).await {
-                    Ok(()) => s3_ok = true,
-                    Err(e) => warn!(chunk = idx, "S3 put_chunk failed: {e}"),
-                },
+                Ok(Ok(data)) => {
+                    let chunk_sha256 = {
+                        let mut h = Sha256::new();
+                        h.update(&data);
+                        format!("{:x}", h.finalize())
+                    };
+                    debug!(
+                        chunk = idx,
+                        len = data.len(),
+                        sha256 = chunk_sha256.as_str(),
+                        chunk_id = crate::manifest::hex_encode_id(&chunk_id),
+                        "chunk S3 upload"
+                    );
+                    match s3.put_chunk(&chunk_id, &data_prefix, data).await {
+                        Ok(()) => s3_ok = true,
+                        Err(e) => warn!(chunk = idx, "S3 put_chunk failed: {e}"),
+                    }
+                }
                 Ok(Err(e)) => warn!(chunk = idx, "S3 upload read failed: {e}"),
                 Err(e) => warn!(chunk = idx, "S3 upload task panicked: {e}"),
             }

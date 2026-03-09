@@ -63,6 +63,7 @@ impl HttpClientPool {
             .no_brotli()
             .no_zstd()
             .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(20))
             .connect_timeout(connect_timeout);
 
         if let Some(rt) = read_timeout {

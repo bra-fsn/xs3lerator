@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
@@ -27,6 +28,33 @@ use crate::range::{parse_range_header, ByteRange};
 use crate::s3_client::{self, S3Client};
 use crate::trace::{trace_log, TraceWriter};
 use crate::upstream_fetcher;
+
+/// Wrap a body stream to compute and log SHA256 of the bytes served.
+fn sha256_logging_stream(
+    inner: impl futures::Stream<Item = Result<Bytes, ProxyError>> + Send + 'static,
+    label: String,
+    cache_key: String,
+) -> impl futures::Stream<Item = Result<Bytes, ProxyError>> + Send + 'static {
+    try_stream! {
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
+        futures::pin_mut!(inner);
+        while let Some(item) = inner.next().await {
+            let data = item?;
+            hasher.update(&data);
+            total += data.len() as u64;
+            yield data;
+        }
+        let hash = format!("{:x}", hasher.finalize());
+        info!(
+            label = label.as_str(),
+            cache_key = cache_key.as_str(),
+            served_bytes = total,
+            sha256 = hash.as_str(),
+            "body SHA256"
+        );
+    }
+}
 
 /// Log a single access-log style line when a response is sent.
 fn log_access(method: &str, key: &str, response: &Response) {
@@ -108,10 +136,21 @@ pub async fn handle_head(
         }
     }
 
-    let response = req_builder
-        .send()
-        .await
-        .map_err(|e| ProxyError::Upstream(format!("upstream HEAD failed: {e}")))?;
+    let response = {
+        let retry_req = req_builder.try_clone();
+        match req_builder.send().await {
+            Ok(resp) => resp,
+            Err(e) if retry_req.is_some() && (e.is_connect() || e.is_request()) => {
+                warn!(upstream_url, "HEAD retrying after stale connection error: {e}");
+                retry_req
+                    .unwrap()
+                    .send()
+                    .await
+                    .map_err(|e2| ProxyError::Upstream(format!("upstream HEAD failed (retry): {e2}")))?
+            }
+            Err(e) => return Err(ProxyError::Upstream(format!("upstream HEAD failed: {e}"))),
+        }
+    };
 
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -218,6 +257,13 @@ pub async fn handle_get(
     };
 
     let log_key = cache_key.as_deref().unwrap_or(&upstream_url);
+
+    debug!(
+        upstream_url = upstream_url.as_str(),
+        cache_key = log_key,
+        cache_skip = contract.cache_skip,
+        "request mapping"
+    );
 
     trace_log(&state.trace, || {
         json!({
@@ -619,9 +665,10 @@ async fn handle_cache_hit(
         disk_cache,
         es_client,
         data_prefix,
-        cache_key_owned,
+        cache_key_owned.clone(),
         all_chunk_ids,
     );
+    let stream = sha256_logging_stream(stream, "cache_hit".into(), cache_key_owned);
     let body = Body::from_stream(stream);
     let mut response = Response::builder()
         .status(status)
@@ -1075,7 +1122,9 @@ fn build_upstream_response(
             resp_headers.insert(RESP_CACHE_HIT, HeaderValue::from_static("false"));
         }
 
+        let ck = cache_key.unwrap_or("-").to_string();
         let stream = make_unknown_size_stream(result.download);
+        let stream = sha256_logging_stream(stream, "upstream_chunked".into(), ck);
         let body = Body::from_stream(stream);
         let mut resp = Response::builder()
             .status(StatusCode::OK)
@@ -1114,6 +1163,7 @@ fn build_upstream_response(
         resp_headers,
         false,
         download_start,
+        cache_key.unwrap_or("-").to_string(),
     )
 }
 
@@ -1418,6 +1468,7 @@ fn build_streaming_response(
     mut extra_headers: HeaderMap,
     cancel_on_drop: bool,
     download_start: u64,
+    cache_key_for_log: String,
 ) -> ProxyResult<Response> {
     let (serve_start, serve_end, status) = match client_range {
         Some(ref r) => (r.start, r.end_inclusive, StatusCode::PARTIAL_CONTENT),
@@ -1442,6 +1493,7 @@ fn build_streaming_response(
     extra_headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
 
     let stream = make_download_stream(download, download_start, serve_len, cancel_on_drop);
+    let stream = sha256_logging_stream(stream, "upstream_stream".into(), cache_key_for_log);
     let body = Body::from_stream(stream);
     let mut response = Response::builder()
         .status(status)
