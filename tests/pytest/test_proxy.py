@@ -555,10 +555,19 @@ class TestOrphanCleanup:
         assert r.status_code == 200
         assert len(r.content) == new_size
 
-        # 3. Wait for the new manifest to appear in ES
-        new_b64 = wait_for_manifest_es(elasticsearch_url, ES_MANIFEST_INDEX, unique_key)
-        new_manifest = base64.b64decode(new_b64)
-        new_chunk_ids = self._chunk_ids_from_manifest(new_manifest)
+        # 3. Wait for the manifest in ES to change (not just exist — it was seeded)
+        deadline = time.monotonic() + 30.0
+        new_chunk_ids = None
+        while time.monotonic() < deadline:
+            cur_b64 = es_get_manifest_b64(elasticsearch_url, ES_MANIFEST_INDEX, unique_key)
+            if cur_b64 is not None and cur_b64 != old_b64:
+                new_manifest = base64.b64decode(cur_b64)
+                new_chunk_ids = self._chunk_ids_from_manifest(new_manifest)
+                break
+            time.sleep(1)
+        assert new_chunk_ids is not None, (
+            "manifest in ES was never updated after conditional revalidation"
+        )
 
         # The new manifest should have different chunk IDs (UUIDs are random)
         assert set(c.hex() for c in new_chunk_ids) != set(c.hex() for c in old_chunk_ids), (
