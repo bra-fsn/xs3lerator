@@ -430,7 +430,13 @@ async fn start_parallel_upstream_download(
     }
 
     if let Some(key) = cache_key {
-        finalize::spawn_finalize(key.to_string(), download.clone(), es_client);
+        finalize::spawn_finalize(
+            key.to_string(),
+            download.clone(),
+            es_client,
+            s3_client.clone(),
+            config.data_prefix.clone(),
+        );
     }
 
     let temp_dir = config.temp_dir.clone();
@@ -1135,7 +1141,13 @@ async fn start_sequential_download(
 
     // Spawn finalize only when caching
     if let Some(key) = cache_key {
-        finalize::spawn_finalize(key.to_string(), download.clone(), es_client.clone());
+        finalize::spawn_finalize(
+            key.to_string(),
+            download.clone(),
+            es_client.clone(),
+            s3_client.clone(),
+            config.data_prefix.clone(),
+        );
     }
 
     if !is_unknown_size {

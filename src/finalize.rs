@@ -1,22 +1,40 @@
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use tracing::{debug, error};
+use tracing::{debug, error, info, warn};
 
 use crate::download::InFlightDownload;
 use crate::error::ProxyError;
 use crate::es_client::EsClient;
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ID_LEN};
+use crate::s3_client::S3Client;
+
+/// Grace period before deleting orphaned chunks, giving in-flight readers
+/// time to finish streaming the old manifest's data from S3.
+const ORPHAN_DELETE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Spawn a background task that waits for all chunks to be S3-committed,
-/// then writes the manifest to Elasticsearch.
+/// then writes the manifest to Elasticsearch.  If the key already had a
+/// manifest, the old chunks that are no longer referenced are deleted from S3
+/// after a short grace period.
 pub fn spawn_finalize(
     cache_key: String,
     download: Arc<InFlightDownload>,
     es_client: Option<Arc<EsClient>>,
+    s3_client: Option<Arc<S3Client>>,
+    data_prefix: String,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = run_finalize(&cache_key, &download, es_client.as_deref()).await {
+        if let Err(e) = run_finalize(
+            &cache_key,
+            &download,
+            es_client.as_deref(),
+            s3_client.as_deref(),
+            &data_prefix,
+        )
+        .await
+        {
             error!(key = cache_key, "finalize pipeline failed: {e}");
             download.mark_failed();
         }
@@ -27,6 +45,8 @@ async fn run_finalize(
     key: &str,
     download: &InFlightDownload,
     es_client: Option<&EsClient>,
+    s3_client: Option<&S3Client>,
+    data_prefix: &str,
 ) -> Result<(), ProxyError> {
     // For unknown-size (chunked) responses, wait until stream finishes
     // to know the actual number of chunks.
@@ -82,6 +102,20 @@ async fn run_finalize(
         chunk_ids,
     };
 
+    // Before writing the new manifest, snapshot the old one so we can clean up
+    // orphaned S3 chunks after the swap.
+    let old_manifest = if let Some(es) = es_client {
+        match es.get_manifest(key).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(key, "failed to read old manifest for orphan cleanup: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if let Some(es) = es_client {
         es.put_manifest(key, manifest.serialize()).await?;
     }
@@ -94,6 +128,34 @@ async fn run_finalize(
     // This may trigger temp file release if no other readers remain.
     for idx in 0..num_chunks {
         download.chunk(idx).decrement_reader();
+    }
+
+    // Clean up orphaned S3 chunks from the previous manifest.
+    if let (Some(old), Some(s3)) = (old_manifest, s3_client) {
+        let new_ids: HashSet<[u8; ID_LEN]> = manifest.chunk_ids.iter().copied().collect();
+        let orphaned: Vec<[u8; ID_LEN]> = old
+            .chunk_ids
+            .iter()
+            .filter(|id| !new_ids.contains(*id))
+            .copied()
+            .collect();
+
+        if !orphaned.is_empty() {
+            let s3 = s3.clone();
+            let prefix = data_prefix.to_string();
+            let key_owned = key.to_string();
+            tokio::spawn(async move {
+                // Wait a grace period so in-flight readers streaming the old
+                // chunks have time to finish before we remove them.
+                tokio::time::sleep(ORPHAN_DELETE_DELAY).await;
+                info!(
+                    cache_key = key_owned.as_str(),
+                    num_orphaned = orphaned.len(),
+                    "deleting orphaned S3 chunks from previous manifest"
+                );
+                s3.delete_chunks(&orphaned, &prefix, 8).await;
+            });
+        }
     }
 
     Ok(())
