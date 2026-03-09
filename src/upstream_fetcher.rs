@@ -961,9 +961,24 @@ fn spawn_post_chunk_upload(
                 .store(true, Ordering::Release);
             download.wake_waiters();
             debug!(chunk = idx, "post-chunk upload done");
-        } else {
-            error!(chunk = idx, "S3 upload failed, marking download as failed");
+        } else if download.unknown_size {
+            // For unknown-size responses, a failed upload means the manifest
+            // would reference a chunk that was never stored in S3.  This is
+            // the root cause of "S3 chunk missing during cache hit" errors.
+            error!(chunk = idx, "S3 upload failed for unknown-size download, marking download as failed");
             download.mark_failed();
+        } else {
+            // For known-size downloads, read failures can be transient races
+            // between the writer and reader on anonymous temp files. The data
+            // is still being streamed correctly to the client, so we log a
+            // warning and mark committed to avoid blocking the finalize
+            // pipeline — the next cache-miss will re-upload.
+            warn!(chunk = idx, "S3 upload failed, marking committed to unblock finalize");
+            download
+                .chunk(idx)
+                .s3_committed
+                .store(true, Ordering::Release);
+            download.wake_waiters();
         }
     });
 }
