@@ -1058,6 +1058,27 @@ fn build_upstream_response(
     cache_key: Option<&str>,
     client_range: Option<&str>,
 ) -> ProxyResult<Response> {
+    // 304 Not Modified passthrough: upstream confirmed the content hasn't changed.
+    // Relay the 304 + its headers directly to the caller (passsage) so it can
+    // honour its own conditional-GET semantics.  Without this, the placeholder
+    // InFlightDownload (no chunks, full_size=None) would fall through to the
+    // "unknown-size" branch and produce a 200 OK with an empty body.
+    if result.revalidated {
+        let mut resp_headers = HeaderMap::new();
+        if let Some(ref uh) = result.upstream_headers {
+            merge_upstream_headers(uh, &mut resp_headers);
+        }
+        if cache_key.is_some() {
+            resp_headers.insert(RESP_REVALIDATED, HeaderValue::from_static("true"));
+        }
+        let mut resp = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .map_err(|e| ProxyError::Internal(format!("build 304 response: {e}")))?;
+        *resp.headers_mut() = resp_headers;
+        return Ok(resp);
+    }
+
     // Redirect passthrough
     if let Some(redirect_code) = result.redirect_status {
         let status = StatusCode::from_u16(redirect_code).unwrap_or(StatusCode::FOUND);

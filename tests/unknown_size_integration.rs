@@ -244,3 +244,124 @@ async fn passthrough_known_size_response() {
     let body = resp.text().await.unwrap();
     assert_eq!(body, "hello, known size response");
 }
+
+/// Mock upstream that returns 304 when the client sends a matching If-None-Match.
+async fn handle_conditional(
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(inm) = headers.get("if-none-match") {
+        if inm.to_str().unwrap_or("") == "\"abc123\"" {
+            return Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header("etag", "\"abc123\"")
+                .body(Body::empty())
+                .unwrap();
+        }
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("etag", "\"abc123\"")
+        .body(Body::from("{\"ok\":true}"))
+        .unwrap()
+}
+
+async fn start_mock_upstream_with_conditional() -> String {
+    let app = Router::new()
+        .route("/conditional", get(handle_conditional));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// Regression: when the client sends If-None-Match and upstream returns 304,
+/// xs3lerator must relay the 304 status back to the caller instead of
+/// producing a 200 OK with an empty body (the pre-fix behavior that caused
+/// pip to see "Content-Type: Unknown").
+#[tokio::test]
+async fn passthrough_304_not_modified() {
+    let upstream = start_mock_upstream_with_conditional().await;
+    let config = AppConfig {
+        passthrough: true,
+        ..test_config()
+    };
+    let state = AppState {
+        config: Arc::new(config),
+        downloads: Arc::new(DownloadManager::default()),
+        trace: None,
+        es_client: None,
+        http_pool: Arc::new(HttpClientPool::new()),
+        s3: None,
+        disk_cache: None,
+    };
+    let base = start_xs3lerator(state).await;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // First request without If-None-Match — should get 200.
+    let resp = client
+        .get(format!("{base}/{upstream}/conditional"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("ok"));
+
+    // Second request with matching ETag — should get 304, not 200-empty.
+    let resp = client
+        .get(format!("{base}/{upstream}/conditional"))
+        .header("if-none-match", "\"abc123\"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        304,
+        "xs3lerator must relay upstream 304 in passthrough mode"
+    );
+}
+
+/// Regression: same as above but with cache_skip=true (cache key set but
+/// skip flag active), which follows the same code path.
+#[tokio::test]
+async fn cache_skip_304_not_modified() {
+    let upstream = start_mock_upstream_with_conditional().await;
+    let config = test_config();
+    let state = AppState {
+        config: Arc::new(config),
+        downloads: Arc::new(DownloadManager::default()),
+        trace: None,
+        es_client: None,
+        http_pool: Arc::new(HttpClientPool::new()),
+        s3: None,
+        disk_cache: None,
+    };
+    let base = start_xs3lerator(state).await;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .get(format!("{base}/{upstream}/conditional"))
+        .header("X-Xs3lerator-Cache-Key", "test-conditional")
+        .header("X-Xs3lerator-Cache-Skip", "true")
+        .header("if-none-match", "\"abc123\"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        304,
+        "xs3lerator must relay upstream 304 when cache_skip=true"
+    );
+}
