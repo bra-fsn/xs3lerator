@@ -522,4 +522,49 @@ mod tests {
         file.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(&buf, b"hello");
     }
+
+    #[tokio::test]
+    async fn wait_for_bytes_returns_actual_on_stream_complete() {
+        let ids = generate_chunk_ids(1);
+        let chunk_size = 8 * 1024 * 1024; // 8 MiB
+        let dl = InFlightDownload::new_unknown_size(chunk_size, chunk_size, ids);
+
+        dl.record_written(0, 462);
+        dl.mark_stream_complete(462);
+
+        let got = dl.wait_for_bytes(0, chunk_size).await.unwrap();
+        assert_eq!(got, 462);
+    }
+
+    #[tokio::test]
+    async fn wait_for_bytes_returns_full_for_known_size() {
+        let ids = generate_chunk_ids(1);
+        let dl = InFlightDownload::new(5000, 5000, ids);
+
+        dl.record_written(0, 5000);
+        let got = dl.wait_for_bytes(0, 5000).await.unwrap();
+        assert_eq!(got, 5000);
+    }
+
+    #[tokio::test]
+    async fn unknown_size_actual_total_bytes() {
+        let chunk_size = 1024u64;
+        let ids = generate_chunk_ids(2);
+        let dl = InFlightDownload::new_unknown_size(chunk_size * 2, chunk_size, ids);
+
+        assert!(dl.unknown_size);
+        assert!(!dl.is_stream_complete());
+
+        dl.record_written(0, 462);
+        dl.mark_stream_complete(462);
+
+        assert!(dl.is_stream_complete());
+        assert_eq!(dl.actual_total_bytes(), 462);
+
+        let got = dl.wait_for_bytes(0, chunk_size).await.unwrap();
+        assert_eq!(got, 462, "should return actual bytes, not chunk_size");
+
+        let got_1 = dl.wait_for_bytes(1, chunk_size).await.unwrap();
+        assert_eq!(got_1, 0, "second chunk should have zero bytes");
+    }
 }

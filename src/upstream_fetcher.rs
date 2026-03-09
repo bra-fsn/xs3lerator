@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, TRANSFER_ENCODING};
 use serde_json::json;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::config::AppConfig;
 use crate::disk_cache::DiskCache;
@@ -849,8 +849,25 @@ fn spawn_post_chunk_upload(
     let chunk_id = *download.chunk_id(idx);
 
     tokio::spawn(async move {
-        // Wait for the chunk to be fully written
-        if let Err(_) = download.wait_for_bytes(idx, expected).await {
+        // Wait for the chunk to be fully written.  For unknown-size responses
+        // this returns early (with actual bytes < expected) once the stream
+        // completes, so we must use the returned value as the true chunk length.
+        let actual_len = match download.wait_for_bytes(idx, expected).await {
+            Ok(n) => n,
+            Err(_) => {
+                download.wake_waiters();
+                return;
+            }
+        };
+
+        // For unknown-size responses the last chunk (or the only chunk for
+        // small responses) will have fewer bytes than expected_chunk_len().
+        // Zero-length chunks (beyond the actual data) are skipped entirely.
+        if actual_len == 0 {
+            download
+                .chunk(idx)
+                .s3_committed
+                .store(true, Ordering::Release);
             download.wake_waiters();
             return;
         }
@@ -887,7 +904,7 @@ fn spawn_post_chunk_upload(
 
                     let mut offset = 0u64;
                     let mut buf = vec![0u8; 256 * 1024];
-                    let len = expected;
+                    let len = actual_len;
                     while offset < len {
                         let to_read = std::cmp::min((len - offset) as usize, buf.len());
                         if let Err(e) = tf.read_exact_at(&mut buf[..to_read], offset) {
@@ -915,9 +932,10 @@ fn spawn_post_chunk_upload(
         }
 
         // 2. Upload to S3
+        let mut s3_ok = s3_client.is_none();
         if let Some(ref s3) = s3_client {
             let tf = temp_file.clone();
-            let len = expected as usize;
+            let len = actual_len as usize;
             let read_result = tokio::task::spawn_blocking(move || {
                 use std::os::unix::fs::FileExt;
                 let mut buf = vec![0u8; len];
@@ -927,22 +945,26 @@ fn spawn_post_chunk_upload(
             .await;
 
             match read_result {
-                Ok(Ok(data)) => {
-                    if let Err(e) = s3.put_chunk(&chunk_id, &data_prefix, data).await {
-                        warn!(chunk = idx, "S3 put_chunk failed: {e}");
-                    }
-                }
+                Ok(Ok(data)) => match s3.put_chunk(&chunk_id, &data_prefix, data).await {
+                    Ok(()) => s3_ok = true,
+                    Err(e) => warn!(chunk = idx, "S3 put_chunk failed: {e}"),
+                },
                 Ok(Err(e)) => warn!(chunk = idx, "S3 upload read failed: {e}"),
                 Err(e) => warn!(chunk = idx, "S3 upload task panicked: {e}"),
             }
         }
 
-        download
-            .chunk(idx)
-            .s3_committed
-            .store(true, Ordering::Release);
-        download.wake_waiters();
-        debug!(chunk = idx, "post-chunk upload done");
+        if s3_ok {
+            download
+                .chunk(idx)
+                .s3_committed
+                .store(true, Ordering::Release);
+            download.wake_waiters();
+            debug!(chunk = idx, "post-chunk upload done");
+        } else {
+            error!(chunk = idx, "S3 upload failed, marking download as failed");
+            download.mark_failed();
+        }
     });
 }
 
