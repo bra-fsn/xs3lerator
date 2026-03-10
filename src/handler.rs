@@ -435,11 +435,21 @@ async fn handle_conditional_revalidation(
                 fetch_ms = fetch_ms as u64,
                 "conditional revalidation: 304 Not Modified, serving from cache"
             );
-            let mut resp =
-                handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
-            resp.headers_mut()
-                .insert(RESP_REVALIDATED, HeaderValue::from_static("true"));
-            Ok(resp)
+            match handle_cache_hit(state, cache_key, client_range, header_manifest).await {
+                Ok(mut resp) => {
+                    resp.headers_mut()
+                        .insert(RESP_REVALIDATED, HeaderValue::from_static("true"));
+                    Ok(resp)
+                }
+                Err(e) => {
+                    warn!(
+                        cache_key,
+                        error = %e,
+                        "conditional revalidation: 304 but cache data missing, retrying unconditionally"
+                    );
+                    retry_unconditional(state, contract, client_headers, upstream_url, cache_key, client_range).await
+                }
+            }
         }
         Ok(upstream) if upstream.error_passthrough.is_some() && contract.stale_if_error => {
             let (status_code, _err_resp) = upstream.error_passthrough.unwrap();
@@ -449,11 +459,21 @@ async fn handle_conditional_revalidation(
                 fetch_ms = fetch_ms as u64,
                 "conditional revalidation: upstream error, serving stale from cache (stale-if-error)"
             );
-            let mut resp =
-                handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
-            resp.headers_mut()
-                .insert(RESP_REVALIDATED, HeaderValue::from_static("stale-error"));
-            Ok(resp)
+            match handle_cache_hit(state, cache_key, client_range, header_manifest).await {
+                Ok(mut resp) => {
+                    resp.headers_mut()
+                        .insert(RESP_REVALIDATED, HeaderValue::from_static("stale-error"));
+                    Ok(resp)
+                }
+                Err(e) => {
+                    warn!(
+                        cache_key,
+                        error = %e,
+                        "stale-if-error: cache data missing, retrying unconditionally"
+                    );
+                    retry_unconditional(state, contract, client_headers, upstream_url, cache_key, client_range).await
+                }
+            }
         }
         Ok(upstream) => {
             debug!(
@@ -469,14 +489,58 @@ async fn handle_conditional_revalidation(
                 error = %e,
                 "conditional revalidation: upstream fetch failed, serving stale from cache (stale-if-error)"
             );
-            let mut resp =
-                handle_cache_hit(state, cache_key, client_range, header_manifest).await?;
-            resp.headers_mut()
-                .insert(RESP_REVALIDATED, HeaderValue::from_static("stale-error"));
-            Ok(resp)
+            match handle_cache_hit(state, cache_key, client_range, header_manifest).await {
+                Ok(mut resp) => {
+                    resp.headers_mut()
+                        .insert(RESP_REVALIDATED, HeaderValue::from_static("stale-error"));
+                    Ok(resp)
+                }
+                Err(cache_err) => {
+                    warn!(
+                        cache_key,
+                        upstream_error = %e,
+                        cache_error = %cache_err,
+                        "stale-if-error: cache also missing, returning upstream error"
+                    );
+                    Err(e)
+                }
+            }
         }
         Err(e) => Err(e),
     }
+}
+
+/// Re-fetch unconditionally when a conditional revalidation returned 304 but
+/// the cached data is missing (metadata/data inconsistency).
+async fn retry_unconditional(
+    state: &AppState,
+    contract: &headers::ContractHeaders,
+    client_headers: &HeaderMap,
+    upstream_url: &str,
+    cache_key: &str,
+    client_range: Option<&str>,
+) -> ProxyResult<Response> {
+    let mut stripped = contract.clone();
+    stripped.if_none_match = None;
+    stripped.if_modified_since = None;
+
+    let result = upstream_fetcher::fetch_upstream(
+        &state.config,
+        &stripped,
+        client_headers,
+        upstream_url,
+        Some(cache_key),
+        client_range,
+        &state.downloads,
+        &state.trace,
+        state.es_client.clone(),
+        &state.http_pool,
+        state.s3.clone(),
+        state.disk_cache.clone(),
+    )
+    .await?;
+
+    build_upstream_response(state, result, Some(cache_key), client_range)
 }
 
 /// Handle a background-revalidation request: serve the cache hit immediately

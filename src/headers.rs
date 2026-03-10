@@ -204,6 +204,33 @@ pub fn filter_upstream_headers(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
+/// Like [`filter_upstream_headers`] but also strips client conditional headers
+/// (`If-None-Match`, `If-Modified-Since`).  Use when xs3lerator owns the
+/// caching layer — conditional revalidation is driven exclusively by the
+/// contract headers (`X-Xs3lerator-If-None-Match` / `If-Modified-Since`).
+/// Forwarding the client's own values would trigger a 304 from upstream that
+/// xs3lerator cannot serve when its cache is empty.
+pub fn filter_upstream_headers_no_conditionals(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in headers.iter() {
+        let key = name.as_str().to_lowercase();
+        if key.starts_with(CONTRACT_PREFIX) {
+            continue;
+        }
+        if key == "host" || key == "range" {
+            continue;
+        }
+        if key == "if-none-match" || key == "if-modified-since" {
+            continue;
+        }
+        if HOP_BY_HOP_HEADERS.contains(&key.as_str()) {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+    out
+}
+
 /// Extract the upstream URL from the request URI.
 ///
 /// The upstream URL is encoded in the path+query of the incoming request:

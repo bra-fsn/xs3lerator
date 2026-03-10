@@ -119,10 +119,10 @@ async fn start_mock_upstream(etag: &str, body: &str) -> String {
 }
 
 /// When If-None-Match matches the upstream ETag, xs3lerator receives a 304
-/// from upstream. Without a cache to serve from (no ES/S3), handle_cache_hit
-/// fails — confirming the 304 path was taken (not error passthrough).
+/// from upstream. Without a cache to serve from (no ES/S3), the retry path
+/// re-fetches unconditionally and returns the full content as a 200.
 #[tokio::test]
-async fn conditional_get_304_without_cache_returns_error() {
+async fn conditional_get_304_without_cache_retries_unconditionally() {
     let upstream = start_mock_upstream("\"abc123\"", "hello world").await;
     let xs3 = start_xs3lerator(test_state()).await;
 
@@ -135,11 +135,16 @@ async fn conditional_get_304_without_cache_returns_error() {
         .await
         .unwrap();
 
-    assert!(
-        resp.status() == StatusCode::NOT_FOUND
-            || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
-        "expected 404 or 500 from cache-hit fallback (no ES), got {}",
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "expected 200 from unconditional retry (cache data missing), got {}",
         resp.status()
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("hello world"),
+        "retry should return full content, got: {body}"
     );
 }
 

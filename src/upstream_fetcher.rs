@@ -18,7 +18,7 @@ use crate::download::{
 use crate::error::ProxyError;
 use crate::es_client::EsClient;
 use crate::finalize;
-use crate::headers::{filter_upstream_headers, ContractHeaders};
+use crate::headers::{self, filter_upstream_headers, ContractHeaders};
 use crate::http_pool::HttpClientPool;
 use crate::planner::{compute_chunk_plan, ConcurrencyRamp};
 use crate::range::parse_range_header;
@@ -124,8 +124,16 @@ pub async fn fetch_upstream(
         )
         .map_err(|e| ProxyError::Internal(format!("get http client: {e}")))?;
 
-    // Build filtered headers for the upstream request
-    let upstream_headers = filter_upstream_headers(client_headers);
+    // Build filtered headers for the upstream request.
+    // When a cache_key is present, strip client conditional headers — conditional
+    // revalidation is driven by the contract (X-Xs3lerator-If-None-Match etc.),
+    // and forwarding the client's own ETags would cause spurious 304s from upstream
+    // that xs3lerator cannot serve when its cache is empty.
+    let upstream_headers = if cache_key.is_some() {
+        headers::filter_upstream_headers_no_conditionals(client_headers)
+    } else {
+        filter_upstream_headers(client_headers)
+    };
     let mut req_builder = http_client.get(upstream_url);
     for (name, value) in upstream_headers.iter() {
         if let Ok(v) = value.to_str() {

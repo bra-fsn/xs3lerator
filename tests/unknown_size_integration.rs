@@ -333,10 +333,11 @@ async fn passthrough_304_not_modified() {
     );
 }
 
-/// Regression: same as above but with cache_skip=true (cache key set but
-/// skip flag active), which follows the same code path.
+/// When cache_skip=true with a cache key, client conditional headers are
+/// stripped (conditional revalidation is managed by the contract headers).
+/// The upstream gets an unconditional request and returns 200.
 #[tokio::test]
-async fn cache_skip_304_not_modified() {
+async fn cache_skip_strips_client_conditional_headers() {
     let upstream = start_mock_upstream_with_conditional().await;
     let config = test_config();
     let state = AppState {
@@ -355,6 +356,8 @@ async fn cache_skip_304_not_modified() {
         .build()
         .unwrap();
 
+    // Client sends If-None-Match, but cache_key is set → header is stripped,
+    // upstream sees an unconditional GET and returns 200.
     let resp = client
         .get(format!("{base}/{upstream}/conditional"))
         .header("X-Xs3lerator-Cache-Key", "test-conditional")
@@ -365,11 +368,9 @@ async fn cache_skip_304_not_modified() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        304,
-        "xs3lerator must relay upstream 304 when cache_skip=true"
+        200,
+        "client If-None-Match must be stripped when a cache key is present"
     );
-    assert!(
-        resp.headers().get("x-xs3lerator-revalidated").is_none(),
-        "cache_skip 304 must NOT set X-Xs3lerator-Revalidated (no cached copy exists)"
-    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("ok"), "should return full content");
 }
