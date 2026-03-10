@@ -1068,9 +1068,6 @@ fn build_upstream_response(
         if let Some(ref uh) = result.upstream_headers {
             merge_upstream_headers(uh, &mut resp_headers);
         }
-        if cache_key.is_some() {
-            resp_headers.insert(RESP_REVALIDATED, HeaderValue::from_static("true"));
-        }
         let mut resp = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .body(Body::empty())

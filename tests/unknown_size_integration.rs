@@ -327,6 +327,10 @@ async fn passthrough_304_not_modified() {
         304,
         "xs3lerator must relay upstream 304 in passthrough mode"
     );
+    assert!(
+        resp.headers().get("x-xs3lerator-revalidated").is_none(),
+        "passthrough 304 must NOT set X-Xs3lerator-Revalidated (no cached copy exists)"
+    );
 }
 
 /// Regression: same as above but with cache_skip=true (cache key set but
@@ -363,5 +367,9 @@ async fn cache_skip_304_not_modified() {
         resp.status(),
         304,
         "xs3lerator must relay upstream 304 when cache_skip=true"
+    );
+    assert!(
+        resp.headers().get("x-xs3lerator-revalidated").is_none(),
+        "cache_skip 304 must NOT set X-Xs3lerator-Revalidated (no cached copy exists)"
     );
 }
