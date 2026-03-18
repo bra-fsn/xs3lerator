@@ -1,6 +1,6 @@
 [package]
 name = "xs3lerator"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "High-performance HTTP download accelerator and caching proxy for S3"
 license = "MIT"
